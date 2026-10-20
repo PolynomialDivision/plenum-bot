@@ -1,0 +1,45 @@
+# plenum-bot config. In house-infra rendered from matrix.yml (matrix_bots.plenum-bot.plenum).
+
+[matrix]
+homeserver = "https://matrix.example.org"
+user_id = "@plenum-bot:example.org"
+device_id = "PLENUMBOT"
+# access_token: MATRIX_ACCESS_TOKEN in the environment
+
+[security]
+admin_users = ["@admin:example.org"]
+allowed_inviters = []
+allowed_rooms = ["!house:example.org"]
+
+[outline]
+url = "http://outline:3000"               # the API, without /api
+public_url = "https://wiki.example.org"   # for links in the chat
+# api_key: OUTLINE_API_KEY in the environment
+
+[defaults]
+timezone = "Europe/Berlin"
+prepare_days = 3        # protocol created and announced this many days before
+remind_minutes = 30     # 0 = no reminder
+duration_minutes = 120
+close_after_hours = 12  # closed this long after the end (or with !protokoll fertig)
+
+[pdf]
+enabled = true
+font_dir = "/usr/share/fonts/truetype/dejavu"
+post_to_room = true
+
+[[plenum]]
+key = "haus"
+name = "Hausplenum"
+room = "!house:example.org"
+collection = "Hausplenum"
+recurrence = { kind = "monthly_nth", weekday = "sun", nths = [1], time = "19:00" }
+
+[[plenum]]
+key = "kueche-eg"
+name = "Küchenplenum EG"
+room = "!kitchen:example.org"
+collection = "Küchenplena"
+prepare_days = 1
+organizers = ["@anna:example.org"]
+recurrence = { kind = "weekly", weekday = "mon", time = "20:00", every_weeks = 2, anchor = "2026-10-26" }
