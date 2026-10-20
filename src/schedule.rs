@@ -224,14 +224,20 @@ impl Recurrence {
                 nths,
                 time,
             } => {
-                let which = nths
+                let mut which = nths
                     .iter()
                     .map(|n| match n {
                         -1 => "letzten".to_owned(),
                         n => format!("{n}."),
                     })
-                    .collect::<Vec<_>>()
-                    .join(" und ");
+                    .collect::<Vec<_>>();
+                // "1., 3. und 5."
+                let last = which.pop().unwrap_or_default();
+                let which = if which.is_empty() {
+                    last
+                } else {
+                    format!("{} und {last}", which.join(", "))
+                };
                 format!("jeden {which} {} im Monat um {time}", weekday_de(weekday.0))
             }
         }
@@ -340,6 +346,29 @@ mod tests {
                 key("2026-11-01 19:00"),
                 key("2026-12-06 19:00")
             ]
+        );
+    }
+
+    #[test]
+    fn the_first_third_and_fifth_sunday_and_the_fifth_only_when_there_is_one() {
+        let r = rule("kind = 'monthly_nth'\nweekday = 'sun'\nnths = [1, 3, 5]\ntime = '19:00'");
+        // November 2026 has five Sundays, December four, January 2027 five
+        assert_eq!(
+            r.between(d(2026, 11, 1), d(2027, 1, 31)),
+            vec![
+                key("2026-11-01 19:00"),
+                key("2026-11-15 19:00"),
+                key("2026-11-29 19:00"),
+                key("2026-12-06 19:00"),
+                key("2026-12-20 19:00"),
+                key("2027-01-03 19:00"),
+                key("2027-01-17 19:00"),
+                key("2027-01-31 19:00")
+            ]
+        );
+        assert_eq!(
+            r.describe(),
+            "jeden 1., 3. und 5. Sonntag im Monat um 19:00"
         );
     }
 
