@@ -13,7 +13,6 @@
 mod calendar;
 mod commands;
 mod config;
-mod directory;
 mod engine;
 mod members;
 mod outline;
@@ -23,6 +22,8 @@ mod schedule;
 mod state;
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
+
+use mxbot_common::directory::{self, Directory};
 
 use anyhow::{Context, Result};
 use mxbot_common::{
@@ -53,17 +54,10 @@ use crate::{
     state::State,
 };
 
-/// A message from Markdown: the Markdown as the plain body, HTML for clients. Raw HTML in
-/// it (from a protocol, typed by people) is shown as text, and nobody is pinged.
+/// A message from Markdown (raw HTML in it, from a protocol, is shown as text); nobody is
+/// pinged.
 fn message(markdown: &str) -> RoomMessageEventContent {
-    use pulldown_cmark::{Event, Options, Parser};
-    let events = Parser::new_ext(markdown, Options::ENABLE_STRIKETHROUGH).map(|e| match e {
-        Event::Html(t) | Event::InlineHtml(t) => Event::Text(t),
-        other => other,
-    });
-    let mut html = String::new();
-    pulldown_cmark::html::push_html(&mut html, events);
-    RoomMessageEventContent::text_html(markdown, html.trim_end()).add_mentions(Mentions::new())
+    mxbot_common::format::markdown(markdown).add_mentions(Mentions::new())
 }
 
 /// Matrix behind [`Chat`].
@@ -144,6 +138,10 @@ const ADMIN_HELP: &str =
 Here in the admin chat !plenum shows every plenum.";
 
 type PlenumEngine = Engine<Outline, MatrixChat>;
+
+/// Commands older than this (by the server's clock) are history, not orders: long enough for
+/// those sent while the bot restarted, short of what a fresh store brings back.
+const COMMAND_MAX_AGE_MS: i64 = 15 * 60 * 1000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -244,7 +242,12 @@ async fn main() -> Result<()> {
     tokio::spawn(ticker(Arc::clone(&engine)));
     match (&config.directory, config.members.enabled) {
         (Some(dir), true) if engine.plenums.iter().any(|p| p.group.is_some()) => {
-            tokio::spawn(members_loop(Arc::clone(&engine), dir.clone()));
+            match Directory::new(dir, &bot.user_id) {
+                Ok(directory) => {
+                    tokio::spawn(members_loop(Arc::clone(&engine), directory));
+                }
+                Err(e) => warn!("Rooms: {e:#}; no room is managed"),
+            }
         }
         _ => info!("Rooms: no plenum with a group, or [members] off: no room is managed"),
     }
@@ -276,8 +279,15 @@ async fn calendar_loop(
             cfg.manage && managed_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(3600));
         for p in &engine.plenums {
             if manage {
-                if let Err(e) = keep_calendar(&nextcloud, &cfg, p).await {
-                    warn!(plenum = %p.key, calendar = %p.calendar, "Calendar: {e:#}");
+                match keep_calendar(&nextcloud, &cfg, p).await {
+                    // A calendar made just now is empty: read at the next round, so that one
+                    // someone deleted by mistake cancels nothing before it is noticed.
+                    Ok(true) => {
+                        warn!(plenum = %p.key, calendar = %p.calendar, "Calendar made (it was missing): read at the next round");
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(e) => warn!(plenum = %p.key, calendar = %p.calendar, "Calendar: {e:#}"),
                 }
             }
             let today = chrono::Utc::now().with_timezone(&engine.tz).date_naive();
@@ -285,7 +295,7 @@ async fn calendar_loop(
                 today - chrono::Duration::days(30),
                 today + chrono::Duration::days(400),
             );
-            match nextcloud.events(&p.calendar, from, to).await {
+            match nextcloud.events(&p.calendar, from, to, &engine.tz).await {
                 Ok(events) => {
                     let occurrences = calendar::occurrences(&events, from, to);
                     engine
@@ -304,14 +314,13 @@ async fn calendar_loop(
     }
 }
 
+/// The calendar made when missing (true then) and its shares kept in line.
 async fn keep_calendar(
     nextcloud: &calendar::Nextcloud,
     cfg: &config::CalendarConfig,
     p: &config::Plenum,
-) -> Result<()> {
-    if nextcloud.ensure_calendar(&p.calendar, &p.name).await? {
-        info!(plenum = %p.key, calendar = %p.calendar, "Calendar made");
-    }
+) -> Result<bool> {
+    let made = nextcloud.ensure_calendar(&p.calendar, &p.name).await?;
     let wanted =
         calendar::wanted_shares(p.access, p.group.as_deref(), &cfg.house_group, &cfg.readers);
     let current = nextcloud.shares(&p.calendar).await?;
@@ -324,54 +333,27 @@ async fn keep_calendar(
         nextcloud.unshare(&p.calendar, principal).await?;
         info!(plenum = %p.key, %principal, "Calendar share removed");
     }
-    Ok(())
+    Ok(made)
 }
 
 /// The groups from the directory now and every `refresh_minutes`, the rooms after them.
 /// While the directory cannot be read, the rooms stay as they are.
-async fn members_loop(engine: Arc<PlenumEngine>, cfg: config::DirectoryConfig) {
-    let token = match std::env::var(&cfg.token_env) {
-        Ok(t) if !t.trim().is_empty() => t.trim().to_owned(),
-        _ => {
-            warn!(env = %cfg.token_env, "Rooms: no directory token, no room is managed");
-            return;
-        }
-    };
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("Rooms: no HTTP client: {e}");
-            return;
-        }
-    };
+async fn members_loop(engine: Arc<PlenumEngine>, directory: Directory) {
     let wanted: BTreeSet<String> = engine
         .plenums
         .iter()
         .filter_map(|p| p.group.clone())
         .collect();
-    let every = Duration::from_secs(cfg.refresh_minutes.max(1) * 60);
     loop {
-        match directory::read(&client, &cfg, &token, &wanted).await {
-            Ok(groups) => engine.sync_members(&groups, chrono::Utc::now()).await,
+        match directory.people().await {
+            Ok(people) => {
+                let groups = directory::groups(&people, &wanted);
+                engine.sync_members(&groups, chrono::Utc::now()).await
+            }
             Err(e) => warn!("Rooms: the directory could not be read ({e:#}); nothing changed"),
         }
-        tokio::time::sleep(every).await;
+        tokio::time::sleep(directory.config().refresh()).await;
     }
-}
-
-/// The body without a reply's quoted fallback (the "> " lines before the answer).
-fn without_reply_fallback(body: &str) -> &str {
-    let mut rest = body;
-    while rest.starts_with("> ") || rest.starts_with(">\n") || rest == ">" {
-        rest = match rest.split_once('\n') {
-            Some((_, r)) => r,
-            None => "",
-        };
-    }
-    rest.trim_start()
 }
 
 /// `!top` (maybe with a plenum key) as a reply: the message it answers is the topic, by its
@@ -411,7 +393,7 @@ async fn replied_topic(
     let MessageType::Text(text) = &original.content.msgtype else {
         return None;
     };
-    let topic = without_reply_fallback(&text.body).trim();
+    let topic = mxbot_common::format::strip_reply_fallback(&text.body).trim();
     if topic.is_empty() {
         return None;
     }
@@ -446,20 +428,25 @@ fn install_handler(bot: &Bot, engine: &Arc<PlenumEngine>) {
                 let MessageType::Text(text) = &ev.content.msgtype else {
                     return;
                 };
+                // A fresh Matrix store syncs the rooms' history: old commands are no orders
+                // (an old `!minutes done` would close the meeting that is open now).
+                let now = chrono::Utc::now();
+                if now.timestamp_millis() - i64::from(ev.origin_server_ts.0) > COMMAND_MAX_AGE_MS {
+                    info!(event = %ev.event_id, "An old message from the history, left alone");
+                    return;
+                }
                 // Plenum rooms, the admin DM, and the bot's own room (the overview).
                 let in_plenum_room = rooms.contains(room.room_id());
                 if !in_plenum_room && dispatch != Dispatch::AdminDm && !own_room(&room, &bot) {
                     return;
                 }
-                let now = chrono::Utc::now();
-                let today = now.with_timezone(&engine.tz).date_naive();
                 let keys: Vec<&str> = engine
                     .plenums
                     .iter()
                     .filter(|p| !in_plenum_room || p.room == room.room_id())
                     .map(|p| p.key.as_str())
                     .collect();
-                let body = without_reply_fallback(&text.body);
+                let body = mxbot_common::format::strip_reply_fallback(&text.body);
                 // `!top` as the answer to a message: that message is the topic, by its author.
                 let replied = if in_plenum_room {
                     replied_topic(&room, &ev, body, &keys).await
@@ -470,7 +457,7 @@ fn install_handler(bot: &Bot, engine: &Arc<PlenumEngine>) {
                     Some((command, author)) => (command.as_str(), Some(author.clone())),
                     None => (body, None),
                 };
-                let Some(command) = commands::parse_for(body, today, &keys) else {
+                let Some(command) = commands::parse_for(body, &keys) else {
                     return;
                 };
                 let name = match author {
@@ -505,22 +492,4 @@ fn install_handler(bot: &Bot, engine: &Arc<PlenumEngine>) {
 fn own_room(room: &Room, bot: &Bot) -> bool {
     room.canonical_alias()
         .is_some_and(|a| a.alias() == bot.user_id.localpart())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::without_reply_fallback;
-
-    #[test]
-    fn a_replys_quote_is_not_the_command() {
-        assert_eq!(
-            without_reply_fallback("> <@anna:x> Spülmaschine kaputt\n\n!top"),
-            "!top"
-        );
-        assert_eq!(
-            without_reply_fallback(">\n> zwei\n!top küche"),
-            "!top küche"
-        );
-        assert_eq!(without_reply_fallback("!top Müll"), "!top Müll");
-    }
 }

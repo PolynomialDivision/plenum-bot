@@ -56,8 +56,6 @@ struct ApiDoc {
     text: String,
     url: String,
     #[serde(default)]
-    revision: i64,
-    #[serde(default)]
     collection_id: Option<String>,
     #[serde(default)]
     parent_document_id: Option<String>,
@@ -78,7 +76,6 @@ impl From<ApiDoc> for Doc {
             title: d.title,
             text: d.text,
             url: d.url,
-            revision: d.revision,
             // Every change sets updatedAt, a new title too; the revision count is no help
             // (Outline 1.11 counts it up in the background after creating, seen 2026-10-22).
             untouched: d.created_at.is_some() && d.updated_at == d.created_at,
@@ -212,7 +209,9 @@ impl Wiki for Outline {
                 Err(e) => return Err(e),
             }
         }
-        if found.is_none() {
+        // A private one only by its ID: one with that name that someone else made would keep
+        // its maker as a member, who would then read the group's minutes.
+        if found.is_none() && access != Access::Private {
             let listed: Vec<ApiCollection> = self
                 .call("collections.list", json!({"query": name, "limit": 100}))
                 .await?;
@@ -306,16 +305,6 @@ impl Wiki for Outline {
             )
             .await?;
         Ok(d.into())
-    }
-
-    async fn move_doc(&self, id: &str, collection_id: &str, parent_id: &str) -> Result<()> {
-        let _: Value = self
-            .call(
-                "documents.move",
-                json!({"id": id, "collectionId": collection_id, "parentDocumentId": parent_id}),
-            )
-            .await?;
-        Ok(())
     }
 
     async fn rename(&self, id: &str, title: &str) -> Result<()> {
@@ -458,7 +447,6 @@ mod against_outline {
             id: id.into(),
             start,
             end: Some(start.0 + chrono::Duration::hours(2)),
-            summary: "Plenum".into(),
         }
     }
 
@@ -487,11 +475,11 @@ mod against_outline {
         let wiki = Outline::new(&url, &url, &key, Duration::from_secs(30)).unwrap();
         let collection = format!("IT {}", uuid::Uuid::new_v4());
         let plenum = Plenum {
-            key: "haus".into(),
-            name: "Hausplenum".into(),
-            room: "!haus:x".try_into().unwrap(),
+            key: "house".into(),
+            name: "House plenum".into(),
+            room: "!house:x".try_into().unwrap(),
             collection: collection.clone(),
-            calendar: "plenum-haus".into(),
+            calendar: "plenum-house".into(),
             prepare_days: 3,
             remind_minutes: 30,
             duration_minutes: 120,
@@ -526,16 +514,15 @@ mod against_outline {
                 .unwrap()
                 .with_timezone(&chrono::Utc)
         };
-        let room: mxbot_common::matrix_sdk::ruma::OwnedRoomId = "!haus:x".try_into().unwrap();
+        let room: mxbot_common::matrix_sdk::ruma::OwnedRoomId = "!house:x".try_into().unwrap();
         let anna = Sender {
             id: "@anna:x".try_into().unwrap(),
             name: "Anna".into(),
         };
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
-        let cmd = |s: &str| commands::parse_for(s, today, &["haus"]).unwrap();
+        let cmd = |s: &str| commands::parse_for(s, &["house"]).unwrap();
         engine
             .apply_calendar(
-                "haus",
+                "house",
                 vec![occurrence("ev#2026-11-01", "2026-11-01 19:00")],
                 at(10, 1, 0),
             )
@@ -553,7 +540,7 @@ mod against_outline {
             .ensure_collection(None, &collection, crate::config::Access::House)
             .await
             .unwrap();
-        let doc = listed(&engine.wiki, &col, "Hausplenum 2026-11-01").await;
+        let doc = listed(&engine.wiki, &col, "House plenum 2026-11-01").await;
         assert!(doc.text.contains("* Müll trennen (Anna)"), "{}", doc.text);
 
         // Outline writes the first revisions in the background: the item may need a retry.
@@ -582,7 +569,7 @@ mod against_outline {
             .command(
                 &room,
                 &anna,
-                cmd("!top Beschluss: Kasse [ ] an Mallory"),
+                cmd("!top Decision: Kasse [ ] an Mallory"),
                 at(10, 30, 10),
             )
             .await;
@@ -598,12 +585,12 @@ mod against_outline {
             .wiki
             .append(
                 &doc.id,
-                "\n\n### Müll\n\n**Beschluss:** Gelbe Tonne in den Hof.\n\n- [ ] Ben: Schild malen",
+                "\n\n### Müll\n\n**Decision:** Gelbe Tonne in den Hof.\n\n- [ ] Ben: Schild malen",
             )
             .await
             .unwrap();
         let a = engine
-            .command(&room, &anna, cmd("!protokoll fertig"), at(11, 1, 20))
+            .command(&room, &anna, cmd("!minutes done"), at(11, 1, 20))
             .await;
         assert!(a.contains("closed in a moment"), "{a}");
         engine.tick(at(11, 1, 20)).await;
@@ -614,7 +601,7 @@ mod against_outline {
         assert!(summary.contains("- Ben: Schild malen"), "{summary}");
         assert_eq!(engine.chat.files.lock().unwrap().len(), 1);
 
-        let decisions = listed(&engine.wiki, &col, "Hausplenum: Decisions").await;
+        let decisions = listed(&engine.wiki, &col, "House plenum: Decisions").await;
         assert!(
             decisions.text.contains("Gelbe Tonne in den Hof."),
             "{}",
@@ -671,7 +658,7 @@ mod against_outline {
             name: name.into(),
             room: room.try_into().unwrap(),
             collection: format!("IT {name} {run}"),
-            calendar: "plenum-haus".into(),
+            calendar: "plenum-house".into(),
             prepare_days: 3,
             remind_minutes: 30,
             duration_minutes: 120,
@@ -688,7 +675,7 @@ mod against_outline {
         let finance = Plenum {
             group: Some(format!("it-finance-{run}")), // not in the wiki: no grant yet
             access: crate::config::Access::Private,
-            ..base("finance", "Finanzplenum", "!f:x")
+            ..base("finance", "Finance plenum", "!f:x")
         };
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::new(
@@ -827,7 +814,7 @@ mod against_outline {
         let k = admin(&url, &admin_key, "collections.info", json!({"id": kc})).await;
         assert_eq!(k["permission"], "read", "{k}");
 
-        // renamed in the config (as German names became English, 2026-10-22): the same
+        // renamed in the config: the same
         // collection and documents, renamed; texts nobody changed follow, edited ones stay
         let rules = listed(&engine.wiki, kc, "Küchenplenum: Rules").await;
         assert!(rules.untouched, "a new document counts as untouched");

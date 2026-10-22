@@ -41,7 +41,7 @@ post_to_room = true
 [directory]
 provider = "authentik"
 api_url = "https://login.example.org/api/v3"
-server_name = "example.org"           # house accounts: @<login>:example.org
+# server_name = "example.org"         # house accounts: @<login>:<server>; default: the bot's own
 localpart_attribute = "matrix_localpart"
 matrix_ids_attribute = "matrix_ids"   # a person's other accounts
 # token: DIRECTORY_TOKEN in the environment (token_env)
@@ -58,11 +58,11 @@ room = "!house:example.org"
 collection = "House plenum"
 
 [[plenum]]
-key = "kueche-eg"
+key = "kitchen-floor-0"
 name = "Kitchen plenum ground floor"
 room = "!kitchen:example.org"
 collection = "Kitchen ground floor"
-group = "kitchen-ground-floor"   # its room and its editors follow this directory group
+group = "kitchen-floor-0"   # its room and its editors follow this directory group
 access = "members"                # everyone reads, the group writes (house | members | private)
 prepare_days = 1
 organizers = ["@anna:example.org"]

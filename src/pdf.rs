@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use genpdf::{elements, fonts, style, Alignment, Element};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-use crate::protocol::TOP_MARKERS;
+use crate::protocol::TOP_MARKER;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Span {
@@ -67,7 +67,7 @@ fn outline_cleanup(markdown: &str) -> String {
         .lines()
         .filter(|l| {
             let t = l.trim();
-            t != "\\" && !TOP_MARKERS.contains(&t) && !(t.starts_with(":::") && !t.contains(' '))
+            t != "\\" && t != TOP_MARKER && !(t.starts_with(":::") && !t.contains(' '))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -457,7 +457,7 @@ fn document(title: &str, subtitle: &str, font_dir: &Path, look: Look) -> Result<
     let mut deco = genpdf::SimplePageDecorator::new();
     deco.set_margins(18);
     deco.set_header(|page| {
-        elements::Paragraph::new(format!("Seite {page}"))
+        elements::Paragraph::new(format!("Page {page}"))
             .aligned(Alignment::Right)
             .styled(style::Style::new().with_font_size(8))
     });
@@ -516,9 +516,9 @@ mod tests {
 
     #[test]
     fn outline_markdown_becomes_blocks() {
-        let md = "## Tagesordnung\n\n* Müll (Ben)\n* Kaffee\n\n➕ Neue Punkte kommen mit !top im Chat hier dazu.\n\n\\\n\n:::info\nHinweis\n:::\n\n- [ ] Anna: Kompost\n- [x] erledigt\n\n| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let md = "## Agenda\n\n* Müll (Ben)\n* Kaffee\n\n➕ New items from the chat (!top) go here.\n\n\\\n\n:::info\nHinweis\n:::\n\n- [ ] Anna: Kompost\n- [x] erledigt\n\n| A | B |\n|---|---|\n| 1 | 2 |\n";
         let blocks = parse(md);
-        assert_eq!(blocks[0], Block::Heading(2, spans("Tagesordnung")));
+        assert_eq!(blocks[0], Block::Heading(2, spans("Agenda")));
         let Block::List {
             ordered: false,
             items,
@@ -581,12 +581,12 @@ mod tests {
             "## Tagesordnung\n\n* Müll\n  * Tonnen\n\n| A | B |\n|---|---|\n| {} | 2 |\n\n```\ncode\n```\n",
             "lang ".repeat(200)
         );
-        let pdf = render("Hausplenum 2026-11-01", "Stand 02.11.2026", &md, dir).unwrap();
+        let pdf = render("House plenum 2026-11-01", "As of 2 Nov 2026", &md, dir).unwrap();
         assert!(pdf.starts_with(b"%PDF"));
-        // German only: the reader's fonts, nothing embedded.
+        // Western European only (umlauts included): the reader's fonts, nothing embedded.
         assert!(pdf.len() < 100_000, "{} bytes", pdf.len());
         // Cyrillic needs DejaVu embedded.
-        let pdf = render("Hausplenum", "Stand", "Привіт, сусіди", dir).unwrap();
+        let pdf = render("House plenum", "As of", "Привіт, сусіди", dir).unwrap();
         assert!(pdf.len() > 500_000, "{} bytes", pdf.len());
     }
 }

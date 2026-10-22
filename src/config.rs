@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use chrono_tz::Tz;
 use mxbot_common::{
     config::{MatrixConfig, SecurityConfig},
+    directory::DirectoryConfig,
     matrix_sdk::ruma::{OwnedRoomId, OwnedUserId},
 };
 use serde::Deserialize;
@@ -33,46 +34,6 @@ pub struct Config {
     pub members: MembersConfig,
     #[serde(rename = "plenum", default)]
     pub plenums: Vec<PlenumConfig>,
-}
-
-/// The house's directory (its identity provider): who is in a plenum's group.
-#[derive(Deserialize, Clone, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct DirectoryConfig {
-    pub provider: DirectoryProvider,
-    /// The REST API base, e.g. "https://login.example.org/api/v3".
-    pub api_url: String,
-    /// The house's homeserver: a resident's house account is @<login>:<server_name>.
-    pub server_name: String,
-    /// User attribute that overrides the login as the house account's localpart.
-    #[serde(default)]
-    pub localpart_attribute: Option<String>,
-    /// User attribute with a person's other accounts: a list of full Matrix IDs.
-    #[serde(default = "default_matrix_ids_attribute")]
-    pub matrix_ids_attribute: String,
-    /// Environment variable with the read-only API token (never in the config).
-    #[serde(default = "default_directory_token_env")]
-    pub token_env: String,
-    #[serde(default = "default_refresh_minutes")]
-    pub refresh_minutes: u64,
-}
-
-#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum DirectoryProvider {
-    Authentik,
-}
-
-fn default_matrix_ids_attribute() -> String {
-    "matrix_ids".to_owned()
-}
-
-fn default_directory_token_env() -> String {
-    "DIRECTORY_TOKEN".to_owned()
-}
-
-fn default_refresh_minutes() -> u64 {
-    15
 }
 
 /// The rooms of plenums with a group follow it: its members are invited, others removed.
@@ -182,7 +143,7 @@ pub struct Defaults {
     pub remind_minutes: u32,
     pub duration_minutes: u32,
     /// The protocol is closed (decisions collected, PDF, summary) this many hours after the
-    /// end, unless someone says `!protokoll fertig` earlier.
+    /// end, unless someone says `!minutes done` earlier.
     pub close_after_hours: u32,
 }
 
@@ -221,9 +182,10 @@ impl Default for PdfConfig {
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PlenumConfig {
-    /// Short name for commands and the state file: `haus`, `kueche-eg`.
+    /// Short name for commands and the state file: `house`, `kitchen-floor-1`. Never renamed
+    /// once used: the state, the default calendar and the commands follow it.
     pub key: String,
-    /// Shown in titles and messages: "Hausplenum".
+    /// Shown in titles and messages: "House plenum".
     pub name: String,
     /// The room the plenum belongs to (announcements, `!top`, the summary).
     pub room: String,
@@ -241,11 +203,13 @@ pub struct PlenumConfig {
     pub duration_minutes: Option<u32>,
     #[serde(default)]
     pub close_after_hours: Option<u32>,
-    /// Who may cancel or add dates; empty = everyone in the room (admins always).
+    /// Who may close the minutes while the meeting is still on (`!minutes done` before its
+    /// end); the bot's admins always may. After the end, everyone in the room may when this
+    /// is empty, else only they.
     #[serde(default)]
     pub organizers: Vec<String>,
     /// The directory group the plenum belongs to: its room's members and the wiki's editors
-    /// follow it. None: a room nobody manages (the house chat).
+    /// follow it. None: a room nobody manages.
     #[serde(default)]
     pub group: Option<String>,
     #[serde(default)]
@@ -452,6 +416,13 @@ readers = ["calendar-bot"]
     }
 
     #[test]
+    fn the_example_config_is_accepted() {
+        let c: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        assert_eq!(c.plenums().unwrap().len(), 2);
+        c.timezone().unwrap();
+    }
+
+    #[test]
     fn plenums_get_the_defaults_and_keep_their_own_values() {
         let c = parse(
             r#"
@@ -459,16 +430,16 @@ readers = ["calendar-bot"]
 prepare_days = 5
 
 [[plenum]]
-key = "haus"
-name = "Hausplenum"
+key = "house"
+name = "House plenum"
 room = "!house:example.org"
-collection = "Hausplenum"
+collection = "House plenum"
 
 [[plenum]]
-key = "kueche-eg"
-name = "Küchenplenum EG"
+key = "kitchen-floor-1"
+name = "Kitchen plenum 1st floor"
 room = "!kitchen:example.org"
-collection = "Küchenplena"
+collection = "Kitchens"
 prepare_days = 1
 organizers = ["@anna:example.org"]
 "#,
@@ -479,7 +450,7 @@ organizers = ["@anna:example.org"]
         assert_eq!(ps[1].prepare_days, 1);
         assert_eq!(
             (ps[0].calendar.as_str(), ps[1].calendar.as_str()),
-            ("plenum-haus", "plenum-kueche-eg")
+            ("plenum-house", "plenum-kitchen-floor-1")
         );
         assert_eq!(c.calendar.house_group, "residents");
         assert_eq!(
@@ -487,7 +458,7 @@ organizers = ["@anna:example.org"]
             ("CALDAV_PASSWORD", 5)
         );
         assert_eq!(ps[1].organizers.len(), 1);
-        assert_eq!(ps[1].template_title(), "Küchenplenum EG: Template");
+        assert_eq!(ps[1].template_title(), "Kitchen plenum 1st floor: Template");
         assert_eq!(c.public_url(), "https://wiki.example.org");
         assert_eq!(ps[0].access, Access::House);
         assert!(ps[0].group.is_none());
@@ -501,16 +472,15 @@ organizers = ["@anna:example.org"]
 [directory]
 provider = "authentik"
 api_url = "https://login.example.org/api/v3"
-server_name = "example.org"
 
 [members]
 keep = ["@calendar-bot:example.org"]
 
 [[plenum]]
 key = "kitchen-floor-1"
-name = "Küchenplenum 1. OG"
+name = "Kitchen plenum 1st floor"
 room = "!k1:example.org"
-collection = "Küche 1. OG"
+collection = "Kitchen 1st floor"
 group = "kitchen-floor-1"
 access = "members"
 "#,
@@ -518,11 +488,15 @@ access = "members"
         let ps = c.plenums().unwrap();
         assert_eq!(ps[0].group.as_deref(), Some("kitchen-floor-1"));
         assert_eq!(ps[0].access, Access::Members);
-        assert_eq!(ps[0].overview_title(), "Küchenplenum 1. OG: Overview");
+        assert_eq!(ps[0].overview_title(), "Kitchen plenum 1st floor: Overview");
         let d = c.directory.as_ref().unwrap();
         assert_eq!(
-            (d.token_env.as_str(), d.refresh_minutes),
-            ("DIRECTORY_TOKEN", 15)
+            (
+                d.token_env.as_str(),
+                d.refresh_minutes,
+                d.server_name.as_deref()
+            ),
+            ("DIRECTORY_TOKEN", 15, None)
         );
         assert_eq!(c.members.keep.len(), 1);
     }
@@ -544,14 +518,14 @@ access = "members"
     #[test]
     fn broken_plenum_tables_are_refused() {
         let one = |body: &str| parse(&format!("[[plenum]]\n{body}")).plenums();
-        assert!(one("key = 'Haus'\nname = 'H'\nroom = '!r:x'\ncollection = 'C'").is_err());
-        assert!(one("key = 'haus'\nname = 'H'\nroom = 'house'\ncollection = 'C'").is_err());
+        assert!(one("key = 'House'\nname = 'H'\nroom = '!r:x'\ncollection = 'C'").is_err());
+        assert!(one("key = 'house'\nname = 'H'\nroom = 'house'\ncollection = 'C'").is_err());
         assert!(one(
-            "key = 'haus'\nname = 'H'\nroom = '!r:x'\ncollection = 'C'\norganizers = ['anna']"
+            "key = 'house'\nname = 'H'\nroom = '!r:x'\ncollection = 'C'\norganizers = ['anna']"
         )
         .is_err());
         assert!(one(
-            "key = 'haus'\nname = 'H'\nroom = '!r:x'\ncollection = 'C'\nduration_minutes = 0"
+            "key = 'house'\nname = 'H'\nroom = '!r:x'\ncollection = 'C'\nduration_minutes = 0"
         )
         .is_err());
         let twice = parse(
@@ -571,7 +545,7 @@ access = "members"
         );
         assert!(shared.plenums().is_err());
         assert!(one(
-            "key = 'a'\nname = 'A'\nroom = '!r:x'\ncollection = 'C'\ncalendar = 'Haus Plenum'"
+            "key = 'a'\nname = 'A'\nroom = '!r:x'\ncollection = 'C'\ncalendar = 'House Plenum'"
         )
         .is_err());
         assert!(toml::from_str::<Config>(&format!(

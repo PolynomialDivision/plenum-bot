@@ -1,18 +1,16 @@
-//! Chat commands. Only `!plenum`, `!top` and `!protokoll` are the bot's; everything else in
-//! the room is left alone (other bots share the house chat).
-
-use chrono::NaiveDate;
+//! Chat commands. Only `!plenum`, `!top` and `!minutes` are the bot's; everything else in
+//! the room is left alone (other bots may share the room).
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Help,
-    /// `!plenum [key]`, also `!protokoll` alone.
+    /// `!plenum [key]`, also `!minutes` alone.
     Overview(Option<String>),
     Top {
         key: Option<String>,
         text: String,
     },
-    /// `!protokoll fertig [key]`
+    /// `!minutes done [key]`
     Close(Option<String>),
     /// A command of the bot with a mistake in it; the text says what is wrong.
     Invalid(String),
@@ -20,13 +18,13 @@ pub enum Command {
 
 /// [`parse_for`] without plenum keys (every word is text).
 #[cfg(test)]
-pub fn parse(body: &str, today: NaiveDate) -> Option<Command> {
-    parse_for(body, today, &[])
+pub fn parse(body: &str) -> Option<Command> {
+    parse_for(body, &[])
 }
 
 /// The command in a message, if it is one of the bot's. `keys`: the plenum keys of the room,
 /// recognised where a command takes one.
-pub fn parse_for(body: &str, _today: NaiveDate, keys: &[&str]) -> Option<Command> {
+pub fn parse_for(body: &str, keys: &[&str]) -> Option<Command> {
     let body = body.trim();
     let (head, rest) = match body.split_once(char::is_whitespace) {
         Some((h, r)) => (h, r.trim()),
@@ -61,13 +59,11 @@ pub fn parse_for(body: &str, _today: NaiveDate, keys: &[&str]) -> Option<Command
                 text: text.to_owned(),
             })
         }
-        // `!minutes done`; the German `!protokoll fertig` of before 2026-10-22 too.
-        "!minutes" | "!protokoll" => {
+        "!minutes" => {
             let (key, rest) = split_key(&words);
             match rest.first().map(|w| w.to_lowercase()).as_deref() {
                 None => Some(Command::Overview(key)),
-                Some("done") | Some("close") | Some("fertig") | Some("abschliessen")
-                | Some("abschließen") => Some(Command::Close(key)),
+                Some("done") | Some("close") => Some(Command::Close(key)),
                 Some(_) => Some(Command::Invalid("Did you mean `!minutes done`?".to_owned())),
             }
         }
@@ -75,16 +71,13 @@ pub fn parse_for(body: &str, _today: NaiveDate, keys: &[&str]) -> Option<Command
             let sub = words.first().map(|w| w.to_lowercase());
             match sub.as_deref() {
                 None => Some(Command::Overview(None)),
-                Some("hilfe") | Some("help") => Some(Command::Help),
-                // Dates are the calendar's now (2026-10-22): moved, cancelled and added there.
-                Some("absagen") | Some("extra") | Some("zusatz") | Some("verschieben")
-                | Some("verlegen") | Some("cancel") | Some("add") | Some("move") => {
-                    Some(Command::Invalid(
-                        "The meetings are in the plenum's Nextcloud calendar now: add, move or \
-                         cancel them there. The bot follows the calendar."
-                            .to_owned(),
-                    ))
-                }
+                Some("help") => Some(Command::Help),
+                // The dates are the calendar's: moved, cancelled and added there.
+                Some("cancel") | Some("add") | Some("move") => Some(Command::Invalid(
+                    "The meetings are in the plenum's Nextcloud calendar: add, move or cancel \
+                     them there. The bot follows the calendar."
+                        .to_owned(),
+                )),
                 Some(w) if is_key(w) && words.len() == 1 => {
                     Some(Command::Overview(Some(w.to_owned())))
                 }
@@ -101,71 +94,68 @@ pub fn parse_for(body: &str, _today: NaiveDate, keys: &[&str]) -> Option<Command
 mod tests {
     use super::*;
 
-    fn today() -> NaiveDate {
-        NaiveDate::from_ymd_opt(2026, 10, 20).unwrap()
-    }
-
     fn p(s: &str) -> Option<Command> {
-        parse_for(s, today(), &["kueche-eg", "kueche-og"])
+        parse_for(s, &["kitchen-floor-1", "kitchen-floor-3"])
     }
 
     #[test]
     fn other_messages_are_not_ours() {
-        assert_eq!(p("hallo"), None);
+        assert_eq!(p("hello"), None);
         assert_eq!(p("!help"), None);
         assert_eq!(p("!topf"), None);
         assert_eq!(p("!admin status"), None);
+        // the German commands of before 2026-10-22 are gone
+        assert_eq!(p("!protokoll fertig"), None);
     }
 
     #[test]
     fn agenda_items_with_and_without_a_key() {
         assert_eq!(
-            p("!top Müll und Tonnen"),
+            p("!top Bins and recycling"),
             Some(Command::Top {
                 key: None,
-                text: "Müll und Tonnen".into()
+                text: "Bins and recycling".into()
             })
         );
         assert_eq!(
-            p("!TOP kueche-og Spülmaschine kaputt"),
+            p("!TOP kitchen-floor-3 dishwasher broken"),
             Some(Command::Top {
-                key: Some("kueche-og".into()),
-                text: "Spülmaschine kaputt".into()
+                key: Some("kitchen-floor-3".into()),
+                text: "dishwasher broken".into()
             })
         );
         assert!(matches!(p("!top"), Some(Command::Invalid(_))));
-        assert!(matches!(p("!top kueche-eg"), Some(Command::Invalid(_))));
+        assert!(matches!(
+            p("!top kitchen-floor-1"),
+            Some(Command::Invalid(_))
+        ));
     }
 
     #[test]
     fn closing_and_the_overview() {
-        assert_eq!(p("!protokoll fertig"), Some(Command::Close(None)));
         assert_eq!(p("!minutes done"), Some(Command::Close(None)));
         assert_eq!(p("!Minutes close"), Some(Command::Close(None)));
         assert_eq!(p("!minutes"), Some(Command::Overview(None)));
         assert_eq!(
-            p("!protokoll fertig kueche-eg"),
-            Some(Command::Close(Some("kueche-eg".into())))
+            p("!minutes done kitchen-floor-1"),
+            Some(Command::Close(Some("kitchen-floor-1".into())))
         );
-        assert_eq!(p("!protokoll"), Some(Command::Overview(None)));
         assert_eq!(p("!plenum"), Some(Command::Overview(None)));
         assert_eq!(
-            p("!plenum kueche-og"),
-            Some(Command::Overview(Some("kueche-og".into())))
+            p("!plenum kitchen-floor-3"),
+            Some(Command::Overview(Some("kitchen-floor-3".into())))
         );
-        assert_eq!(p("!plenum hilfe"), Some(Command::Help));
         assert_eq!(p("!plenum help"), Some(Command::Help));
-        assert!(matches!(p("!protokoll los"), Some(Command::Invalid(_))));
+        assert!(matches!(p("!minutes now"), Some(Command::Invalid(_))));
         assert!(matches!(p("!plenum xyz"), Some(Command::Invalid(_))));
     }
 
     #[test]
     fn date_commands_point_to_the_calendar() {
         for body in [
-            "!plenum absagen 27.10.",
-            "!plenum extra 30.10. 19:00",
-            "!plenum verschieben 1.11. 8.11.",
             "!plenum cancel 27.10.",
+            "!plenum add 30.10. 19:00",
+            "!plenum move 1.11.",
         ] {
             match p(body) {
                 Some(Command::Invalid(why)) => assert!(why.contains("Nextcloud calendar"), "{why}"),

@@ -5,7 +5,7 @@
 use std::{fmt, str::FromStr};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc, Weekday};
+use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -61,19 +61,6 @@ impl<'de> Deserialize<'de> for MeetingKey {
         String::deserialize(d)?
             .parse()
             .map_err(serde::de::Error::custom)
-    }
-}
-
-/// For the German placeholders of templates from before the bot spoke English.
-pub fn weekday_de(day: Weekday) -> &'static str {
-    match day {
-        Weekday::Mon => "Montag",
-        Weekday::Tue => "Dienstag",
-        Weekday::Wed => "Mittwoch",
-        Weekday::Thu => "Donnerstag",
-        Weekday::Fri => "Freitag",
-        Weekday::Sat => "Samstag",
-        Weekday::Sun => "Sonntag",
     }
 }
 

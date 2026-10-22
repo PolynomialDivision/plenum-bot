@@ -14,10 +14,11 @@ chrono         = { version = "0.4", features = ["serde"] }
 chrono-tz      = "0.10"
 genpdf         = "0.2"
 mime           = "0.3"
-mxbot-common   = { git = "https://github.com/PolynomialDivision/mxbot-common", features = ["calendar"] }
+mxbot-common   = { git = "https://github.com/PolynomialDivision/mxbot-common", features = ["calendar", "directory", "markdown"] }
+# the protocol into the PDF (pdf.rs)
+pulldown-cmark = { version = "0.13", default-features = false }
 # The same printpdf as genpdf (its built-in font names; genpdf does not re-export them).
 printpdf       = { version = "=0.3.4", default-features = false }
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 reqwest        = { version = "0.13", default-features = false, features = ["rustls", "json", "multipart"] }
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"

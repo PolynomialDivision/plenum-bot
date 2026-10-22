@@ -32,8 +32,6 @@ pub struct Occurrence {
     /// Its local end, if the event has one.
     #[serde(default)]
     pub end: Option<NaiveDateTime>,
-    #[serde(default)]
-    pub summary: String,
 }
 
 /// The timed occurrences from `from` to `to` (local days), each once (all-day events are no
@@ -50,7 +48,6 @@ pub fn occurrences(events: &[IcsEvent], from: NaiveDate, to: NaiveDate) -> Vec<O
                 id: e.key.clone(),
                 start: MeetingKey(e.starts_at),
                 end: end.map(|t| e.last_day.and_time(t)),
-                summary: e.summary.clone(),
             });
         }
     }
@@ -122,73 +119,15 @@ pub fn plan_shares(current: &[Share], wanted: &[Share]) -> (Vec<Share>, Vec<Stri
     (set, remove)
 }
 
-/// The text between `<prefix:name ...>` and its closing tag, for every element with that
-/// local name (whatever namespace prefix the server chose).
-fn elements<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(open) = find_tag(rest, name) {
-        let after = &rest[open..];
-        let Some(gt) = after.find('>') else {
-            break;
-        };
-        if after[..gt].ends_with('/') {
-            out.push("");
-            rest = &after[gt + 1..];
-            continue;
-        }
-        let body = &after[gt + 1..];
-        let Some(close) = find_close(body, name) else {
-            break;
-        };
-        out.push(&body[..close]);
-        rest = &body[close..];
-    }
-    out
-}
-
-/// The position of the next `<name` or `<prefix:name` start tag.
-fn find_tag(xml: &str, name: &str) -> Option<usize> {
-    let mut from = 0;
-    while let Some(i) = xml[from..].find('<') {
-        let at = from + i;
-        let tag = &xml[at + 1..];
-        let local = tag
-            .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
-            .next()
-            .unwrap_or("");
-        let local = local.rsplit(':').next().unwrap_or(local);
-        if !tag.starts_with('/') && local == name {
-            return Some(at);
-        }
-        from = at + 1;
-    }
-    None
-}
-
-fn find_close(xml: &str, name: &str) -> Option<usize> {
-    let mut from = 0;
-    while let Some(i) = xml[from..].find("</") {
-        let at = from + i;
-        let tag = &xml[at + 2..];
-        let local = tag.split('>').next().unwrap_or("");
-        if local.rsplit(':').next() == Some(name) {
-            return Some(at);
-        }
-        from = at + 2;
-    }
-    None
-}
-
 /// The shares in a PROPFIND answer with `oc:invite` (Nextcloud: one `user` element per
 /// sharee, `read-write` among its access when it may edit).
 pub fn parse_shares(xml: &str) -> Vec<Share> {
-    let mut out: Vec<Share> = elements(xml, "invite")
+    let mut out: Vec<Share> = caldav::xml_elements(xml, "invite")
         .into_iter()
-        .flat_map(|invite| elements(invite, "user"))
+        .flat_map(|invite| caldav::xml_elements(invite, "user"))
         .filter_map(|u| {
-            let href = elements(u, "href").first()?.trim().to_owned();
-            let write = !elements(u, "read-write").is_empty();
+            let href = caldav::xml_elements(u, "href").first()?.trim().to_owned();
+            let write = !caldav::xml_elements(u, "read-write").is_empty();
             Some(Share {
                 principal: href,
                 write,
@@ -263,16 +202,16 @@ impl Nextcloud {
             .await?;
         match status {
             207 => {
-                let current = elements(&body, "displayname")
+                let current = caldav::xml_elements(&body, "displayname")
                     .first()
-                    .map(|s| s.trim().to_owned());
+                    .map(|s| caldav::xml_unescape(s.trim()));
                 if current.as_deref() != Some(name) {
                     let (status, _) = self
                         .dav(
                             "PROPPATCH",
                             &url,
                             None,
-                            format!(r#"<?xml version="1.0" encoding="utf-8"?><d:propertyupdate xmlns:d="DAV:"><d:set><d:prop><d:displayname>{}</d:displayname></d:prop></d:set></d:propertyupdate>"#, xml_text(name)),
+                            format!(r#"<?xml version="1.0" encoding="utf-8"?><d:propertyupdate xmlns:d="DAV:"><d:set><d:prop><d:displayname>{}</d:displayname></d:prop></d:set></d:propertyupdate>"#, caldav::xml_escape(name)),
                         )
                         .await?;
                     if status != 207 {
@@ -287,7 +226,7 @@ impl Nextcloud {
                         "MKCALENDAR",
                         &url,
                         None,
-                        format!(r#"<?xml version="1.0" encoding="utf-8"?><c:mkcalendar xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:set><d:prop><d:displayname>{}</d:displayname><c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set></d:prop></d:set></c:mkcalendar>"#, xml_text(name)),
+                        format!(r#"<?xml version="1.0" encoding="utf-8"?><c:mkcalendar xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:set><d:prop><d:displayname>{}</d:displayname><c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set></d:prop></d:set></c:mkcalendar>"#, caldav::xml_escape(name)),
                     )
                     .await?;
                 if status != 201 {
@@ -344,7 +283,7 @@ impl Nextcloud {
             slug,
             format!(
                 "<oc:set><d:href>{}</d:href>{write}</oc:set>",
-                xml_text(&share.principal)
+                caldav::xml_escape(&share.principal)
             ),
         )
         .await
@@ -355,18 +294,20 @@ impl Nextcloud {
             slug,
             format!(
                 "<oc:remove><d:href>{}</d:href></oc:remove>",
-                xml_text(principal)
+                caldav::xml_escape(principal)
             ),
         )
         .await
     }
 
-    /// The calendar's events touching `from`..`to` (a failure is an error, never "none").
+    /// The calendar's events touching `from`..`to`, their times in `zone` (a failure is an
+    /// error, never "none").
     pub async fn events(
         &self,
         slug: &str,
         from: NaiveDate,
         to: NaiveDate,
+        zone: &chrono_tz::Tz,
     ) -> Result<Vec<IcsEvent>> {
         caldav::fetch_calendar(
             &self.http,
@@ -375,16 +316,11 @@ impl Nextcloud {
             &self.password,
             from,
             to,
+            zone,
         )
         .await
         .with_context(|| format!("reading the calendar {slug}"))
     }
-}
-
-fn xml_text(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
@@ -395,10 +331,10 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
 
-    const SERIES: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:plenum-1\r\nSUMMARY:Hausplenum\r\n\
+    const SERIES: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:plenum-1\r\nSUMMARY:House plenum\r\n\
 DTSTART;TZID=Europe/Berlin:20261101T190000\r\nDTEND;TZID=Europe/Berlin:20261101T210000\r\n\
 RRULE:FREQ=MONTHLY;BYDAY=1SU\r\nEXDATE;TZID=Europe/Berlin:20270103T190000\r\nEND:VEVENT\r\n\
-BEGIN:VEVENT\r\nUID:plenum-1\r\nRECURRENCE-ID;TZID=Europe/Berlin:20261206T190000\r\nSUMMARY:Hausplenum\r\n\
+BEGIN:VEVENT\r\nUID:plenum-1\r\nRECURRENCE-ID;TZID=Europe/Berlin:20261206T190000\r\nSUMMARY:House plenum\r\n\
 DTSTART;TZID=Europe/Berlin:20261208T200000\r\nDTEND;TZID=Europe/Berlin:20261208T220000\r\nEND:VEVENT\r\n\
 BEGIN:VEVENT\r\nUID:allday\r\nSUMMARY:Putztag\r\nDTSTART;VALUE=DATE:20261110\r\nEND:VEVENT\r\n\
 BEGIN:VEVENT\r\nUID:extra\r\nSUMMARY:Sonderplenum\r\nDTSTART;TZID=Europe/Berlin:20261115T180000\r\n\
@@ -406,7 +342,11 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
 
     #[test]
     fn a_series_with_a_moved_and_an_excluded_occurrence() {
-        let occ = occurrences(&ics::parse_ics(SERIES), d(2026, 10, 1), d(2027, 2, 28));
+        let occ = occurrences(
+            &ics::parse_ics_in(SERIES, &chrono_tz::Europe::Berlin),
+            d(2026, 10, 1),
+            d(2027, 2, 28),
+        );
         let list: Vec<(String, String)> = occ
             .iter()
             .map(|o| (o.id.clone(), o.start.to_string()))
@@ -442,7 +382,11 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
             "/unraid/house-infra/docs/plenum/house-plenum.ics"
         ));
         let Ok(ics) = ics else { return }; // house-infra not next to the bot
-        let occ = occurrences(&ics::parse_ics(&ics), d(2026, 11, 1), d(2026, 11, 30));
+        let occ = occurrences(
+            &ics::parse_ics_in(&ics, &chrono_tz::Europe::Berlin),
+            d(2026, 11, 1),
+            d(2026, 11, 30),
+        );
         let starts: Vec<String> = occ.iter().map(|o| o.start.to_string()).collect();
         assert_eq!(
             starts,
@@ -508,7 +452,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
     #[test]
     fn shares_are_read_whatever_the_prefix() {
         let xml = r#"<?xml version="1.0"?>
-<d:multistatus xmlns:d="DAV:" xmlns:x1="http://owncloud.org/ns"><d:response><d:href>/remote.php/dav/calendars/plenum-bot/plenum-haus/</d:href>
+<d:multistatus xmlns:d="DAV:" xmlns:x1="http://owncloud.org/ns"><d:response><d:href>/remote.php/dav/calendars/plenum-bot/plenum-house/</d:href>
 <d:propstat><d:prop><x1:invite>
 <x1:user><d:href>principal:principals/groups/residents</d:href><x1:common-name>Bewohner</x1:common-name><x1:invite-accepted/><x1:access><x1:read-write/></x1:access></x1:user>
 <x1:user><d:href>principal:principals/users/calendar-bot</d:href><x1:invite-accepted/><x1:access><x1:read/></x1:access></x1:user>
@@ -583,7 +527,7 @@ mod against_nextcloud {
         )
         .await;
         assert_eq!(status, 207, "{xml}");
-        let href = elements(&xml, "href").into_iter().find(|h| {
+        let href = caldav::xml_elements(&xml, "href").into_iter().find(|h| {
             h.trim_end_matches('/')
                 .ends_with(&format!("{slug}_shared_by_plenum-bot"))
         })?;
@@ -621,10 +565,13 @@ END:VCALENDAR\r\n";
         assert!(nc.ensure_calendar(&kitchen, "IT Küche").await.unwrap());
         assert!(!nc.ensure_calendar(&kitchen, "IT Küche").await.unwrap());
         assert!(!nc
-            .ensure_calendar(&kitchen, "IT Küche 1. OG")
+            .ensure_calendar(&kitchen, "IT Kitchen 1st floor")
             .await
             .unwrap());
-        assert!(nc.ensure_calendar(&finance, "IT Finanz-AG").await.unwrap());
+        assert!(nc
+            .ensure_calendar(&finance, "IT Finance group")
+            .await
+            .unwrap());
 
         // shares as the access says; a share by hand goes
         for (slug, access, group) in [
@@ -701,14 +648,20 @@ END:VCALENDAR\r\n";
         );
         assert!(
             shared_url(&dav, "ben", &finance).await.is_none(),
-            "the Finanz-AG's is private"
+            "the Finance group's is private"
         );
         assert!(shared_url(&dav, "anna", &finance).await.is_none());
 
         // the bot reads it: the moved one keeps its ID, the excluded one is gone
         let from = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
         let to = NaiveDate::from_ymd_opt(2027, 1, 31).unwrap();
-        let occ = occurrences(&nc.events(&kitchen, from, to).await.unwrap(), from, to);
+        let occ = occurrences(
+            &nc.events(&kitchen, from, to, &chrono_tz::Europe::Berlin)
+                .await
+                .unwrap(),
+            from,
+            to,
+        );
         let list: Vec<(String, String)> = occ
             .iter()
             .map(|o| (o.id.clone(), o.start.to_string()))
@@ -723,7 +676,7 @@ END:VCALENDAR\r\n";
             ]
             .map(|(a, b)| (a.to_owned(), b.to_owned()))
         );
-        // calendar-bot finds the kitchen's among its calendars, not the Finanz-AG's
+        // calendar-bot finds the kitchen's among its calendars, not the Finance group's
         let src = caldav::Source {
             caldav_account_url: Some(format!("{dav}/calendars/calendar-bot/")),
             username: Some("calendar-bot".into()),

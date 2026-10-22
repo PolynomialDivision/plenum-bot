@@ -11,7 +11,7 @@
 //!   prepare  (`prepare_days` before: the protocol from the template, chat items added)
 //!   announce (the link in the plenum's room)
 //!   remind   (`remind_minutes` before the start)
-//!   close    (`close_after_hours` after the end, or `!protokoll fertig`: decisions into the
+//!   close    (`close_after_hours` after the end, or `!minutes done`: decisions into the
 //!            decision list, the PDF attached and posted, the summary)
 //! and each step is saved when done, so a restart neither repeats nor skips one. An error in
 //! one meeting is logged and retried at the next tick; the other meetings go on. Everything
@@ -38,7 +38,10 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use chrono_tz::Tz;
-use mxbot_common::matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
+use mxbot_common::{
+    directory::Groups,
+    matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId},
+};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -46,7 +49,6 @@ use crate::{
     calendar::Occurrence,
     commands::Command,
     config::{Access, PdfConfig, Plenum},
-    directory::Groups,
     members::{self, Member},
     protocol::{self, PdfNote},
     schedule::{self, MeetingKey},
@@ -60,7 +62,6 @@ pub struct Doc {
     pub title: String,
     pub text: String,
     pub url: String,
-    pub revision: i64,
     /// Nobody (the bot neither) changed it since it was made.
     pub untouched: bool,
     pub collection_id: Option<String>,
@@ -71,8 +72,9 @@ pub struct Doc {
 #[allow(async_fn_in_trait)]
 pub trait Wiki {
     /// The collection's ID: `known` (the one used last time, renamed to `name` if its name
-    /// differs) while it exists, else the one named `name`, else a new one; set to `access`
-    /// (everyone writes; everyone reads; nobody but its groups) if it is not.
+    /// differs) while it exists, else the one named `name` (never for a private one: someone
+    /// else's would keep its members), else a new one; set to `access` (everyone writes;
+    /// everyone reads; nobody but its groups) if it is not.
     async fn ensure_collection(
         &self,
         known: Option<&str>,
@@ -92,8 +94,6 @@ pub trait Wiki {
         title: &str,
         text: &str,
     ) -> Result<Doc>;
-    /// File the document under `parent_id` in the collection.
-    async fn move_doc(&self, id: &str, collection_id: &str, parent_id: &str) -> Result<()>;
     async fn rename(&self, id: &str, title: &str) -> Result<()>;
     /// Replace the whole text: only for the overview, which the bot alone writes.
     async fn replace(&self, id: &str, text: &str) -> Result<()>;
@@ -217,9 +217,17 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         now.with_timezone(&self.tz).date_naive()
     }
 
-    async fn save(&self, st: &State) {
-        if let Err(e) = st.save(&self.state_path).await {
-            error!("Saving the state failed: {e:#}");
+    /// The state on disk. Every step saves before its side effect (the document's ID, the
+    /// message's transaction ID): a step whose save fails must not go on, or a restart would
+    /// do it again.
+    async fn save(&self, st: &State) -> Result<()> {
+        st.save(&self.state_path).await.context("saving the state")
+    }
+
+    /// For the places that cannot stop: logged, tried again at the next save.
+    async fn save_or_log(&self, st: &State) {
+        if let Err(e) = self.save(st).await {
+            error!("{e:#}");
         }
     }
 
@@ -232,15 +240,13 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             if let Err(e) = self.tick_area(&mut st, p, now).await {
                 warn!(plenum = %p.key, "Wiki area: {e:#}");
             }
-            let today = self.today(now);
-            let _ = today;
             st.plenums.entry(p.key.clone()).or_default().prune();
         }
-        self.save(&st).await;
+        self.save_or_log(&st).await;
     }
 
     /// The area in the wiki: checked every [`AREA_EVERY`] (and right after the start), the
-    /// protocols filed, the overview written when its text changed.
+    /// overview written when its text changed.
     async fn tick_area(&self, st: &mut State, p: &Plenum, now: DateTime<Utc>) -> Result<()> {
         let due = !self.areas_checked.lock().unwrap().contains(&p.key)
             || st
@@ -250,61 +256,11 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 .is_none_or(|at| now - at >= AREA_EVERY);
         if due {
             self.setup(st, p).await?;
-            self.file_protocols(st, p).await;
             st.plenums.entry(p.key.clone()).or_default().area_checked = Some(now);
             self.areas_checked.lock().unwrap().insert(p.key.clone());
-            self.save(st).await;
+            self.save(st).await?;
         }
         self.write_overview(st, p, now).await
-    }
-
-    /// Protocols made before the protocols document existed (at the top of the collection)
-    /// go under it, once each.
-    async fn file_protocols(&self, st: &mut State, p: &Plenum) {
-        let ps = st.plenums.entry(p.key.clone()).or_default();
-        let (Some(collection), Some(parent)) =
-            (ps.collection_id.clone(), ps.protocols_doc_id.clone())
-        else {
-            return;
-        };
-        let todo: Vec<(String, String)> = ps
-            .meetings
-            .iter()
-            .filter(|(_, m)| m.created && !m.filed)
-            .map(|(k, m)| (k.clone(), m.doc_id.clone()))
-            .collect();
-        for (key, doc_id) in todo {
-            let filed = match self.wiki.doc(&doc_id).await {
-                Ok(Some(d)) if d.parent_id.as_deref() == Some(parent.as_str()) => true,
-                Ok(Some(d)) if d.collection_id.as_deref() == Some(collection.as_str()) => {
-                    match self.wiki.move_doc(&doc_id, &collection, &parent).await {
-                        Ok(()) => {
-                            info!(plenum = %p.key, meeting = %key, "Protocol filed under the protocols");
-                            true
-                        }
-                        Err(e) => {
-                            warn!(plenum = %p.key, meeting = %key, "Filing the protocol: {e:#}");
-                            false
-                        }
-                    }
-                }
-                // gone, or moved elsewhere by someone: left where it is
-                Ok(_) => true,
-                Err(e) => {
-                    warn!(plenum = %p.key, meeting = %key, "Filing the protocol: {e:#}");
-                    false
-                }
-            };
-            if filed {
-                if let Some(m) = st
-                    .plenums
-                    .get_mut(&p.key)
-                    .and_then(|ps| ps.meetings.get_mut(&key))
-                {
-                    m.filed = true;
-                }
-            }
-        }
     }
 
     /// The overview's text now (None until the area is set up).
@@ -361,12 +317,11 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         self.wiki.replace(&id, &text).await?;
         let ps = st.plenums.entry(p.key.clone()).or_default();
         ps.overview_text = Some(text);
-        self.save(st).await;
+        self.save(st).await?;
         Ok(())
     }
 
-    /// The calendar as last read: an occurrence a meeting is known by keeps it (taking over
-    /// one from before the calendar with the same start), a moved one is renamed and
+    /// The calendar as last read: an occurrence a meeting is known by keeps it, a moved one is renamed and
     /// announced again, one gone from the calendar before it began is cancelled, one that
     /// comes back is not any more.
     async fn follow_calendar(&self, st: &mut State, p: &Plenum, now: DateTime<Utc>) {
@@ -378,14 +333,6 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let ids: HashSet<&str> = occurrences.iter().map(|o| o.id.as_str()).collect();
         let mut moved = Vec::new();
         for occ in &occurrences {
-            if !ps.meetings.contains_key(&occ.id) {
-                let legacy = occ.start.to_string();
-                if ps.meetings.get(&legacy).is_some_and(|m| m.start.is_none()) {
-                    let m = ps.meetings.remove(&legacy).expect("just looked at");
-                    info!(plenum = %p.key, meeting = %occ.id, "A meeting from before the calendar, taken over by its occurrence");
-                    ps.meetings.insert(occ.id.clone(), m);
-                }
-            }
             let Some(m) = ps.meetings.get_mut(&occ.id) else {
                 continue;
             };
@@ -393,6 +340,12 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 info!(plenum = %p.key, meeting = %occ.id, "Back in the calendar");
                 m.cancelled = false;
                 m.skipped = false;
+                // The room was told it is cancelled: it hears that it is on again.
+                if m.cancel_notice.done {
+                    m.announce = Default::default();
+                    m.remind = Default::default();
+                    m.announce_again = true;
+                }
                 m.cancel_notice = Default::default();
             }
             if let Some(old) = m.start {
@@ -413,7 +366,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                     && !m.close.done
                     && !m.cancelled
                     && !m.skipped
-                    && m.start_of(id).is_some_and(|s| s.start(tz) > now)
+                    && m.start.is_some_and(|s| s.start(tz) > now)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -433,7 +386,8 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     }
 
     /// Moved in the calendar: the protocol's title follows, and a meeting still to come is
-    /// announced and reminded of again (the announcement says from when).
+    /// announced again (at once if the room knew the old date; the announcement says from
+    /// when) and reminded of again.
     async fn moved(
         &self,
         st: &mut State,
@@ -442,9 +396,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         old: MeetingKey,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let new = meeting(st, p, id)
-            .start_of(id)
-            .expect("set from the calendar");
+        let new = meeting(st, p, id).start.expect("set from the calendar");
         info!(plenum = %p.key, meeting = %id, from = %old, to = %new, "Moved in the calendar");
         let title = self.free_title(st, p, id, new);
         let doc_id = meeting(st, p, id).doc_id.clone();
@@ -456,11 +408,12 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             let m = meeting(st, p, id);
             if m.announce.done {
                 m.moved_from = Some(m.moved_from.unwrap_or(old));
+                m.announce_again = true;
             }
             m.announce = Default::default();
             m.remind = Default::default();
         }
-        self.save(st).await;
+        self.save(st).await?;
         Ok(())
     }
 
@@ -471,15 +424,15 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         info!(plenum = %p.key, meeting = %id, "Gone from the calendar: cancelled");
         if m.announce.done && !m.cancel_notice.done {
             let txn = m.cancel_notice.txn();
-            let start = m.start_of(id).expect("a known meeting");
+            let start = m.start.expect("a known meeting");
             let link = self.link_of(m);
-            self.save(st).await;
+            self.save(st).await?;
             self.chat
                 .send(&p.room, &protocol::cancellation(p, start, &link), &txn)
                 .await?;
             meeting(st, p, id).cancel_notice.done = true;
         }
-        self.save(st).await;
+        self.save(st).await?;
         Ok(())
     }
 
@@ -494,7 +447,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let ps = st.plenums.entry(key.to_owned()).or_default();
         ps.occurrences = occurrences;
         ps.calendar_read = Some(now);
-        self.save(&st).await;
+        self.save_or_log(&st).await;
     }
 
     async fn tick_plenum(&self, st: &mut State, p: &Plenum, now: DateTime<Utc>) {
@@ -526,7 +479,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             .iter()
             .filter(|(_, m)| !m.close.done && !m.skipped && !m.cancelled)
             .filter_map(|(id, m)| {
-                let start = m.start_of(id)?;
+                let start = m.start?;
                 (m.created || (start.date() >= from && start.date() <= to))
                     .then(|| (start, id.clone()))
             })
@@ -540,8 +493,8 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     }
 
     /// When the meeting ends: the calendar's end, else its start and `duration_minutes`.
-    fn end_of(&self, p: &Plenum, id: &str, m: &Meeting) -> DateTime<Utc> {
-        let start = m.start_of(id).map(|s| s.start(self.tz)).unwrap_or_default();
+    fn end_of(&self, p: &Plenum, m: &Meeting) -> DateTime<Utc> {
+        let start = m.start.map(|s| s.start(self.tz)).unwrap_or_default();
         match m.end {
             Some(end) if MeetingKey(end).start(self.tz) > start => MeetingKey(end).start(self.tz),
             _ => start + Duration::minutes(i64::from(p.duration_minutes)),
@@ -574,8 +527,8 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let (start_key, end) = {
             let m = &st.plenums[&p.key].meetings[key];
             (
-                m.start_of(key).context("a meeting without a start")?,
-                self.end_of(p, key, m),
+                m.start.context("a meeting without a start")?,
+                self.end_of(p, m),
             )
         };
         let start = start_key.start(self.tz);
@@ -589,6 +542,11 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 return Ok(());
             }
             if now < prepare_at {
+                // The room knew another date (or that it was cancelled): told now, not only
+                // when it is due.
+                if m.created && m.announce_again && !m.announce.done {
+                    self.announce(st, p, key).await?;
+                }
                 return Ok(());
             }
             if !m.created && now >= end {
@@ -630,7 +588,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             .await?;
         // Kept before the group is granted, which may fail: the next try finds it by ID.
         st.plenums.entry(p.key.clone()).or_default().collection_id = Some(collection.clone());
-        self.save(st).await;
+        self.save(st).await?;
         if let (Some(group), true) = (&p.group, p.access != Access::House) {
             if !self.wiki.grant_group(&collection, group).await? {
                 warn!(plenum = %p.key, %group, "The wiki has no such group yet (outline-roles makes it): only its admins write here for now");
@@ -747,19 +705,18 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
         let (collection, template, _) = self.setup(st, p).await?;
         let start = st.plenums[&p.key].meetings[key]
-            .start_of(key)
+            .start
             .context("a meeting without a start")?;
-        let title = match st.plenums[&p.key].meetings[key].title.clone() {
-            Some(t) => t,
-            None => self.free_title(st, p, key, start),
-        };
+        // Worked out anew while there is no protocol: the meeting may have moved since a
+        // failed try (the document is found by its ID, not its title).
+        let title = self.free_title(st, p, key, start);
         let ps = st.plenums.get_mut(&p.key).expect("set up");
         let m = ps.meetings.get_mut(key).expect("due");
         m.title = Some(title.clone());
         let doc_id = m.doc_id.clone();
         // Saved before the call: after a crash the same ID is looked up instead of a second
         // protocol being created.
-        self.save(st).await;
+        self.save(st).await?;
         let pending: Vec<String> = st.plenums[&p.key]
             .pending_tops
             .iter()
@@ -788,13 +745,11 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         };
         let ps = st.plenums.get_mut(&p.key).expect("set up");
         ps.pending_tops.clear();
-        let filed = ps.protocols_doc_id.is_some() && doc.parent_id == ps.protocols_doc_id;
         let m = ps.meetings.get_mut(key).expect("inserted");
         m.created = true;
-        m.filed = filed;
         m.url = Some(doc.url);
         info!(plenum = %p.key, meeting = %key, tops = pending.len(), "Protocol ready");
-        self.save(st).await;
+        self.save(st).await?;
         Ok(())
     }
 
@@ -806,13 +761,11 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let Some(doc) = self.wiki.doc(doc_id).await? else {
             return Ok(None);
         };
-        let mut heading = protocol::CHAT_ITEMS_HEADINGS
-            .iter()
-            .any(|h| protocol::contains_line(&doc.text, h));
-        // German in protocols from before 2026-10-22
-        let marker = protocol::TOP_MARKERS
-            .iter()
-            .find(|m| doc.text.contains(**m));
+        let mut heading = protocol::contains_line(&doc.text, protocol::CHAT_ITEMS_HEADING);
+        let marker = doc
+            .text
+            .contains(protocol::TOP_MARKER)
+            .then_some(protocol::TOP_MARKER);
         for line in lines {
             if protocol::contains_line(&doc.text, line) {
                 continue;
@@ -852,9 +805,9 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let txn = m.announce.txn();
         let link = self.link_of(m);
         let doc_id = m.doc_id.clone();
-        let start = m.start_of(key).context("a meeting without a start")?;
+        let start = m.start.context("a meeting without a start")?;
         let moved_from = m.moved_from;
-        self.save(st).await;
+        self.save(st).await?;
         // The number of items is only known in the document now; count the list lines.
         let tops = self
             .wiki
@@ -869,8 +822,11 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 &txn,
             )
             .await?;
-        meeting(st, p, key).announce.done = true;
-        self.save(st).await;
+        let m = meeting(st, p, key);
+        m.announce.done = true;
+        m.announce_again = false;
+        m.moved_from = None;
+        self.save(st).await?;
         Ok(())
     }
 
@@ -881,27 +837,27 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
         let txn = m.remind.txn();
         let link = self.link_of(m);
-        let start = m.start_of(key).context("a meeting without a start")?;
-        self.save(st).await;
+        let start = m.start.context("a meeting without a start")?;
+        self.save(st).await?;
         self.chat
             .send(&p.room, &protocol::reminder(p, start, &link, started), &txn)
             .await?;
         meeting(st, p, key).remind.done = true;
-        self.save(st).await;
+        self.save(st).await?;
         Ok(())
     }
 
     async fn close(&self, st: &mut State, p: &Plenum, key: &str, now: DateTime<Utc>) -> Result<()> {
         let (doc_id, link, start, title) = {
             let m = meeting(st, p, key);
-            let start = m.start_of(key).context("a meeting without a start")?;
+            let start = m.start.context("a meeting without a start")?;
             let title = m.title.clone().unwrap_or_else(|| protocol::title(p, start));
             (m.doc_id.clone(), self.link_of(m), start, title)
         };
         let Some(doc) = self.wiki.doc(&doc_id).await? else {
             warn!(plenum = %p.key, meeting = %key, "The protocol was deleted; closed without it");
             meeting(st, p, key).close.done = true;
-            self.save(st).await;
+            self.save(st).await?;
             return Ok(());
         };
         let outcome = protocol::extract(&doc.text);
@@ -915,11 +871,17 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 date,
                 link: link.clone(),
             };
-            ps.open_tasks = outcome.tasks.iter().map(carried).collect();
-            ps.decisions.retain(|d| d.date != date);
+            // The newest meeting's open tasks are the ones that go on.
+            if ps.open_tasks_from.is_none_or(|from| from <= start) {
+                ps.open_tasks = outcome.tasks.iter().map(carried).collect();
+                ps.open_tasks_from = Some(start);
+            }
+            // By the protocol: two meetings on one day keep their decisions apart.
+            ps.decisions.retain(|d| d.link != link);
             ps.decisions.extend(outcome.decisions.iter().map(carried));
             ps.decisions.sort_by_key(|d| d.date);
         }
+        self.carry_tasks_on(st, p, start).await?;
 
         // 1. the decisions into the plenum's list (found or created again)
         let mut decisions_link = None;
@@ -935,7 +897,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                         .await?;
                 }
                 meeting(st, p, key).close.decisions_saved = true;
-                self.save(st).await;
+                self.save(st).await?;
             }
         }
 
@@ -945,12 +907,12 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 let c = &mut meeting(st, p, key).close;
                 c.pdf_attempts += 1;
                 if c.pdf_attempts < PDF_ATTEMPTS {
-                    self.save(st).await;
+                    self.save(st).await?;
                     return Err(e.context("PDF"));
                 }
                 error!(plenum = %p.key, meeting = %key, "PDF given up after {} attempts: {e:#}", c.pdf_attempts);
                 c.pdf_failed = true;
-                self.save(st).await;
+                self.save(st).await?;
             }
         }
         let c = &meeting(st, p, key).close;
@@ -959,12 +921,12 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 let c = &mut meeting(st, p, key).close;
                 c.pdf_room_attempts += 1;
                 if c.pdf_room_attempts < PDF_ATTEMPTS {
-                    self.save(st).await;
+                    self.save(st).await?;
                     return Err(e.context("PDF into the room"));
                 }
                 error!(plenum = %p.key, meeting = %key, "Posting the PDF given up: {e:#}");
                 c.pdf_room_failed = true;
-                self.save(st).await;
+                self.save(st).await?;
             }
         }
 
@@ -979,7 +941,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             } else {
                 PdfNote::Fine
             };
-            self.save(st).await;
+            self.save(st).await?;
             let text =
                 protocol::summary(p, start, &link, &outcome, decisions_link.as_deref(), note);
             self.chat.send(&p.room, &text, &txn).await?;
@@ -987,7 +949,47 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
         meeting(st, p, key).close.done = true;
         info!(plenum = %p.key, meeting = %key, decisions = outcome.decisions.len(), "Protocol closed");
-        self.save(st).await;
+        self.save(st).await?;
+        Ok(())
+    }
+
+    /// The open tasks into the next protocol that is made already (meetings close together:
+    /// it was prepared before this one closed). Only the tasks not in it yet, so a repeated
+    /// close adds nothing.
+    async fn carry_tasks_on(&self, st: &mut State, p: &Plenum, after: MeetingKey) -> Result<()> {
+        let ps = &st.plenums[&p.key];
+        if ps.open_tasks_from != Some(after) || ps.open_tasks.is_empty() {
+            return Ok(());
+        }
+        let next = ps
+            .meetings
+            .values()
+            .filter(|m| m.created && !m.close.done && !m.cancelled && !m.skipped)
+            .filter(|m| m.start.is_some_and(|s| s > after))
+            .min_by_key(|m| m.start);
+        let Some(next) = next else {
+            return Ok(());
+        };
+        let Some(doc) = self.wiki.doc(&next.doc_id).await? else {
+            return Ok(());
+        };
+        let block = protocol::open_tasks_block(&ps.open_tasks);
+        let missing: Vec<&str> = block
+            .lines()
+            .filter(|l| l.starts_with("- [ ]") && !protocol::contains_line(&doc.text, l))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let heading = if protocol::contains_line(&doc.text, protocol::OPEN_TASKS_HEADING) {
+            String::new()
+        } else {
+            format!("{}\n\n", protocol::OPEN_TASKS_HEADING)
+        };
+        self.wiki
+            .append(&doc.id, &format!("\n\n{heading}{}", missing.join("\n")))
+            .await?;
+        info!(plenum = %p.key, tasks = missing.len(), "Open tasks into the next minutes, made already");
         Ok(())
     }
 
@@ -1022,7 +1024,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 .attach(&doc.id, &file, "application/pdf", pdf)
                 .await?;
             meeting(st, p, key).close.pdf_url = Some(url);
-            self.save(st).await;
+            self.save(st).await?;
         }
         let c = &meeting(st, p, key).close;
         if !c.pdf_linked {
@@ -1038,7 +1040,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                     .await?;
             }
             meeting(st, p, key).close.pdf_linked = true;
-            self.save(st).await;
+            self.save(st).await?;
         }
         Ok(())
     }
@@ -1054,13 +1056,13 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         now: DateTime<Utc>,
     ) -> Result<()> {
         let txn = meeting(st, p, key).close.pdf_room.txn();
-        self.save(st).await;
+        self.save(st).await?;
         let pdf = self.render_pdf(doc, title, now)?;
         self.chat
             .send_file(&p.room, &format!("{title}.pdf"), pdf, &txn)
             .await?;
         meeting(st, p, key).close.pdf_room.done = true;
-        self.save(st).await;
+        self.save(st).await?;
         Ok(())
     }
 
@@ -1102,9 +1104,16 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
     }
 
-    /// Dates and closing: the organizers (everyone in the room when there are none), admins.
+    /// Closing the minutes after the meeting: the organizers (everyone in the room when there
+    /// are none), admins.
     fn may_organize(&self, p: &Plenum, user: &UserId) -> bool {
-        p.organizers.is_empty() || p.organizers.contains(user) || self.admins.contains(user)
+        p.organizers.is_empty() || self.may_close_early(p, user)
+    }
+
+    /// Closing them while the meeting is still on: only the organizers named in the config and
+    /// the admins (a close is final: what is decided afterwards misses the decision list).
+    fn may_close_early(&self, p: &Plenum, user: &UserId) -> bool {
+        p.organizers.contains(user) || self.admins.contains(user)
     }
 
     /// A command from a room; the answer for the room.
@@ -1139,12 +1148,12 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             },
             Command::Close(key) => match self.pick(room, key.as_deref()) {
                 Ok(p) if !self.may_organize(p, &sender.id) => ORGANIZERS_ONLY.to_owned(),
-                Ok(p) => self.request_close(&mut st, p, now),
+                Ok(p) => self.request_close(&mut st, p, &sender.id, now),
                 Err(e) => e,
             },
             Command::Invalid(why) => why,
         };
-        self.save(&st).await;
+        self.save_or_log(&st).await;
         drop(st);
         answer
     }
@@ -1165,7 +1174,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         ps.meetings
             .iter()
             .filter(|(_, m)| m.created && !m.close.done && !m.skipped && !m.cancelled)
-            .filter_map(|(id, m)| Some((m.start_of(id)?, id)))
+            .filter_map(|(id, m)| Some((m.start?, id)))
             .filter(|(start, _)| start.start(self.tz) <= now)
             .max()
             .map(|(_, id)| id.clone())
@@ -1204,8 +1213,8 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let mut list: Vec<(MeetingKey, String)> = all
             .iter()
             .filter(|(_, m)| !m.close.done && !m.skipped && !m.cancelled)
-            .filter(|(id, m)| self.end_of(p, id, m) > now)
-            .filter_map(|(id, m)| Some((m.start_of(id)?, id.clone())))
+            .filter(|(_, m)| self.end_of(p, m) > now)
+            .filter_map(|(id, m)| Some((m.start?, id.clone())))
             .collect();
         list.sort();
         list.truncate(n);
@@ -1327,14 +1336,28 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
     }
 
-    fn request_close(&self, st: &mut State, p: &Plenum, now: DateTime<Utc>) -> String {
+    fn request_close(
+        &self,
+        st: &mut State,
+        p: &Plenum,
+        user: &UserId,
+        now: DateTime<Utc>,
+    ) -> String {
         let Some(key) = self.current_meeting(st, p, now) else {
             return format!(
                 "{} has no open minutes of a meeting that has started.",
                 p.name
             );
         };
-        let start = meeting(st, p, &key).start_of(&key);
+        let end = self.end_of(p, meeting(st, p, &key));
+        if now < end && !self.may_close_early(p, user) {
+            return format!(
+                "⏳ The meeting is on until {}; the minutes close by themselves after it. \
+                 Before that only the organizers or the admins close them.",
+                end.with_timezone(&self.tz).format("%H:%M")
+            );
+        }
+        let start = meeting(st, p, &key).start;
         meeting(st, p, &key).close.requested = true;
         format!(
             "👍 The minutes of {} are closed in a moment: the decisions into the list, the PDF, a summary.",
@@ -1418,7 +1441,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 remembered.invited.insert(m.id.to_string());
             }
         }
-        self.save(&st).await;
+        self.save(&st).await?;
         Ok(())
     }
 }
@@ -1452,7 +1475,7 @@ pub fn help() -> String {
      The meetings are in the plenum's Nextcloud calendar: add, move or cancel them there, or \
      make a series; the bot follows it.\n\n\
      A topic also works like this: reply to a message with `!top`.\n\
-     With several plenums in a room, add the name: `!top kueche-eg dishwasher`.\n\
+     With several plenums in a room, add the key: `!top kitchen-floor-1 dishwasher`.\n\
      In the minutes, every line that starts with \"Decision:\" goes into the list of decisions \
      after the plenum (except on the agenda)."
         .to_owned()
@@ -1476,6 +1499,8 @@ pub(crate) mod fakes {
         pub grants: StdMutex<Vec<(String, String)>>,
         pub attachments: StdMutex<Vec<(String, String, usize)>>,
         pub fail: StdMutex<bool>,
+        /// changes of a document's text (replace, patch, append)
+        pub writes: StdMutex<u32>,
     }
 
     impl FakeWiki {
@@ -1506,7 +1531,11 @@ pub(crate) mod fakes {
             let mut c = self.collections.lock().unwrap();
             let found = known
                 .and_then(|k| c.iter().position(|(id, _)| id == k))
-                .or_else(|| c.iter().position(|(_, n)| n == name));
+                .or_else(|| {
+                    (access != Access::Private)
+                        .then(|| c.iter().position(|(_, n)| n == name))
+                        .flatten()
+                });
             let id = match found {
                 Some(i) => {
                     c[i].1 = name.to_owned();
@@ -1535,17 +1564,6 @@ pub(crate) mod fakes {
             }
             Ok(true)
         }
-        async fn move_doc(&self, id: &str, collection_id: &str, parent_id: &str) -> Result<()> {
-            self.check()?;
-            let mut docs = self.docs.lock().unwrap();
-            let (d, _) = docs
-                .iter_mut()
-                .find(|(d, _)| d.id == id)
-                .context("no doc")?;
-            d.collection_id = Some(collection_id.to_owned());
-            d.parent_id = Some(parent_id.to_owned());
-            Ok(())
-        }
         async fn rename(&self, id: &str, title: &str) -> Result<()> {
             self.check()?;
             let mut docs = self.docs.lock().unwrap();
@@ -1565,7 +1583,7 @@ pub(crate) mod fakes {
                 .find(|(d, _)| d.id == id)
                 .context("no doc")?;
             d.text = text.to_owned();
-            d.revision += 1;
+            *self.writes.lock().unwrap() += 1;
             d.untouched = false;
             Ok(())
         }
@@ -1599,7 +1617,6 @@ pub(crate) mod fakes {
                 title: title.to_owned(),
                 text: text.to_owned(),
                 url: format!("/doc/{}", title.to_lowercase().replace(' ', "-")),
-                revision: 1,
                 untouched: true,
                 collection_id: Some(collection_id.to_owned()),
                 parent_id: parent_id.map(str::to_owned),
@@ -1628,7 +1645,7 @@ pub(crate) mod fakes {
                 return Ok(false);
             }
             d.text = d.text.replacen(find, text, 1);
-            d.revision += 1;
+            *self.writes.lock().unwrap() += 1;
             d.untouched = false;
             Ok(true)
         }
@@ -1640,7 +1657,7 @@ pub(crate) mod fakes {
                 .find(|(d, _)| d.id == id)
                 .context("no doc")?;
             d.text.push_str(text);
-            d.revision += 1;
+            *self.writes.lock().unwrap() += 1;
             d.untouched = false;
             Ok(())
         }
@@ -1848,7 +1865,6 @@ mod tests {
             id: id.into(),
             start,
             end: Some(start.0 + Duration::hours(2)),
-            summary: "Plenum".into(),
         }
     }
 
@@ -1880,16 +1896,16 @@ mod tests {
     }
 
     fn room() -> OwnedRoomId {
-        "!haus:x".try_into().unwrap()
+        "!house:x".try_into().unwrap()
     }
 
     fn cmd(s: &str) -> Command {
-        crate::commands::parse(s, NaiveDate::from_ymd_opt(2026, 10, 20).unwrap()).unwrap()
+        crate::commands::parse(s).unwrap()
     }
 
     #[tokio::test]
     async fn a_meeting_from_preparation_to_summary() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
 
         // An item before the protocol exists waits for it.
@@ -1899,17 +1915,20 @@ mod tests {
         assert!(a.contains("Noted"), "{a}");
 
         e.tick(at(2026, 10, 28, 18, 59)).await; // 4 days before: nothing yet
-        assert!(e.wiki.by_title("Hausplenum 2026-11-01").is_none());
+        assert!(e.wiki.by_title("House plenum 2026-11-01").is_none());
 
         e.tick(at(2026, 10, 29, 19, 0)).await; // 3 days before: prepared and announced
-        let doc = e.wiki.by_title("Hausplenum 2026-11-01").expect("protocol");
+        let doc = e
+            .wiki
+            .by_title("House plenum 2026-11-01")
+            .expect("protocol");
         assert!(doc.text.contains("* Müll (Anna)"), "{}", doc.text);
-        assert!(e.wiki.by_title("Hausplenum: Template").is_some());
-        assert!(e.wiki.by_title("Hausplenum: Decisions").is_some());
+        assert!(e.wiki.by_title("House plenum: Template").is_some());
+        assert!(e.wiki.by_title("House plenum: Decisions").is_some());
         let texts = e.chat.texts();
         assert_eq!(texts.len(), 1);
         assert!(
-            texts[0].contains("https://wiki.test/doc/hausplenum-2026-11-01"),
+            texts[0].contains("https://wiki.test/doc/house-plenum-2026-11-01"),
             "{}",
             texts[0]
         );
@@ -1922,7 +1941,7 @@ mod tests {
             .command(&room(), &anna(), cmd("!top Kaffee"), at(2026, 10, 30, 9, 0))
             .await;
         assert!(a.contains("On the agenda"), "{a}");
-        let doc = e.wiki.by_title("Hausplenum 2026-11-01").unwrap();
+        let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
         // In place of the marker, which stays below it for the next one.
         let marker = protocol::TOP_MARKER;
         assert!(
@@ -1941,10 +1960,10 @@ mod tests {
             let mut docs = e.wiki.docs.lock().unwrap();
             let (d, _) = docs
                 .iter_mut()
-                .find(|(d, _)| d.title == "Hausplenum 2026-11-01")
+                .find(|(d, _)| d.title == "House plenum 2026-11-01")
                 .unwrap();
             d.text
-                .push_str("\nBeschluss: Kompost kommt.\n- [ ] Ben: Tonne kaufen\n");
+                .push_str("\nDecision: Kompost kommt.\n- [ ] Ben: Tonne kaufen\n");
         }
         e.tick(at(2026, 11, 1, 21, 0)).await; // just ended: not closed yet
         assert_eq!(e.chat.texts().len(), 2);
@@ -1953,14 +1972,14 @@ mod tests {
         assert_eq!(texts.len(), 3, "{texts:?}");
         assert!(texts[2].contains("- Kompost kommt."), "{}", texts[2]);
         assert!(texts[2].contains("- Ben: Tonne kaufen"));
-        let decisions = e.wiki.by_title("Hausplenum: Decisions").unwrap();
-        assert!(decisions.text.contains("### [Hausplenum 2026-11-01](https://wiki.test/doc/hausplenum-2026-11-01)\n\n* Kompost kommt."), "{}", decisions.text);
+        let decisions = e.wiki.by_title("House plenum: Decisions").unwrap();
+        assert!(decisions.text.contains("### [House plenum 2026-11-01](https://wiki.test/doc/house-plenum-2026-11-01)\n\n* Kompost kommt."), "{}", decisions.text);
         if e.pdf.enabled {
             assert_eq!(e.wiki.attachments.lock().unwrap().len(), 1);
             assert_eq!(e.chat.files.lock().unwrap().len(), 1);
-            let doc = e.wiki.by_title("Hausplenum 2026-11-01").unwrap();
+            let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
             assert!(doc.text.contains(
-                "The minutes as a PDF:\n\n[Hausplenum 2026-11-01.pdf](/api/attachments.redirect?id=att-1)"
+                "The minutes as a PDF:\n\n[House plenum 2026-11-01.pdf](/api/attachments.redirect?id=att-1)"
             ));
         }
 
@@ -1969,13 +1988,13 @@ mod tests {
         assert_eq!(e.chat.texts().len(), 3);
         assert_eq!(
             decisions.text,
-            e.wiki.by_title("Hausplenum: Decisions").unwrap().text
+            e.wiki.by_title("House plenum: Decisions").unwrap().text
         );
     }
 
     #[tokio::test]
     async fn a_failed_step_is_repeated_and_the_done_ones_are_not() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         *e.wiki.fail.lock().unwrap() = true;
         e.tick(at(2026, 10, 29, 19, 0)).await;
@@ -1983,7 +2002,7 @@ mod tests {
         *e.wiki.fail.lock().unwrap() = false;
         *e.chat.fail.lock().unwrap() = true; // created, but the announcement fails
         e.tick(at(2026, 10, 29, 19, 1)).await;
-        assert!(e.wiki.by_title("Hausplenum 2026-11-01").is_some());
+        assert!(e.wiki.by_title("House plenum 2026-11-01").is_some());
         assert!(e.chat.texts().is_empty());
         *e.chat.fail.lock().unwrap() = false;
         e.tick(at(2026, 10, 29, 19, 2)).await;
@@ -1995,14 +2014,14 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(d, _)| d.title.starts_with("Hausplenum 2026"))
+            .filter(|(d, _)| d.title.starts_with("House plenum 2026"))
             .count();
         assert_eq!(protocols, 1, "no second protocol");
     }
 
     #[tokio::test]
     async fn a_restart_finds_the_protocol_it_created_before_the_crash() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         e.tick(at(2026, 10, 29, 19, 0)).await;
         // As if the bot had crashed after creating the document but before saving it.
@@ -2010,7 +2029,7 @@ mod tests {
             let mut st = e.state.lock().await;
             let m = st
                 .plenums
-                .get_mut("haus")
+                .get_mut("house")
                 .unwrap()
                 .meetings
                 .values_mut()
@@ -2026,30 +2045,44 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(d, _)| d.title.starts_with("Hausplenum 2026"))
+            .filter(|(d, _)| d.title.starts_with("House plenum 2026"))
             .count();
         assert_eq!(protocols, 1);
     }
 
     #[tokio::test]
     async fn the_bot_closes_early_on_request_and_skips_what_it_missed() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         e.tick(at(2026, 10, 29, 19, 0)).await;
         let a = e
             .command(
                 &room(),
                 &anna(),
-                cmd("!protokoll fertig"),
+                cmd("!minutes done"),
                 at(2026, 10, 30, 12, 0),
             )
             .await;
         assert!(a.contains("no open minutes"), "not started yet: {a}");
+        // while it is on, only an organizer or an admin closes it (a close is final)
         let a = e
             .command(
                 &room(),
                 &anna(),
-                cmd("!protokoll fertig"),
+                cmd("!minutes done"),
+                at(2026, 11, 1, 20, 0),
+            )
+            .await;
+        assert!(a.contains("on until 21:00"), "{a}");
+        let admin = Sender {
+            id: "@admin:x".try_into().unwrap(),
+            name: "Admin".into(),
+        };
+        let a = e
+            .command(
+                &room(),
+                &admin,
+                cmd("!minutes done"),
                 at(2026, 11, 1, 20, 0),
             )
             .await;
@@ -2059,28 +2092,28 @@ mod tests {
 
         // The December meeting passes while the bot is down: skipped, not prepared late.
         e.tick(at(2026, 12, 7, 12, 0)).await;
-        assert!(e.wiki.by_title("Hausplenum 2026-12-06").is_none());
+        assert!(e.wiki.by_title("House plenum 2026-12-06").is_none());
         let st = e.state.lock().await;
-        assert!(st.plenums["haus"].meetings["haus-series#2026-12-06"].skipped);
+        assert!(st.plenums["house"].meetings["house-series#2026-12-06"].skipped);
     }
 
     #[tokio::test]
     async fn the_calendar_cancels_adds_and_brings_back_dates() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         let now = at(2026, 10, 20, 12, 0);
         // cancelled before it was prepared: no protocol, nothing said
         calendar(
             e,
-            "haus",
-            |l| l.retain(|o| o.id != "haus-series#2026-11-01"),
+            "house",
+            |l| l.retain(|o| o.id != "house-series#2026-11-01"),
             now,
         )
         .await;
         // an extra date
         calendar(
             e,
-            "haus",
+            "house",
             |l| l.push(occ("extra-1", "2026-11-04 20:00")),
             now,
         )
@@ -2090,11 +2123,11 @@ mod tests {
             a.contains("Next meeting: Wednesday, 4 November 2026 at 20:00"),
             "{a}"
         );
-        assert!(a.contains("calendar “Hausplenum”"), "{a}");
+        assert!(a.contains("calendar “House plenum”"), "{a}");
         e.tick(at(2026, 10, 29, 19, 0)).await;
-        assert!(e.wiki.by_title("Hausplenum 2026-11-01").is_none());
+        assert!(e.wiki.by_title("House plenum 2026-11-01").is_none());
         e.tick(at(2026, 11, 1, 20, 0)).await;
-        assert!(e.wiki.by_title("Hausplenum 2026-11-04").is_some());
+        assert!(e.wiki.by_title("House plenum 2026-11-04").is_some());
         assert_eq!(e.chat.texts().len(), 1, "announced once");
 
         // announced, then cancelled: said once, the protocol stays
@@ -2103,8 +2136,8 @@ mod tests {
         assert!(e.chat.texts().last().unwrap().contains("6 December 2026"));
         calendar(
             e,
-            "haus",
-            |l| l.retain(|o| o.id != "haus-series#2026-12-06"),
+            "house",
+            |l| l.retain(|o| o.id != "house-series#2026-12-06"),
             at(2026, 12, 4, 9, 0),
         )
         .await;
@@ -2117,68 +2150,83 @@ mod tests {
             last.contains("cancelled") && last.contains("6 December 2026"),
             "{last}"
         );
-        assert!(e.wiki.by_title("Hausplenum 2026-12-06").is_some());
+        assert!(e.wiki.by_title("House plenum 2026-12-06").is_some());
         e.tick(at(2026, 12, 6, 18, 30)).await; // no reminder for it
         assert_eq!(e.chat.texts().len(), before + 1);
 
         // the old commands point to the calendar
         let a = e
-            .command(&room(), &anna(), cmd("!plenum absagen 3.1."), now)
+            .command(&room(), &anna(), cmd("!plenum cancel 3.1."), now)
             .await;
         assert!(a.contains("Nextcloud calendar"), "{a}");
     }
 
     #[tokio::test]
     async fn a_cancelled_meeting_that_comes_back_goes_on() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         e.tick(at(2026, 10, 29, 19, 0)).await; // 1.11. announced
-        let gone = e.state.lock().await.plenums["haus"].occurrences.clone();
+        let gone = e.state.lock().await.plenums["house"].occurrences.clone();
         calendar(
             e,
-            "haus",
-            |l| l.retain(|o| o.id != "haus-series#2026-11-01"),
+            "house",
+            |l| l.retain(|o| o.id != "house-series#2026-11-01"),
             at(2026, 10, 30, 9, 0),
         )
         .await;
         e.tick(at(2026, 10, 30, 9, 0)).await;
         assert!(e.chat.texts().last().unwrap().contains("cancelled"));
         // undone in the calendar: the meeting goes on with its protocol
-        e.apply_calendar("haus", gone, at(2026, 10, 30, 10, 0))
+        e.apply_calendar("house", gone, at(2026, 10, 30, 10, 0))
             .await;
+        // the room was told it is cancelled: it hears at once that it is on again
+        e.tick(at(2026, 10, 30, 10, 0)).await;
+        let texts = e.chat.texts();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert!(
+            texts[2].starts_with("📋 **House plenum** on Sunday, 1 November"),
+            "{}",
+            texts[2]
+        );
         e.tick(at(2026, 11, 1, 18, 30)).await;
         assert!(e.chat.texts().last().unwrap().contains("starts at 19:00"));
     }
 
     #[tokio::test]
     async fn the_calendar_unread_changes_nothing() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         e.tick(at(2026, 10, 29, 19, 0)).await;
         // a calendar that was never read knows nothing: nothing is cancelled
         {
             let mut st = e.state.lock().await;
-            let ps = st.plenums.get_mut("haus").unwrap();
+            let ps = st.plenums.get_mut("house").unwrap();
             ps.calendar_read = None;
             ps.occurrences.clear();
         }
         e.tick(at(2026, 10, 30, 9, 0)).await;
         assert_eq!(e.chat.texts().len(), 1);
-        assert!(!e.state.lock().await.plenums["haus"].meetings["haus-series#2026-11-01"].cancelled);
+        assert!(
+            !e.state.lock().await.plenums["house"].meetings["house-series#2026-11-01"].cancelled
+        );
     }
 
     #[tokio::test]
     async fn several_plenums_in_one_room_need_the_key() {
         let t = setup(vec![
-            plenum("kueche-eg", "Küchenplenum EG", "!kitchens:x"),
-            plenum("kueche-og", "Küchenplenum OG", "!kitchens:x"),
+            plenum(
+                "kitchen-floor-0",
+                "Kitchen plenum ground floor",
+                "!kitchens:x",
+            ),
+            plenum("kitchen-floor-3", "Kitchen plenum 3rd floor", "!kitchens:x"),
         ]);
         let e = &t.engine;
         let r: OwnedRoomId = "!kitchens:x".try_into().unwrap();
         let now = at(2026, 10, 20, 12, 0);
         let a = e.command(&r, &anna(), cmd("!top Spülmaschine"), now).await;
         assert!(
-            a.contains("several plenums") && a.contains("`kueche-eg`"),
+            a.contains("several plenums") && a.contains("`kitchen-floor-0`"),
             "{a}"
         );
         let a = e
@@ -2186,45 +2234,56 @@ mod tests {
                 &r,
                 &anna(),
                 crate::commands::parse_for(
-                    "!top kueche-og Spülmaschine",
-                    now.date_naive(),
-                    &["kueche-eg", "kueche-og"],
+                    "!top kitchen-floor-3 Spülmaschine",
+                    &["kitchen-floor-0", "kitchen-floor-3"],
                 )
                 .unwrap(),
                 now,
             )
             .await;
-        assert!(a.contains("Noted for Küchenplenum OG"), "{a}");
+        assert!(a.contains("Noted for Kitchen plenum 3rd floor"), "{a}");
         let a = e.command(&room(), &anna(), cmd("!top x"), now).await;
         assert!(a.contains("no plenum"), "{a}");
         // Both get their own template and decision list in the shared collection.
         e.tick(at(2026, 10, 29, 19, 0)).await;
-        assert!(e.wiki.by_title("Küchenplenum EG: Template").is_some());
-        assert!(e.wiki.by_title("Küchenplenum OG: Decisions").is_some());
-        let og = e.wiki.by_title("Küchenplenum OG 2026-11-01").unwrap();
+        assert!(e
+            .wiki
+            .by_title("Kitchen plenum ground floor: Template")
+            .is_some());
+        assert!(e
+            .wiki
+            .by_title("Kitchen plenum 3rd floor: Decisions")
+            .is_some());
+        let og = e
+            .wiki
+            .by_title("Kitchen plenum 3rd floor 2026-11-01")
+            .unwrap();
         assert!(og.text.contains("Spülmaschine"));
-        let eg = e.wiki.by_title("Küchenplenum EG 2026-11-01").unwrap();
+        let eg = e
+            .wiki
+            .by_title("Kitchen plenum ground floor 2026-11-01")
+            .unwrap();
         assert!(!eg.text.contains("Spülmaschine"));
     }
 
     #[tokio::test]
     async fn a_template_edited_in_the_wiki_is_used() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         e.tick(at(2026, 10, 29, 19, 0)).await; // creates the template (and November's protocol)
         {
             let mut docs = e.wiki.docs.lock().unwrap();
             let (d, _) = docs
                 .iter_mut()
-                .find(|(d, _)| d.title == "Hausplenum: Template")
+                .find(|(d, _)| d.title == "House plenum: Template")
                 .unwrap();
-            d.text = "Eigene Vorlage für {{plenum}} am {{datum}}\n\n## Tagesordnung\n".into();
+            d.text = "Our own template for {{plenum}} on {{iso_date}}\n\n## Agenda\n".into();
         }
         e.tick(at(2026, 12, 3, 19, 0)).await;
-        let dec = e.wiki.by_title("Hausplenum 2026-12-06").unwrap();
+        let dec = e.wiki.by_title("House plenum 2026-12-06").unwrap();
         assert!(
             dec.text
-                .starts_with("Eigene Vorlage für Hausplenum am 06.12.2026"),
+                .starts_with("Our own template for House plenum on 2026-12-06"),
             "{}",
             dec.text
         );
@@ -2237,7 +2296,6 @@ mod tests {
             .find(|(d, del)| d.title == title && !del)
             .unwrap();
         f(&mut d.text);
-        d.revision += 1;
     }
 
     fn delete_doc(e: &Engine<FakeWiki, FakeChat>, title: &str) {
@@ -2247,22 +2305,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_chat_item_changes_nothing_else_and_decides_nothing() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         e.tick(at(2026, 10, 29, 19, 0)).await;
-        edit_doc(e, "Hausplenum 2026-11-01", |t| {
+        edit_doc(e, "House plenum 2026-11-01", |t| {
             t.push_str("\n* Variante [x] Hof oder [ ] Keller\n")
         });
         let a = e
             .command(
                 &room(),
                 &anna(),
-                cmd("!top Beschluss: Kasse an Anna [ ] sofort"),
+                cmd("!top Decision: Kasse an Anna [ ] sofort"),
                 at(2026, 10, 30, 9, 0),
             )
             .await;
         assert!(a.contains("On the agenda"), "{a}");
-        let doc = e.wiki.by_title("Hausplenum 2026-11-01").unwrap();
+        let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
         assert!(
             doc.text.contains("* Variante [x] Hof oder [ ] Keller"),
             "untouched: {}",
@@ -2270,7 +2328,7 @@ mod tests {
         );
         assert!(
             doc.text
-                .contains("* Item: Beschluss: Kasse an Anna ( ) sofort (Anna)"),
+                .contains("* Item: Decision: Kasse an Anna ( ) sofort (Anna)"),
             "{}",
             doc.text
         );
@@ -2278,12 +2336,12 @@ mod tests {
             .command(
                 &room(),
                 &anna(),
-                cmd("!protokoll fertig"),
-                at(2026, 11, 1, 20, 0),
+                cmd("!minutes done"),
+                at(2026, 11, 1, 21, 5),
             )
             .await;
         assert!(a.contains("closed in a moment"), "{a}");
-        e.tick(at(2026, 11, 1, 20, 1)).await;
+        e.tick(at(2026, 11, 1, 21, 6)).await;
         let summary = e.chat.texts().last().unwrap().clone();
         assert!(summary.contains("No decisions"), "{summary}");
         assert!(!summary.contains("Kasse"), "{summary}");
@@ -2291,17 +2349,17 @@ mod tests {
 
     #[tokio::test]
     async fn without_the_marker_items_go_under_a_heading_of_their_own() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         e.tick(at(2026, 10, 29, 19, 0)).await;
-        edit_doc(e, "Hausplenum 2026-11-01", |t| {
+        edit_doc(e, "House plenum 2026-11-01", |t| {
             *t = t.replace(protocol::TOP_MARKER, "")
         });
         for item in ["!top Garten", "!top Keller"] {
             e.command(&room(), &anna(), cmd(item), at(2026, 10, 30, 9, 0))
                 .await;
         }
-        let doc = e.wiki.by_title("Hausplenum 2026-11-01").unwrap();
+        let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
         assert!(
             doc.text
                 .ends_with("## New items from the chat\n\n* Garten (Anna)\n\n* Keller (Anna)"),
@@ -2311,53 +2369,53 @@ mod tests {
         // Sent again (a lost answer, a second try): not twice.
         e.command(&room(), &anna(), cmd("!top Garten"), at(2026, 10, 30, 9, 1))
             .await;
-        let doc = e.wiki.by_title("Hausplenum 2026-11-01").unwrap();
+        let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
         assert_eq!(doc.text.matches("Garten").count(), 1);
     }
 
     #[tokio::test]
     async fn a_deleted_decision_list_or_collection_comes_back() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         e.tick(at(2026, 10, 29, 19, 0)).await;
-        delete_doc(e, "Hausplenum: Decisions");
-        edit_doc(e, "Hausplenum 2026-11-01", |t| {
-            t.push_str("\nBeschluss: Kompost.\n")
+        delete_doc(e, "House plenum: Decisions");
+        edit_doc(e, "House plenum 2026-11-01", |t| {
+            t.push_str("\nDecision: Kompost.\n")
         });
         e.tick(at(2026, 11, 2, 9, 0)).await;
         let list = e
             .wiki
-            .by_title("Hausplenum: Decisions")
+            .by_title("House plenum: Decisions")
             .expect("created again");
         assert!(list.text.contains("Kompost."), "{}", list.text);
         assert!(e.chat.texts().last().unwrap().contains("are closed:"));
         // The collection is looked up again for the next protocol.
         e.wiki.collections.lock().unwrap().clear();
         e.tick(at(2026, 12, 3, 19, 0)).await;
-        assert!(e.wiki.by_title("Hausplenum 2026-12-06").is_some());
+        assert!(e.wiki.by_title("House plenum 2026-12-06").is_some());
     }
 
     #[tokio::test]
     async fn one_failing_meeting_does_not_hold_up_the_next() {
-        let mut p = plenum("haus", "Hausplenum", "!haus:x");
+        let mut p = plenum("house", "House plenum", "!house:x");
         p.prepare_days = 8;
         let t = setup(vec![p]);
         let e = &t.engine;
         calendar(
             e,
-            "haus",
+            "house",
             |l| l.push(occ("weekly#2026-11-08", "2026-11-08 19:00")),
             at(2026, 10, 29, 0, 0),
         )
         .await;
         e.tick(at(2026, 10, 29, 19, 0)).await; // Nov 1 and Nov 8 prepared
-        delete_doc(e, "Hausplenum 2026-11-01");
+        delete_doc(e, "House plenum 2026-11-01");
         // Nov 1 closes without a protocol; Nov 8 is unaffected.
         e.tick(at(2026, 11, 2, 9, 0)).await;
-        assert!(e.wiki.by_title("Hausplenum 2026-11-08").is_some());
+        assert!(e.wiki.by_title("House plenum 2026-11-08").is_some());
         let st = e.state.lock().await;
         assert!(
-            st.plenums["haus"].meetings["haus-series#2026-11-01"]
+            st.plenums["house"].meetings["house-series#2026-11-01"]
                 .close
                 .done
         );
@@ -2365,7 +2423,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pdf_that_does_not_reach_the_room_is_still_in_the_wiki() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         if !e.pdf.enabled {
             return;
@@ -2387,11 +2445,11 @@ mod tests {
 
     #[tokio::test]
     async fn two_meetings_on_one_day_get_two_protocols() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         calendar(
             e,
-            "haus",
+            "house",
             |l| l.push(occ("noon", "2026-11-01 12:00")),
             at(2026, 10, 28, 0, 0),
         )
@@ -2404,7 +2462,7 @@ mod tests {
             .unwrap()
             .iter()
             .map(|(d, _)| d.title.clone())
-            .filter(|t| t.starts_with("Hausplenum 2026-11-01"))
+            .filter(|t| t.starts_with("House plenum 2026-11-01"))
             .collect();
         assert_eq!(titles.len(), 2, "{titles:?}");
         assert!(
@@ -2416,8 +2474,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_meetings_on_one_day_keep_their_decisions_and_the_later_ones_tasks() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        calendar(
+            e,
+            "house",
+            |l| l.push(occ("noon", "2026-11-01 12:00")),
+            at(2026, 10, 28, 0, 0),
+        )
+        .await;
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        edit_doc(e, "House plenum 2026-11-01", |t| {
+            t.push_str("\nDecision: noon decides.\n- [ ] Ann: noon task\n")
+        });
+        edit_doc(e, "House plenum 2026-11-01 19:00", |t| {
+            t.push_str("\nDecision: evening decides.\n- [ ] Ben: evening task\n")
+        });
+        // the evening closes first (asked for), the noon one later (by the time)
+        let admin = Sender {
+            id: "@admin:x".try_into().unwrap(),
+            name: "Admin".into(),
+        };
+        e.command(
+            &room(),
+            &admin,
+            cmd("!minutes done"),
+            at(2026, 11, 1, 19, 30),
+        )
+        .await;
+        e.tick(at(2026, 11, 1, 19, 31)).await;
+        e.tick(at(2026, 11, 2, 9, 0)).await;
+        let st = e.state.lock().await;
+        let ps = &st.plenums["house"];
+        let decisions: Vec<&str> = ps.decisions.iter().map(|d| d.text.as_str()).collect();
+        assert_eq!(decisions.len(), 2, "{decisions:?}");
+        assert!(decisions.contains(&"noon decides.") && decisions.contains(&"evening decides."));
+        // the evening's tasks go on: the noon meeting was earlier
+        let tasks: Vec<&str> = ps.open_tasks.iter().map(|d| d.text.as_str()).collect();
+        assert_eq!(tasks, ["Ben: evening task"]);
+    }
+
+    #[tokio::test]
+    async fn open_tasks_reach_minutes_made_already() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        // the next meeting two days later: prepared before this one closes
+        calendar(
+            e,
+            "house",
+            |l| l.push(occ("soon", "2026-11-03 19:00")),
+            at(2026, 10, 28, 0, 0),
+        )
+        .await;
+        e.tick(at(2026, 10, 31, 19, 0)).await;
+        edit_doc(e, "House plenum 2026-11-01", |t| {
+            t.push_str("\n- [ ] Ben: buy a bin [big]\n")
+        });
+        e.tick(at(2026, 11, 2, 9, 0)).await; // the 1st closed, the 3rd prepared before
+        let next = e.wiki.by_title("House plenum 2026-11-03").unwrap();
+        assert!(
+            next.text.contains(protocol::OPEN_TASKS_HEADING)
+                && next
+                    .text
+                    .contains("- [ ] Ben: buy a bin (big) (since 1 Nov 2026)"),
+            "{}",
+            next.text
+        );
+        // once
+        e.tick(at(2026, 11, 2, 9, 1)).await;
+        let again = e.wiki.by_title("House plenum 2026-11-03").unwrap();
+        assert_eq!(again.text.matches("Ben: buy a bin").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_stops_the_step() {
+        let mut t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        // the state file cannot be written (its place is a directory)
+        let blocked = t._dir.path().join("blocked");
+        std::fs::create_dir_all(blocked.join("x")).unwrap();
+        t.engine.state_path = blocked;
+        let e = &t.engine;
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        assert!(
+            e.chat.texts().is_empty(),
+            "nothing is sent that is not on disk"
+        );
+        assert!(e.wiki.by_title("House plenum 2026-11-01").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_private_collection_is_never_taken_over_by_its_name() {
+        let t = setup(vec![finance()]);
+        let e = &t.engine;
+        e.wiki
+            .collections
+            .lock()
+            .unwrap()
+            .push(("col-other".into(), "Finance group".into()));
+        e.tick(at(2026, 10, 20, 12, 0)).await;
+        let id = e.state.lock().await.plenums["finance"]
+            .collection_id
+            .clone();
+        assert!(id.is_some_and(|id| id != "col-other"));
+    }
+
+    #[tokio::test]
     async fn organizers_close_early_and_others_may_not() {
-        let mut p = plenum("haus", "Hausplenum", "!haus:x");
+        let mut p = plenum("house", "House plenum", "!house:x");
         p.organizers = HashSet::from(["@ben:x".try_into().unwrap()]);
         let t = setup(vec![p]);
         let e = &t.engine;
@@ -2426,7 +2590,7 @@ mod tests {
             .command(
                 &room(),
                 &anna(),
-                cmd("!protokoll fertig"),
+                cmd("!minutes done"),
                 at(2026, 11, 1, 20, 0),
             )
             .await;
@@ -2436,19 +2600,14 @@ mod tests {
             name: "Ben".into(),
         };
         let a = e
-            .command(
-                &room(),
-                &ben,
-                cmd("!protokoll fertig"),
-                at(2026, 11, 1, 20, 0),
-            )
+            .command(&room(), &ben, cmd("!minutes done"), at(2026, 11, 1, 20, 0))
             .await;
         assert!(a.contains("are closed in a moment"), "{a}");
     }
 
     #[tokio::test]
     async fn a_reminder_after_the_start_says_so() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         e.tick(at(2026, 11, 1, 19, 30)).await; // the bot comes back during the meeting
         let texts = e.chat.texts();
@@ -2460,35 +2619,35 @@ mod tests {
 
     #[test]
     fn agenda_items_are_counted_in_their_section() {
-        let md = "## Tagesordnung\n\n* a\n* b\n1. c\n\n## Protokoll\n\n* not\n";
+        let md = "## Agenda\n\n* a\n* b\n1. c\n\n## Minutes\n\n* not\n";
         assert_eq!(count_tops(md), 3);
     }
 
     fn kitchen() -> Plenum {
         Plenum {
             key: "kitchen-floor-1".into(),
-            name: "Küchenplenum 1. OG".into(),
+            name: "Kitchen plenum 1st floor".into(),
             room: "!k1:x".try_into().unwrap(),
-            collection: "Küche 1. OG".into(),
+            collection: "Kitchen 1st floor".into(),
             group: Some("kitchen-floor-1".into()),
             access: Access::Members,
-            ..plenum("kitchen-floor-1", "Küchenplenum 1. OG", "!k1:x")
+            ..plenum("kitchen-floor-1", "Kitchen plenum 1st floor", "!k1:x")
         }
     }
 
     fn finance() -> Plenum {
         Plenum {
-            collection: "Finanz-AG".into(),
+            collection: "Finance group".into(),
             group: Some("finance".into()),
             access: Access::Private,
-            ..plenum("finance", "Finanzplenum", "!fin:x")
+            ..plenum("finance", "Finance plenum", "!fin:x")
         }
     }
 
     #[tokio::test]
     async fn every_plenum_gets_its_area_with_the_access_its_group_needs() {
         let t = setup(vec![
-            plenum("haus", "Hausplenum", "!haus:x"),
+            plenum("house", "House plenum", "!house:x"),
             kitchen(),
             finance(),
         ]);
@@ -2496,12 +2655,12 @@ mod tests {
         e.wiki.groups.lock().unwrap().push("kitchen-floor-1".into()); // finance: not yet in the wiki
         e.tick(at(2026, 10, 20, 12, 0)).await;
         for title in [
-            "Küchenplenum 1. OG: Overview",
-            "Küchenplenum 1. OG: Rules",
-            "Küchenplenum 1. OG: Minutes",
-            "Küchenplenum 1. OG: Decisions",
-            "Küchenplenum 1. OG: Template",
-            "Hausplenum: Overview",
+            "Kitchen plenum 1st floor: Overview",
+            "Kitchen plenum 1st floor: Rules",
+            "Kitchen plenum 1st floor: Minutes",
+            "Kitchen plenum 1st floor: Decisions",
+            "Kitchen plenum 1st floor: Template",
+            "House plenum: Overview",
         ] {
             assert!(e.wiki.by_title(title).is_some(), "{title}");
         }
@@ -2512,8 +2671,8 @@ mod tests {
             access.iter().find(|(c, _)| c == id).unwrap().1
         };
         assert_eq!(of("Plena"), Access::House);
-        assert_eq!(of("Küche 1. OG"), Access::Members);
-        assert_eq!(of("Finanz-AG"), Access::Private);
+        assert_eq!(of("Kitchen 1st floor"), Access::Members);
+        assert_eq!(of("Finance group"), Access::Private);
         let grants = e.wiki.grants.lock().unwrap().clone();
         assert_eq!(grants.len(), 1, "{grants:?}");
         assert_eq!(grants[0].1, "kitchen-floor-1");
@@ -2524,7 +2683,7 @@ mod tests {
         e.tick(at(2026, 10, 20, 13, 1)).await;
         assert_eq!(e.wiki.grants.lock().unwrap().len(), 2);
         // the overview: the next dates, how to bring in a topic, the links
-        let o = e.wiki.by_title("Hausplenum: Overview").unwrap();
+        let o = e.wiki.by_title("House plenum: Overview").unwrap();
         assert!(
             o.text.contains("Sunday, 1 November 2026 at 19:00"),
             "{}",
@@ -2532,36 +2691,33 @@ mod tests {
         );
         assert!(
             o.text
-                .contains("[Hausplenum: Rules](https://wiki.test/doc/hausplenum:-rules)"),
+                .contains("[House plenum: Rules](https://wiki.test/doc/house-plenum:-rules)"),
             "{}",
             o.text
         );
         // written only when it changes
-        let rev = o.revision;
+        let writes = *e.wiki.writes.lock().unwrap();
         e.tick(at(2026, 10, 20, 13, 2)).await;
-        assert_eq!(
-            e.wiki.by_title("Hausplenum: Overview").unwrap().revision,
-            rev
-        );
+        assert_eq!(*e.wiki.writes.lock().unwrap(), writes);
     }
 
     #[tokio::test]
     async fn an_area_from_before_is_renamed_not_made_again() {
-        // As the bot left it in German (2026-10-22): another collection name, other titles.
+        // The plenum was renamed in the config: another collection name, other titles.
         let t = setup(vec![kitchen()]);
         let e = &t.engine;
         e.wiki
             .collections
             .lock()
             .unwrap()
-            .push(("col-de".into(), "Küche 1. OG (alt)".into()));
+            .push(("col-de".into(), "Kitchen 1st floor (old)".into()));
         for (id, title) in [
-            ("rules-de", "Regeln Küchenplenum 1. OG"),
-            ("decisions-de", "Beschlüsse Küchenplenum 1. OG"),
-            ("template-de", "Vorlage Küchenplenum 1. OG"),
+            ("rules-de", "Old rules of kitchen 1"),
+            ("decisions-de", "Old decisions of kitchen 1"),
+            ("template-de", "Old template of kitchen 1"),
         ] {
             e.wiki
-                .create_doc(id, "col-de", None, title, "Deutscher Text")
+                .create_doc(id, "col-de", None, title, "Old text")
                 .await
                 .unwrap();
         }
@@ -2572,7 +2728,7 @@ mod tests {
                 .iter_mut()
                 .find(|(d, _)| d.id == "decisions-de")
                 .unwrap();
-            d.text = "Eigene Beschlüsse".into();
+            d.text = "Our own decisions".into();
             d.untouched = false;
         }
         {
@@ -2587,86 +2743,55 @@ mod tests {
         }
         e.tick(at(2026, 10, 20, 12, 0)).await;
         let cols = e.wiki.collections.lock().unwrap().clone();
-        assert_eq!(cols, vec![("col-de".to_owned(), "Küche 1. OG".to_owned())]);
-        let rules = e.wiki.by_title("Küchenplenum 1. OG: Rules").unwrap();
+        assert_eq!(
+            cols,
+            vec![("col-de".to_owned(), "Kitchen 1st floor".to_owned())]
+        );
+        let rules = e.wiki.by_title("Kitchen plenum 1st floor: Rules").unwrap();
         assert_eq!(rules.id, "rules-de");
         assert_eq!(rules.text, protocol::rules_doc_text(&kitchen()));
-        let template = e.wiki.by_title("Küchenplenum 1. OG: Template").unwrap();
+        let template = e
+            .wiki
+            .by_title("Kitchen plenum 1st floor: Template")
+            .unwrap();
         assert_eq!(template.id, "template-de");
         assert_eq!(template.text, protocol::DEFAULT_TEMPLATE);
-        let decisions = e.wiki.by_title("Küchenplenum 1. OG: Decisions").unwrap();
+        let decisions = e
+            .wiki
+            .by_title("Kitchen plenum 1st floor: Decisions")
+            .unwrap();
         assert_eq!(decisions.id, "decisions-de");
-        assert_eq!(decisions.text, "Eigene Beschlüsse");
-        assert!(e.wiki.by_title("Regeln Küchenplenum 1. OG").is_none());
+        assert_eq!(decisions.text, "Our own decisions");
+        assert!(e.wiki.by_title("Old rules of kitchen 1").is_none());
     }
 
     #[tokio::test]
-    async fn protocols_are_filed_and_the_old_ones_moved_there_once() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+    async fn protocols_are_filed_under_the_minutes() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
-        // a protocol of an older version, at the top of the collection
-        {
-            let mut st = e.state.lock().await;
-            let ps = st.plenums.entry("haus".into()).or_default();
-            ps.meetings.insert(
-                "haus-series#2026-10-04".into(),
-                Meeting {
-                    doc_id: "old".into(),
-                    created: true,
-                    ..Default::default()
-                },
-            );
-            ps.meetings
-                .get_mut("haus-series#2026-10-04")
-                .unwrap()
-                .close
-                .done = true;
-        }
-        let col = e
-            .wiki
-            .ensure_collection(None, "Plena", Access::House)
-            .await
-            .unwrap();
-        e.wiki
-            .create_doc("old", &col, None, "Hausplenum 2026-10-04", "alt")
-            .await
-            .unwrap();
-        e.tick(at(2026, 10, 29, 19, 0)).await; // prepares the 1.11. too
-        let protocols = e.wiki.by_title("Hausplenum: Minutes").unwrap();
-        let old = e.wiki.by_title("Hausplenum 2026-10-04").unwrap();
-        let new = e.wiki.by_title("Hausplenum 2026-11-01").unwrap();
-        assert_eq!(old.parent_id.as_deref(), Some(protocols.id.as_str()));
+        e.tick(at(2026, 10, 29, 19, 0)).await; // prepares the 1.11.
+        let protocols = e.wiki.by_title("House plenum: Minutes").unwrap();
+        let new = e.wiki.by_title("House plenum 2026-11-01").unwrap();
         assert_eq!(new.parent_id.as_deref(), Some(protocols.id.as_str()));
-        // someone files it elsewhere: left there
-        e.wiki.move_doc("old", &col, "elsewhere").await.unwrap();
-        e.tick(at(2026, 10, 29, 21, 0)).await;
-        assert_eq!(
-            e.wiki
-                .by_title("Hausplenum 2026-10-04")
-                .unwrap()
-                .parent_id
-                .as_deref(),
-            Some("elsewhere")
-        );
     }
 
     #[tokio::test]
     async fn open_tasks_come_along_to_the_next_protocol_and_the_overview() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         e.tick(at(2026, 10, 29, 19, 0)).await;
         {
             let mut docs = e.wiki.docs.lock().unwrap();
             let (d, _) = docs
                 .iter_mut()
-                .find(|(d, _)| d.title == "Hausplenum 2026-11-01")
+                .find(|(d, _)| d.title == "House plenum 2026-11-01")
                 .unwrap();
             d.text.push_str(
-                "\nBeschluss: Kompost kommt.\n- [ ] Ben: Tonne kaufen\n- [x] Cara: Liste\n",
+                "\nDecision: Kompost kommt.\n- [ ] Ben: Tonne kaufen\n- [x] Cara: Liste\n",
             );
         }
         e.tick(at(2026, 11, 2, 9, 0)).await; // closed
-        let o = e.wiki.by_title("Hausplenum: Overview").unwrap();
+        let o = e.wiki.by_title("House plenum: Overview").unwrap();
         assert!(
             o.text
                 .contains("* Ben: Tonne kaufen (since the [plenum on 1 Nov 2026]"),
@@ -2683,7 +2808,7 @@ mod tests {
         e.tick(at(2026, 12, 3, 19, 0)).await;
         let next = e
             .wiki
-            .by_title("Hausplenum 2026-12-06")
+            .by_title("House plenum 2026-12-06")
             .expect("next protocol");
         assert!(
             next.text
@@ -2696,26 +2821,24 @@ mod tests {
 
     #[tokio::test]
     async fn a_meeting_moved_in_the_calendar_keeps_its_protocol() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         e.tick(at(2026, 10, 29, 19, 0)).await; // 1.11. prepared and announced
         assert_eq!(e.chat.texts().len(), 1);
-        let doc = e.wiki.by_title("Hausplenum 2026-11-01").unwrap();
+        let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
         // the same occurrence a week later at 18:00 (RECURRENCE-ID: the ID stays)
         let move_to = |l: &mut Vec<Occurrence>| {
-            for o in l.iter_mut().filter(|o| o.id == "haus-series#2026-11-01") {
+            for o in l.iter_mut().filter(|o| o.id == "house-series#2026-11-01") {
                 *o = occ(&o.id, "2026-11-08 18:00");
             }
         };
-        calendar(e, "haus", move_to, at(2026, 10, 30, 9, 0)).await;
+        calendar(e, "house", move_to, at(2026, 10, 30, 9, 0)).await;
         e.tick(at(2026, 10, 30, 9, 0)).await;
-        assert!(e.wiki.by_title("Hausplenum 2026-11-01").is_none());
-        let moved = e.wiki.by_title("Hausplenum 2026-11-08").expect("renamed");
+        assert!(e.wiki.by_title("House plenum 2026-11-01").is_none());
+        let moved = e.wiki.by_title("House plenum 2026-11-08").expect("renamed");
         assert_eq!(moved.id, doc.id, "the same protocol");
-        // nothing at the old time; announced again prepare_days before, saying from when
-        e.tick(at(2026, 11, 1, 18, 30)).await;
-        assert_eq!(e.chat.texts().len(), 1);
-        e.tick(at(2026, 11, 5, 18, 0)).await;
+        // the room knew the old date: told at once (not only prepare_days before), saying
+        // from when; nothing at the old time, nothing again when it is due
         let texts = e.chat.texts();
         assert_eq!(texts.len(), 2, "{texts:?}");
         assert!(
@@ -2724,54 +2847,38 @@ mod tests {
             "{}",
             texts[1]
         );
-        e.tick(at(2026, 11, 8, 17, 30)).await;
-        assert!(e.chat.texts()[2].contains("starts at 18:00"));
+        e.tick(at(2026, 11, 1, 18, 30)).await;
+        e.tick(at(2026, 11, 5, 18, 0)).await;
+        assert_eq!(e.chat.texts().len(), 2);
+        // moved once more: from the date the room was told last
+        calendar(
+            e,
+            "house",
+            |l| {
+                for o in l.iter_mut().filter(|o| o.id == "house-series#2026-11-01") {
+                    *o = occ(&o.id, "2026-11-08 18:30");
+                }
+            },
+            at(2026, 11, 5, 18, 1),
+        )
+        .await;
+        e.tick(at(2026, 11, 5, 18, 1)).await;
+        let texts = e.chat.texts();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert!(
+            texts[2].contains("at 18:30")
+                && texts[2].contains("moved from Sunday, 8 November 2026 at 18:00"),
+            "{}",
+            texts[2]
+        );
+        e.tick(at(2026, 11, 8, 18, 0)).await;
+        assert!(e.chat.texts()[3].contains("starts at 18:30"));
         let a = e
             .command(&room(), &anna(), cmd("!plenum"), at(2026, 11, 8, 17, 31))
             .await;
         assert!(
-            a.contains("8 November 2026 at 18:00") && a.contains(&moved.url),
+            a.contains("8 November 2026 at 18:30") && a.contains(&moved.url),
             "{a}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_meeting_from_before_the_calendar_is_taken_over() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
-        let e = &t.engine;
-        // the old state: keyed by its start, prepared and announced already
-        {
-            let mut st = e.state.lock().await;
-            let ps = st.plenums.get_mut("haus").unwrap();
-            let mut m = Meeting {
-                doc_id: "old-doc".into(),
-                created: true,
-                url: Some("/doc/old".into()),
-                ..Default::default()
-            };
-            m.announce.done = true;
-            ps.meetings.insert("2026-11-01 19:00".into(), m);
-        }
-        let col = e
-            .wiki
-            .ensure_collection(None, "Plena", Access::House)
-            .await
-            .unwrap();
-        e.wiki
-            .create_doc("old-doc", &col, None, "Hausplenum 2026-11-01", "alt")
-            .await
-            .unwrap();
-        e.tick(at(2026, 10, 30, 9, 0)).await;
-        let st = e.state.lock().await;
-        let ps = &st.plenums["haus"];
-        assert!(!ps.meetings.contains_key("2026-11-01 19:00"));
-        let m = &ps.meetings["haus-series#2026-11-01"];
-        assert_eq!(m.doc_id, "old-doc");
-        assert!(m.announce.done && !m.cancelled);
-        drop(st);
-        assert!(
-            e.chat.texts().is_empty(),
-            "not announced twice, not cancelled"
         );
     }
 
@@ -2863,11 +2970,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_room_with_a_plenum_without_group_is_never_managed() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x")]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let mut e = t.engine;
         e.me = Some("@plenum-bot:x".try_into().unwrap());
         e.chat.members.lock().unwrap().push((
-            "!haus:x".into(),
+            "!house:x".into(),
             Member {
                 id: "@eve:x".try_into().unwrap(),
                 admin: false,
@@ -2880,23 +2987,23 @@ mod tests {
 
     #[tokio::test]
     async fn a_private_plenum_shows_only_in_its_room_and_to_admins() {
-        let t = setup(vec![plenum("haus", "Hausplenum", "!haus:x"), finance()]);
+        let t = setup(vec![plenum("house", "House plenum", "!house:x"), finance()]);
         let e = &t.engine;
         let elsewhere: OwnedRoomId = "!botroom:x".try_into().unwrap();
         let now = at(2026, 10, 20, 12, 0);
         let a = e.command(&elsewhere, &anna(), cmd("!plenum"), now).await;
         assert!(
-            a.contains("Hausplenum") && !a.contains("Finanzplenum"),
+            a.contains("House plenum") && !a.contains("Finance plenum"),
             "{a}"
         );
         let fin: OwnedRoomId = "!fin:x".try_into().unwrap();
         let a = e.command(&fin, &anna(), cmd("!plenum"), now).await;
-        assert!(a.contains("Finanzplenum"), "{a}");
+        assert!(a.contains("Finance plenum"), "{a}");
         let a = e
             .command_in(&elsewhere, &anna(), cmd("!plenum"), now, Scope::AdminDm)
             .await;
         assert!(
-            a.contains("Finanzplenum") && a.contains("Hausplenum"),
+            a.contains("Finance plenum") && a.contains("House plenum"),
             "{a}"
         );
     }

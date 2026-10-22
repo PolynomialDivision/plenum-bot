@@ -56,6 +56,10 @@ pub struct PlenumState {
     /// The open tasks of the last closed protocol: they go into the next one.
     #[serde(default)]
     pub open_tasks: Vec<Carried>,
+    /// The meeting `open_tasks` are from: a meeting closed later but held earlier (two close
+    /// together) does not replace them.
+    #[serde(default)]
+    pub open_tasks_from: Option<MeetingKey>,
     /// The latest decisions (newest last), for the overview.
     #[serde(default)]
     pub decisions: Vec<Carried>,
@@ -68,8 +72,7 @@ pub struct PlenumState {
     /// Agenda items sent before the next protocol existed; they go into it.
     #[serde(default)]
     pub pending_tops: Vec<Top>,
-    /// By the calendar occurrence's ID (before 2026-10-22: by the start, "2026-11-01 19:00";
-    /// such a one is taken over by the occurrence with that start).
+    /// By the calendar occurrence's ID.
     #[serde(default)]
     pub meetings: BTreeMap<String, Meeting>,
 }
@@ -110,10 +113,6 @@ pub struct Meeting {
     /// The meeting ended before the bot got to prepare it (it was down): nothing happens.
     #[serde(default)]
     pub skipped: bool,
-    /// The protocol is filed under the plenum's protocols document (older ones were made
-    /// at the top of the collection and are moved there once).
-    #[serde(default)]
-    pub filed: bool,
     /// When it starts and ends (local), as the calendar says now.
     #[serde(default)]
     pub start: Option<MeetingKey>,
@@ -131,13 +130,10 @@ pub struct Meeting {
     /// Moved in the calendar after it was announced: the new announcement says from when.
     #[serde(default)]
     pub moved_from: Option<MeetingKey>,
-}
-
-impl Meeting {
-    /// Its start: as the calendar said, or for a meeting from before the calendar its key.
-    pub fn start_of(&self, id: &str) -> Option<MeetingKey> {
-        self.start.or_else(|| id.parse().ok())
-    }
+    /// The room was told about it (announced, or told it is cancelled) and then it moved or
+    /// came back: announced again right away, not only `prepare_days` before.
+    #[serde(default)]
+    pub announce_again: bool,
 }
 
 /// A message that is sent once: its transaction ID, then whether it went out.
@@ -160,7 +156,7 @@ impl Step {
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct Close {
-    /// Someone said `!protokoll fertig`: close at the next tick, whatever the time.
+    /// Someone said `!minutes done`: close at the next tick, whatever the time.
     #[serde(default)]
     pub requested: bool,
     #[serde(default)]
@@ -198,7 +194,7 @@ impl PlenumState {
                 .meetings
                 .iter()
                 .filter(|(_, m)| m.close.done || m.skipped || m.cancelled)
-                .min_by_key(|(id, m)| m.start_of(id))
+                .min_by_key(|(_, m)| m.start)
                 .map(|(id, _)| id.clone())
             else {
                 break;
@@ -231,7 +227,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         let mut st = State::default();
-        let p = st.plenums.entry("haus".into()).or_default();
+        let p = st.plenums.entry("house".into()).or_default();
         let key = "plenum-1#2026-11-01".to_owned();
         let mut m = Meeting {
             doc_id: "d1".into(),
@@ -244,26 +240,13 @@ mod tests {
         st.save(&path).await.unwrap();
 
         let back = State::load(&path).await.unwrap();
-        let p = &back.plenums["haus"];
+        let p = &back.plenums["house"];
         assert_eq!(p.meetings[&key].announce.txn.as_deref(), Some(txn.as_str()));
         assert!(p.meetings[&key].created);
         assert_eq!(
-            p.meetings[&key].start_of(&key).unwrap().to_string(),
+            p.meetings[&key].start.unwrap().to_string(),
             "2026-11-01 19:00"
         );
-    }
-
-    #[test]
-    fn a_state_from_before_the_calendar_still_loads() {
-        let old = r#"{"plenums": {"haus": {"extra": ["2026-11-08 19:00"], "cancelled": [],
-            "meetings": {"2026-11-01 19:00": {"doc_id": "d1", "created": true}}}}}"#;
-        let st: State = serde_json::from_str(old).unwrap();
-        let m = &st.plenums["haus"].meetings["2026-11-01 19:00"];
-        assert_eq!(
-            m.start_of("2026-11-01 19:00").unwrap().to_string(),
-            "2026-11-01 19:00"
-        );
-        assert!(m.start.is_none() && st.plenums["haus"].calendar_read.is_none());
     }
 
     #[test]
@@ -278,7 +261,10 @@ mod tests {
         let start = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
         for i in 0..(KEEP_MEETINGS + 5) {
             let day = start + chrono::Duration::days(i as i64);
-            let mut m = Meeting::default();
+            let mut m = Meeting {
+                start: Some(MeetingKey(day.and_hms_opt(19, 0, 0).unwrap())),
+                ..Default::default()
+            };
             m.close.done = i != 0; // the oldest is still open
             p.meetings.insert(
                 MeetingKey(day.and_hms_opt(19, 0, 0).unwrap()).to_string(),
