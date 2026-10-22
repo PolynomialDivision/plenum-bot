@@ -65,6 +65,10 @@ struct ApiDoc {
     deleted_at: Option<String>,
     #[serde(default)]
     archived_at: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
 }
 
 impl From<ApiDoc> for Doc {
@@ -75,6 +79,9 @@ impl From<ApiDoc> for Doc {
             text: d.text,
             url: d.url,
             revision: d.revision,
+            // Every change sets updatedAt, a new title too; the revision count is no help
+            // (Outline 1.11 counts it up in the background after creating, seen 2026-10-22).
+            untouched: d.created_at.is_some() && d.updated_at == d.created_at,
             collection_id: d.collection_id,
             parent_id: d.parent_document_id,
         }
@@ -88,6 +95,10 @@ struct ApiCollection {
     /// "read_write", "read", or null (only its members and groups).
     #[serde(default)]
     permission: Option<String>,
+    #[serde(default, rename = "deletedAt")]
+    deleted_at: Option<String>,
+    #[serde(default, rename = "archivedAt")]
+    archived_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -181,23 +192,49 @@ fn status_of(e: &anyhow::Error) -> Option<u16> {
 }
 
 impl Wiki for Outline {
-    async fn ensure_collection(&self, name: &str, access: Access) -> Result<String> {
+    async fn ensure_collection(
+        &self,
+        known: Option<&str>,
+        name: &str,
+        access: Access,
+    ) -> Result<String> {
         let wanted = permission(access);
-        let found: Vec<ApiCollection> = self
-            .call("collections.list", json!({"query": name, "limit": 100}))
-            .await?;
-        if let Some(c) = found.into_iter().find(|c| c.name.trim() == name) {
+        let mut found = None;
+        if let Some(id) = known {
+            match self
+                .call::<ApiCollection>("collections.info", json!({"id": id}))
+                .await
+            {
+                Ok(c) if c.deleted_at.is_none() && c.archived_at.is_none() => found = Some(c),
+                Ok(_) => {}
+                // deleted, or no longer the bot's: looked up by its name
+                Err(e) if matches!(status_of(&e), Some(400 | 403 | 404)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if found.is_none() {
+            let listed: Vec<ApiCollection> = self
+                .call("collections.list", json!({"query": name, "limit": 100}))
+                .await?;
+            found = listed.into_iter().find(|c| c.name.trim() == name);
+        }
+        if let Some(c) = found {
+            let mut update = serde_json::Map::new();
             if c.permission.as_deref() != wanted {
+                update.insert("permission".into(), json!(wanted));
+            }
+            if c.name.trim() != name {
+                update.insert("name".into(), json!(name));
+            }
+            if !update.is_empty() {
+                update.insert("id".into(), json!(c.id));
                 // Outline answers 403 when the key's account is no admin of the collection
                 // (one made by hand): an error, so it shows in the log until fixed.
                 let _: ApiCollection = self
-                    .call(
-                        "collections.update",
-                        json!({"id": c.id, "permission": wanted}),
-                    )
+                    .call("collections.update", Value::Object(update))
                     .await
-                    .context("setting the collection's access")?;
-                tracing::info!(collection = %name, ?wanted, "Collection access set");
+                    .context("setting the collection's access and name")?;
+                tracing::info!(collection = %name, from = %c.name, ?wanted, "Collection access and name set");
             }
             return Ok(c.id);
         }
@@ -507,13 +544,13 @@ mod against_outline {
         let a = engine
             .command(&room, &anna, cmd("!top Müll trennen"), at(10, 20, 12))
             .await;
-        assert!(a.contains("Notiert"), "{a}");
+        assert!(a.contains("Noted"), "{a}");
         engine.tick(at(10, 29, 19)).await;
         let texts = engine.chat.texts();
         assert_eq!(texts.len(), 1, "announced: {texts:?}");
         let col = engine
             .wiki
-            .ensure_collection(&collection, crate::config::Access::House)
+            .ensure_collection(None, &collection, crate::config::Access::House)
             .await
             .unwrap();
         let doc = listed(&engine.wiki, &col, "Hausplenum 2026-11-01").await;
@@ -523,7 +560,7 @@ mod against_outline {
         let a = engine
             .command(&room, &anna, cmd("!top Kaffeemaschine"), at(10, 30, 9))
             .await;
-        assert!(a.contains("Steht auf der Tagesordnung"), "{a}");
+        assert!(a.contains("On the agenda"), "{a}");
         let doc = engine.wiki.doc(&doc.id).await.unwrap().unwrap();
         // Outline's patch puts the item where the marker was (its own list, a blank line apart).
         let marker = crate::protocol::TOP_MARKER;
@@ -549,7 +586,7 @@ mod against_outline {
                 at(10, 30, 10),
             )
             .await;
-        assert!(a.contains("Steht auf der Tagesordnung"), "{a}");
+        assert!(a.contains("On the agenda"), "{a}");
         let doc = engine.wiki.doc(&doc.id).await.unwrap().unwrap();
         assert!(
             doc.text.contains("Variante [x] Hof oder [ ] Keller"),
@@ -568,7 +605,7 @@ mod against_outline {
         let a = engine
             .command(&room, &anna, cmd("!protokoll fertig"), at(11, 1, 20))
             .await;
-        assert!(a.contains("wird gleich abgeschlossen"), "{a}");
+        assert!(a.contains("closed in a moment"), "{a}");
         engine.tick(at(11, 1, 20)).await;
         let texts = engine.chat.texts();
         let summary = texts.last().unwrap();
@@ -577,14 +614,14 @@ mod against_outline {
         assert!(summary.contains("- Ben: Schild malen"), "{summary}");
         assert_eq!(engine.chat.files.lock().unwrap().len(), 1);
 
-        let decisions = listed(&engine.wiki, &col, "Beschlüsse Hausplenum").await;
+        let decisions = listed(&engine.wiki, &col, "Hausplenum: Decisions").await;
         assert!(
             decisions.text.contains("Gelbe Tonne in den Hof."),
             "{}",
             decisions.text
         );
         let doc = engine.wiki.doc(&doc.id).await.unwrap().unwrap();
-        assert!(doc.text.contains("Das Protokoll als PDF:"), "{}", doc.text);
+        assert!(doc.text.contains("The minutes as a PDF:"), "{}", doc.text);
         assert!(
             doc.text.contains("(/api/attachments.redirect?id="),
             "{}",
@@ -720,18 +757,14 @@ mod against_outline {
 
         // the documents: overview written, protocol filed under the protocols
         let kc = k["id"].as_str().unwrap();
-        let overview = listed(&engine.wiki, kc, "Übersicht Küchenplenum").await;
+        let overview = listed(&engine.wiki, kc, "Küchenplenum: Overview").await;
+        assert!(overview.text.contains("Next meetings"), "{}", overview.text);
         assert!(
-            overview.text.contains("Nächste Termine"),
+            overview.text.contains("Küchenplenum: Rules"),
             "{}",
             overview.text
         );
-        assert!(
-            overview.text.contains("Regeln Küchenplenum"),
-            "{}",
-            overview.text
-        );
-        let protocols = listed(&engine.wiki, kc, "Protokolle Küchenplenum").await;
+        let protocols = listed(&engine.wiki, kc, "Küchenplenum: Minutes").await;
         let protocol = listed(&engine.wiki, kc, "Küchenplenum 2026-11-01").await;
         assert_eq!(protocol.parent_id.as_deref(), Some(protocols.id.as_str()));
 
@@ -776,7 +809,11 @@ mod against_outline {
         // the overview again, now with the new date (only rewritten when it changed)
         engine.tick(at(10, 29, 23)).await;
         let overview = engine.wiki.doc(&overview.id).await.unwrap().unwrap();
-        assert!(overview.text.contains("08.11.2026"), "{}", overview.text);
+        assert!(
+            overview.text.contains("8 November 2026"),
+            "{}",
+            overview.text
+        );
 
         // the access is put back when someone changed it, at the next check
         admin(
@@ -789,5 +826,64 @@ mod against_outline {
         engine.tick(at(10, 30, 1)).await;
         let k = admin(&url, &admin_key, "collections.info", json!({"id": kc})).await;
         assert_eq!(k["permission"], "read", "{k}");
+
+        // renamed in the config (as German names became English, 2026-10-22): the same
+        // collection and documents, renamed; texts nobody changed follow, edited ones stay
+        let rules = listed(&engine.wiki, kc, "Küchenplenum: Rules").await;
+        assert!(rules.untouched, "a new document counts as untouched");
+        engine
+            .wiki
+            .replace(&protocols.id, "Our own words")
+            .await
+            .unwrap();
+        let state: State = {
+            let st = engine.state.lock().await;
+            serde_json::from_value(serde_json::to_value(&*st).unwrap()).unwrap()
+        };
+        let renamed = Plenum {
+            name: "Kitchen plenum".into(),
+            collection: format!("IT Kitchen {run}"),
+            ..kitchen.clone()
+        };
+        let engine = Engine::new(
+            vec![renamed.clone()],
+            "Europe/Berlin".parse().unwrap(),
+            Outline::new(&url, &url, &key, Duration::from_secs(30)).unwrap(),
+            FakeChat::default(),
+            PdfConfig {
+                enabled: false,
+                font_dir: String::new(),
+                post_to_room: false,
+            },
+            HashSet::new(),
+            state,
+            dir.path().join("state.json"),
+        );
+        engine.tick(at(10, 30, 3)).await;
+        let k = admin(&url, &admin_key, "collections.info", json!({"id": kc})).await;
+        assert_eq!(k["name"], renamed.collection.as_str(), "{k}");
+        let rules_now = engine.wiki.doc(&rules.id).await.unwrap().unwrap();
+        assert_eq!(rules_now.title, "Kitchen plenum: Rules");
+        assert!(
+            rules_now.text.contains("What applies in Kitchen plenum"),
+            "{}",
+            rules_now.text
+        );
+        let protocols_now = engine.wiki.doc(&protocols.id).await.unwrap().unwrap();
+        assert_eq!(protocols_now.title, "Kitchen plenum: Minutes");
+        assert_eq!(protocols_now.text.trim(), "Our own words");
+        let overview = engine.wiki.doc(&overview.id).await.unwrap().unwrap();
+        assert_eq!(overview.title, "Kitchen plenum: Overview");
+        assert!(
+            overview.text.contains("Kitchen plenum: Rules"),
+            "{}",
+            overview.text
+        );
+        assert!(engine
+            .wiki
+            .find_doc(kc, "Küchenplenum: Rules")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

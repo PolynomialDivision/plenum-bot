@@ -30,7 +30,7 @@ timezone = "Europe/Berlin"
 prepare_days = 3        # protocol created and announced this many days before
 remind_minutes = 30     # 0 = no reminder
 duration_minutes = 120
-close_after_hours = 12  # closed this long after the end (or with !protokoll fertig)
+close_after_hours = 12  # closed this long after the end (or with !minutes done)
 
 [pdf]
 enabled = true
@@ -59,9 +59,9 @@ collection = "Hausplenum"
 
 [[plenum]]
 key = "kueche-eg"
-name = "Küchenplenum EG"
+name = "Kitchen plenum ground floor"
 room = "!kitchen:example.org"
-collection = "Küche EG"
+collection = "Kitchen ground floor"
 group = "kitchen-ground-floor"   # its room and its editors follow this directory group
 access = "members"                # everyone reads, the group writes (house | members | private)
 prepare_days = 1

@@ -272,23 +272,23 @@ pub struct Plenum {
 
 impl Plenum {
     pub fn template_title(&self) -> String {
-        format!("Vorlage {}", self.name)
+        format!("{}: Template", self.name)
     }
 
     pub fn decisions_title(&self) -> String {
-        format!("Beschlüsse {}", self.name)
+        format!("{}: Decisions", self.name)
     }
 
     pub fn overview_title(&self) -> String {
-        format!("Übersicht {}", self.name)
+        format!("{}: Overview", self.name)
     }
 
     pub fn rules_title(&self) -> String {
-        format!("Regeln {}", self.name)
+        format!("{}: Rules", self.name)
     }
 
     pub fn protocols_title(&self) -> String {
-        format!("Protokolle {}", self.name)
+        format!("{}: Minutes", self.name)
     }
 }
 
@@ -487,7 +487,7 @@ organizers = ["@anna:example.org"]
             ("CALDAV_PASSWORD", 5)
         );
         assert_eq!(ps[1].organizers.len(), 1);
-        assert_eq!(ps[1].template_title(), "Vorlage Küchenplenum EG");
+        assert_eq!(ps[1].template_title(), "Küchenplenum EG: Template");
         assert_eq!(c.public_url(), "https://wiki.example.org");
         assert_eq!(ps[0].access, Access::House);
         assert!(ps[0].group.is_none());
@@ -518,7 +518,7 @@ access = "members"
         let ps = c.plenums().unwrap();
         assert_eq!(ps[0].group.as_deref(), Some("kitchen-floor-1"));
         assert_eq!(ps[0].access, Access::Members);
-        assert_eq!(ps[0].overview_title(), "Übersicht Küchenplenum 1. OG");
+        assert_eq!(ps[0].overview_title(), "Küchenplenum 1. OG: Overview");
         let d = c.directory.as_ref().unwrap();
         assert_eq!(
             (d.token_env.as_str(), d.refresh_minutes),

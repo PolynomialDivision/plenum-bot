@@ -139,9 +139,9 @@ impl Chat for MatrixChat {
 }
 
 const ADMIN_HELP: &str =
-    "Für alle in den Plenum-Räumen: !plenum · !top <Thema> (auch als Antwort auf eine Nachricht) · \
-!protokoll fertig · !plenum hilfe. Die Termine stehen in den Nextcloud-Kalendern der Plena. \
-Hier im Admin-Chat zeigt !plenum alle Plena.";
+    "For everyone in the plenum rooms: !plenum · !top <topic> (also as a reply to a message) · \
+!minutes done · !plenum help. The meetings are in the plenums' Nextcloud calendars. \
+Here in the admin chat !plenum shows every plenum.";
 
 type PlenumEngine = Engine<Outline, MatrixChat>;
 

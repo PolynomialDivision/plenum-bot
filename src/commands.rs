@@ -53,7 +53,7 @@ pub fn parse_for(body: &str, _today: NaiveDate, keys: &[&str]) -> Option<Command
             };
             if text.is_empty() {
                 return Some(Command::Invalid(
-                    "Bitte das Thema dazuschreiben: `!top <Thema>`".to_owned(),
+                    "Please add the topic: `!top <topic>`".to_owned(),
                 ));
             }
             Some(Command::Top {
@@ -61,16 +61,14 @@ pub fn parse_for(body: &str, _today: NaiveDate, keys: &[&str]) -> Option<Command
                 text: text.to_owned(),
             })
         }
-        "!protokoll" => {
+        // `!minutes done`; the German `!protokoll fertig` of before 2026-10-22 too.
+        "!minutes" | "!protokoll" => {
             let (key, rest) = split_key(&words);
             match rest.first().map(|w| w.to_lowercase()).as_deref() {
                 None => Some(Command::Overview(key)),
-                Some("fertig") | Some("abschliessen") | Some("abschließen") => {
-                    Some(Command::Close(key))
-                }
-                Some(_) => Some(Command::Invalid(
-                    "Meintest du `!protokoll fertig`?".to_owned(),
-                )),
+                Some("done") | Some("close") | Some("fertig") | Some("abschliessen")
+                | Some("abschließen") => Some(Command::Close(key)),
+                Some(_) => Some(Command::Invalid("Did you mean `!minutes done`?".to_owned())),
             }
         }
         "!plenum" => {
@@ -80,16 +78,18 @@ pub fn parse_for(body: &str, _today: NaiveDate, keys: &[&str]) -> Option<Command
                 Some("hilfe") | Some("help") => Some(Command::Help),
                 // Dates are the calendar's now (2026-10-22): moved, cancelled and added there.
                 Some("absagen") | Some("extra") | Some("zusatz") | Some("verschieben")
-                | Some("verlegen") => Some(Command::Invalid(
-                    "Termine stehen jetzt im Nextcloud-Kalender des Plenums: dort eintragen, \
-                         verschieben oder absagen. Der Bot folgt dem Kalender."
-                        .to_owned(),
-                )),
+                | Some("verlegen") | Some("cancel") | Some("add") | Some("move") => {
+                    Some(Command::Invalid(
+                        "The meetings are in the plenum's Nextcloud calendar now: add, move or \
+                         cancel them there. The bot follows the calendar."
+                            .to_owned(),
+                    ))
+                }
                 Some(w) if is_key(w) && words.len() == 1 => {
                     Some(Command::Overview(Some(w.to_owned())))
                 }
                 Some(_) => Some(Command::Invalid(
-                    "Das kenne ich nicht. `!plenum hilfe` zeigt, was geht.".to_owned(),
+                    "I don't know that one. `!plenum help` shows what works.".to_owned(),
                 )),
             }
         }
@@ -140,6 +140,9 @@ mod tests {
     #[test]
     fn closing_and_the_overview() {
         assert_eq!(p("!protokoll fertig"), Some(Command::Close(None)));
+        assert_eq!(p("!minutes done"), Some(Command::Close(None)));
+        assert_eq!(p("!Minutes close"), Some(Command::Close(None)));
+        assert_eq!(p("!minutes"), Some(Command::Overview(None)));
         assert_eq!(
             p("!protokoll fertig kueche-eg"),
             Some(Command::Close(Some("kueche-eg".into())))
@@ -151,6 +154,7 @@ mod tests {
             Some(Command::Overview(Some("kueche-og".into())))
         );
         assert_eq!(p("!plenum hilfe"), Some(Command::Help));
+        assert_eq!(p("!plenum help"), Some(Command::Help));
         assert!(matches!(p("!protokoll los"), Some(Command::Invalid(_))));
         assert!(matches!(p("!plenum xyz"), Some(Command::Invalid(_))));
     }
@@ -161,9 +165,10 @@ mod tests {
             "!plenum absagen 27.10.",
             "!plenum extra 30.10. 19:00",
             "!plenum verschieben 1.11. 8.11.",
+            "!plenum cancel 27.10.",
         ] {
             match p(body) {
-                Some(Command::Invalid(why)) => assert!(why.contains("Nextcloud-Kalender"), "{why}"),
+                Some(Command::Invalid(why)) => assert!(why.contains("Nextcloud calendar"), "{why}"),
                 other => panic!("{body}: {other:?}"),
             }
         }

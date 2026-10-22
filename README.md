@@ -3,8 +3,9 @@
 Plenum protocols in [Outline](https://www.getoutline.com): for every meeting of a plenum the
 bot creates the protocol from the plenum's template in the wiki, posts the link in the
 plenum's room and puts `!top` items from the chat on the agenda. Afterwards it copies every
-line starting with "Beschluss:" into the plenum's decision list, attaches a PDF and posts a
-summary. Searching happens in Outline. Several plenums (house, kitchens, a working group),
+line starting with "Decision:" into the plenum's decision list, attaches a PDF and posts a
+summary. It writes English (since 2026-10-22); protocols and templates in German from before
+are still read (their marker, headings, "Beschluss:"/"Aufgabe:", placeholders). Searching happens in Outline. Several plenums (house, kitchens, a working group),
 each with its own room, collection and Nextcloud calendar.
 
 A plenum may belong to a directory group (`group`): its room's members follow the group
@@ -26,23 +27,30 @@ it is cancelled (said once in the room); while the calendar cannot be read nothi
 | | |
 |---|---|
 | `!plenum` | next date and the protocol's link |
-| `!top <Thema>` | an item for the agenda (waits for the protocol if it does not exist yet) |
-| `!protokoll fertig` | close the protocol now (decisions, PDF, summary; `organizers` only, if set) |
+| `!top <topic>` | an item for the agenda (waits for the protocol if it does not exist yet) |
+| `!minutes done` | close the protocol now (decisions, PDF, summary; `organizers` only, if set) |
 | `!top` as a reply | the message it answers is the topic (by its author) |
-| `!plenum hilfe` | this list |
+| `!plenum help` | this list |
 
-Several plenums in one room: the key goes along, `!top kueche-eg Spülmaschine`.
+Several plenums in one room: the key goes along, `!top kueche-eg dishwasher`. The German
+commands of before (`!protokoll fertig`, `!plenum hilfe`) still work.
 
 ## In Outline
 
-Per plenum, in its collection: "Übersicht <Name>" (the bot writes it anew when something
+Per plenum, in its collection: "<Name>: Overview" (the bot writes it anew when something
 changes: next dates, how to bring in a topic, the calendar link, open tasks, latest
-decisions), "Regeln <Name>" (what holds now; people keep it), "Vorlage <Name>" (the template,
-created on first use, editable; `{{plenum}}`, `{{wochentag}}`, `{{datum}}`, `{{uhrzeit}}`,
-`{{iso_datum}}` are filled in, `{{offene_aufgaben}}` takes the open tasks of the last protocol),
-"Beschlüsse <Name>" (the decisions, newest at the bottom) and "Protokolle <Name>" with one
-"<Name> YYYY-MM-DD" per meeting below it (older protocols at the top are moved there once). The
-collection's access is checked every hour and put back if changed. The line "➕ Neue Punkte kommen mit !top im Chat hier dazu." marks where chat items go.
+decisions), "<Name>: Rules" (what holds now; people keep it), "<Name>: Template" (the
+template, created on first use, editable; `{{plenum}}`, `{{weekday}}`, `{{date}}`, `{{time}}`,
+`{{iso_date}}` are filled in, `{{open_tasks}}` takes the open tasks of the last protocol; the
+German placeholders of older templates too), "<Name>: Decisions" (the decisions, newest at the
+bottom) and "<Name>: Minutes" with one "<Name> YYYY-MM-DD" per meeting below it (older
+protocols at the top are moved there once). The collection's access is checked every hour and
+put back if changed. The line "➕ New items from the chat (!top) go here." marks where chat
+items go.
+
+A plenum's collection and documents are found again by their IDs: when its name (or the bot's
+language) changes, they are renamed, not made anew; a document nobody changed since the bot
+made it gets the new text too.
 
 API key: the key of an Outline account of its own, as `OUTLINE_API_KEY`, with the scopes
 `documents.* collections.* attachments.* files.* auth.info` (stored by Outline as
@@ -60,7 +68,7 @@ every minute and holds up no other.
 The bot never rewrites a protocol people write in: a chat item replaces only the marker line
 (Outline's `patch`), everything else is appended. Outline's Markdown does not survive a full
 rewrite of every text (a literal `[x]` comes back as a checkbox). Chat items carry no
-checkboxes and no "Beschluss:", and the agenda is never read as decisions.
+checkboxes and no "Decision:", and the agenda is never read as decisions.
 
 ## Tests
 

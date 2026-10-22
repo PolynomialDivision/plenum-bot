@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use genpdf::{elements, fonts, style, Alignment, Element};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-use crate::protocol::TOP_MARKER;
+use crate::protocol::TOP_MARKERS;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Span {
@@ -67,7 +67,7 @@ fn outline_cleanup(markdown: &str) -> String {
         .lines()
         .filter(|l| {
             let t = l.trim();
-            t != "\\" && t != TOP_MARKER && !(t.starts_with(":::") && !t.contains(' '))
+            t != "\\" && !TOP_MARKERS.contains(&t) && !(t.starts_with(":::") && !t.contains(' '))
         })
         .collect::<Vec<_>>()
         .join("\n")

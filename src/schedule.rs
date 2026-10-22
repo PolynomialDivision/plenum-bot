@@ -1,11 +1,11 @@
 //! When a meeting is: its local start ([`MeetingKey`], "2026-11-01 19:00") and how it is
-//! written in German. The dates themselves come from the plenum's Nextcloud calendar
+//! written for people. The dates themselves come from the plenum's Nextcloud calendar
 //! (calendar.rs); a meeting is the calendar's occurrence, found again by its ID when it moves.
 
 use std::{fmt, str::FromStr};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDateTime, TimeZone, Utc, Weekday};
+use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -64,6 +64,7 @@ impl<'de> Deserialize<'de> for MeetingKey {
     }
 }
 
+/// For the German placeholders of templates from before the bot spoke English.
 pub fn weekday_de(day: Weekday) -> &'static str {
     match day {
         Weekday::Mon => "Montag",
@@ -76,14 +77,14 @@ pub fn weekday_de(day: Weekday) -> &'static str {
     }
 }
 
-/// "Sonntag, 01.11.2026 um 19:00"
+/// "Sunday, 1 November 2026 at 19:00"
 pub fn describe_meeting(key: MeetingKey) -> String {
-    format!(
-        "{}, {} um {}",
-        weekday_de(key.0.weekday()),
-        key.0.format("%d.%m.%Y"),
-        key.0.format("%H:%M")
-    )
+    key.0.format("%A, %-d %B %Y at %H:%M").to_string()
+}
+
+/// "18 Oct 2026"
+pub fn describe_day(day: NaiveDate) -> String {
+    day.format("%-d %b %Y").to_string()
 }
 
 #[cfg(test)]
@@ -104,11 +105,12 @@ mod tests {
     }
 
     #[test]
-    fn a_meeting_reads_like_german() {
+    fn a_meeting_reads_like_english() {
         assert_eq!(
             describe_meeting(key("2026-11-01 19:00")),
-            "Sonntag, 01.11.2026 um 19:00"
+            "Sunday, 1 November 2026 at 19:00"
         );
+        assert_eq!(describe_day(key("2026-10-18 08:00").date()), "18 Oct 2026");
         assert!("2026-11-01".parse::<MeetingKey>().is_err());
     }
 }

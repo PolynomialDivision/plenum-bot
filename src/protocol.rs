@@ -1,49 +1,62 @@
-//! The protocol as Markdown: the template, agenda items from the chat, and what is read back
-//! at the end (decisions and tasks). Pure text functions; Outline stores Markdown and gives
-//! it back in its own spelling (`*` for bullets, `- [ ]` for checkboxes).
+//! The protocol (the minutes) as Markdown: the template, agenda items from the chat, and what
+//! is read back at the end (decisions and tasks). Pure text functions; Outline stores Markdown
+//! and gives it back in its own spelling (`*` for bullets, `- [ ]` for checkboxes).
+//!
+//! The bot writes English (2026-10-22). Protocols and templates from before, in German, are
+//! still read: their marker, headings, labels and placeholders are known too.
 
 use crate::{
     config::Plenum,
-    schedule::{describe_meeting, weekday_de, MeetingKey},
+    schedule::{describe_day, describe_meeting, weekday_de, MeetingKey},
     state::{Carried, Top},
 };
 use chrono::Datelike;
 
 /// The line agenda items from the chat are put above. It is plain text on purpose: Outline
 /// keeps it exactly as it is, while formatting would come back in another spelling.
-pub const TOP_MARKER: &str = "➕ Neue Punkte kommen mit !top im Chat hier dazu.";
+pub const TOP_MARKER: &str = "➕ New items from the chat (!top) go here.";
 
-/// The template a plenum starts with when its collection has none (`Vorlage <Name>`). The
+/// Every marker the bot knows: [`TOP_MARKER`], and the German one of older protocols.
+pub const TOP_MARKERS: [&str; 2] = [
+    TOP_MARKER,
+    "➕ Neue Punkte kommen mit !top im Chat hier dazu.",
+];
+
+/// The template a plenum starts with when its collection has none (`<Name>: Template`). The
 /// placeholders in double braces are filled in for every meeting.
 pub const DEFAULT_TEMPLATE: &str = "\
-**{{plenum}}** am {{wochentag}}, {{datum}} um {{uhrzeit}} Uhr
+**{{plenum}}** on {{weekday}}, {{date}} at {{time}}
 
-| Moderation | Protokoll | Anwesend |
+| Facilitation | Minutes | Present |
 |---|---|---|
 |  |  |  |
 
-## Tagesordnung
+## Agenda
 
-➕ Neue Punkte kommen mit !top im Chat hier dazu.
+➕ New items from the chat (!top) go here.
 
-## Protokoll
+## Minutes
 
-Zu jedem Punkt eine Überschrift (###) und darunter, was besprochen wurde.
+A heading (###) for each item, and below it what was discussed.
 
-## Beschlüsse und Aufgaben
+## Decisions and tasks
 
-Eine Zeile, die mit „Beschluss:“ beginnt, kommt nach dem Plenum in die Beschlussliste. \
-Aufgaben als Checkliste (in Outline „[]“ am Zeilenanfang tippen): wer macht was bis wann. \
-Was hier offen bleibt, steht im nächsten Protokoll wieder da.
+A line that starts with \"Decision:\" goes into the list of decisions after the plenum. \
+Tasks as a checklist (type \"[]\" at the start of a line in Outline): who does what by when. \
+What stays open here is in the next minutes again.
 
-{{offene_aufgaben}}
+{{open_tasks}}
 ";
 
 /// Where the open tasks of the last protocol go in a template; a template without it gets
-/// them at its end, under [`OPEN_TASKS_HEADING`].
-pub const OPEN_TASKS_PLACEHOLDER: &str = "{{offene_aufgaben}}";
+/// them at its end, under [`OPEN_TASKS_HEADING`]. The German name of older templates works too.
+pub const OPEN_TASKS_PLACEHOLDERS: [&str; 2] = ["{{open_tasks}}", "{{offene_aufgaben}}"];
 
-pub const OPEN_TASKS_HEADING: &str = "## Offene Aufgaben vom letzten Plenum";
+pub const OPEN_TASKS_HEADING: &str = "## Open tasks from the last plenum";
+
+/// The labels of decision and task lines (any case), English and German.
+const DECISION_LABELS: [&str; 2] = ["decision", "beschluss"];
+const TASK_LABELS: [&str; 2] = ["task", "aufgabe"];
 
 /// The open tasks as a checklist (each with the day it comes from): ticked off they are done,
 /// left open they come along to the next protocol again.
@@ -54,15 +67,13 @@ pub fn open_tasks_block(tasks: &[Carried]) -> String {
     let mut block = format!("{OPEN_TASKS_HEADING}\n\n");
     for t in tasks {
         let text = t.text.replace('[', "(").replace(']', ")");
-        block.push_str(&format!(
-            "- [ ] {text} (seit {})\n",
-            t.date.format("%d.%m.%Y")
-        ));
+        block.push_str(&format!("- [ ] {text} (since {})\n", describe_day(t.date)));
     }
     block
 }
 
-/// Fill in a template for one meeting, with the open tasks of the last protocol.
+/// Fill in a template for one meeting, with the open tasks of the last protocol. The German
+/// placeholders of older templates give German dates, as their text around them is German.
 pub fn render_template(
     template: &str,
     plenum: &Plenum,
@@ -70,15 +81,21 @@ pub fn render_template(
     tasks: &[Carried],
 ) -> String {
     let date = key.0.date();
+    let time = key.0.format("%H:%M").to_string();
     let tasks_block = open_tasks_block(tasks);
     let mut text = template
         .replace("{{plenum}}", &plenum.name)
+        .replace("{{weekday}}", &date.format("%A").to_string())
+        .replace("{{date}}", &date.format("%-d %B %Y").to_string())
+        .replace("{{time}}", &time)
         .replace("{{wochentag}}", weekday_de(date.weekday()))
         .replace("{{datum}}", &date.format("%d.%m.%Y").to_string())
-        .replace("{{iso_datum}}", &date.format("%Y-%m-%d").to_string())
-        .replace("{{uhrzeit}}", &key.0.format("%H:%M").to_string());
-    if text.contains(OPEN_TASKS_PLACEHOLDER) {
-        text = text.replace(OPEN_TASKS_PLACEHOLDER, tasks_block.trim_end());
+        .replace("{{uhrzeit}}", &time);
+    for iso in ["{{iso_date}}", "{{iso_datum}}"] {
+        text = text.replace(iso, &date.format("%Y-%m-%d").to_string());
+    }
+    if let Some(placeholder) = OPEN_TASKS_PLACEHOLDERS.iter().find(|p| text.contains(**p)) {
+        text = text.replace(placeholder, tasks_block.trim_end());
         // an empty placeholder leaves no blank lines behind
         while text.contains("\n\n\n") {
             text = text.replace("\n\n\n", "\n\n");
@@ -96,12 +113,15 @@ pub fn title(plenum: &Plenum, key: MeetingKey) -> String {
 
 /// The heading the bot puts chat items under when a protocol has neither the marker nor an
 /// agenda section. Counts as agenda for [`extract`].
-pub const CHAT_ITEMS_HEADING: &str = "## Neue Punkte aus dem Chat";
+pub const CHAT_ITEMS_HEADING: &str = "## New items from the chat";
+
+/// Every chat items heading the bot knows: [`CHAT_ITEMS_HEADING`], and the German one.
+pub const CHAT_ITEMS_HEADINGS: [&str; 2] = [CHAT_ITEMS_HEADING, "## Neue Punkte aus dem Chat"];
 
 /// One agenda item as a Markdown list line, from the chat: one line, no list or heading
 /// syntax of its own, at most 300 characters. Brackets become parentheses (Outline would
 /// turn a `[ ]` into a checkbox, an open task at the end), and an item that starts like a
-/// decision or a task is marked as an item, so `!top Beschluss: …` decides nothing.
+/// decision or a task is marked as an item, so `!top Decision: …` decides nothing.
 pub fn top_line(top: &Top) -> String {
     let mut text: String = top
         .text
@@ -118,9 +138,12 @@ pub fn top_line(top: &Top) -> String {
     if text.is_empty() {
         text = "…".to_owned();
     }
-    let lower = text.to_lowercase();
-    if lower.starts_with("beschluss") || lower.starts_with("aufgabe") {
-        text = format!("TOP {text}");
+    if DECISION_LABELS
+        .iter()
+        .chain(&TASK_LABELS)
+        .any(|label| after_label(&text, label).is_some())
+    {
+        text = format!("Item: {text}");
     }
     format!("* {} ({})", text, top.by)
 }
@@ -132,11 +155,11 @@ pub fn contains_line(markdown: &str, line: &str) -> bool {
 
 /// The protocol with `line` added to the agenda: right after the last list item above the
 /// marker (so it continues that list), or above the marker; without a marker at the end of
-/// the "Tagesordnung" section; without that section in a new one at the end.
+/// the agenda section; without that section in a new one at the end.
 pub fn insert_top(markdown: &str, line: &str) -> String {
     let lines: Vec<&str> = markdown.lines().collect();
     let mut out: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
-    if let Some(marker) = lines.iter().position(|l| l.trim() == TOP_MARKER) {
+    if let Some(marker) = lines.iter().position(|l| TOP_MARKERS.contains(&l.trim())) {
         let before = lines[..marker].iter().rposition(|l| !l.trim().is_empty());
         match before {
             Some(i) if is_list_item(lines[i]) => out.insert(i + 1, line.to_owned()),
@@ -171,7 +194,7 @@ pub fn insert_top(markdown: &str, line: &str) -> String {
         return join(out, markdown);
     }
     let mut text = markdown.trim_end().to_owned();
-    text.push_str("\n\n## Tagesordnung\n\n");
+    text.push_str("\n\n## Agenda\n\n");
     text.push_str(line);
     text.push('\n');
     text
@@ -193,11 +216,19 @@ fn is_list_item(line: &str) -> bool {
     }
 }
 
-fn is_agenda_heading(line: &str) -> bool {
+/// A heading of the agenda or of the chat items (English or German).
+pub fn is_agenda_heading(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with('#') && {
         let title = t.trim_start_matches('#').trim().to_lowercase();
-        title.starts_with("tagesordnung") || title.starts_with("neue punkte aus dem chat")
+        [
+            "agenda",
+            "tagesordnung",
+            "new items from the chat",
+            "neue punkte aus dem chat",
+        ]
+        .iter()
+        .any(|h| title.starts_with(h))
     }
 }
 
@@ -205,13 +236,14 @@ fn is_agenda_heading(line: &str) -> bool {
 #[derive(Debug, Default, PartialEq)]
 pub struct Outcome {
     pub decisions: Vec<String>,
-    /// Open checklist items (and lines starting with "Aufgabe:").
+    /// Open checklist items (and lines starting with "Task:").
     pub tasks: Vec<String>,
 }
 
-/// Decisions are lines that start with "Beschluss:" (also bold, also as a list item); tasks
-/// are open checklist items and lines that start with "Aufgabe:". Empty ones are left out,
-/// and so is the agenda: what is put on it (also from the chat) is no decision yet.
+/// Decisions are lines that start with "Decision:" (also bold, also as a list item); tasks
+/// are open checklist items and lines that start with "Task:" (the German "Beschluss:" and
+/// "Aufgabe:" too). Empty ones are left out, and so is the agenda: what is put on it (also
+/// from the chat) is no decision yet.
 pub fn extract(markdown: &str) -> Outcome {
     let mut out = Outcome::default();
     let mut agenda = false;
@@ -226,13 +258,13 @@ pub fn extract(markdown: &str) -> Outcome {
         }
         let (checkbox, rest) = strip_list_marker(line);
         let rest = rest.trim();
-        if let Some(text) = after_label(rest, "beschluss") {
+        if let Some(text) = DECISION_LABELS.iter().find_map(|l| after_label(rest, l)) {
             if !text.is_empty() {
                 out.decisions.push(text);
             }
             continue;
         }
-        if let Some(text) = after_label(rest, "aufgabe") {
+        if let Some(text) = TASK_LABELS.iter().find_map(|l| after_label(rest, l)) {
             if !text.is_empty() && checkbox != Some(true) {
                 out.tasks.push(text);
             }
@@ -312,24 +344,24 @@ pub fn decisions_block(title: &str, link: &str, decisions: &[String]) -> String 
 
 pub fn decisions_doc_text(plenum: &Plenum) -> String {
     format!(
-        "Die Beschlüsse aus den Protokollen von {}, neueste unten. \
-         Der Bot trägt sie nach jedem Plenum ein.\n",
+        "The decisions from the minutes of {}, newest at the bottom. \
+         The bot adds them after every plenum.\n",
         plenum.name
     )
 }
 
 pub fn rules_doc_text(plenum: &Plenum) -> String {
     format!(
-        "Was beim {} gerade gilt: Absprachen, Pläne, Zuständigkeiten. Diese Seite pflegt ihr \
-         selbst. Wenn ein Beschluss etwas ändert, kommt es hierher; die Protokolle bleiben, \
-         wie sie waren.\n",
+        "What applies in {} right now: agreements, schedules, who does what. You keep this \
+         page yourselves. When a decision changes something, it goes here; the minutes stay \
+         as they were.\n",
         plenum.name
     )
 }
 
 pub fn protocols_doc_text(plenum: &Plenum) -> String {
     format!(
-        "Alle Protokolle vom {}: darunter, eins pro Termin. Neue legt der Bot hier an.\n",
+        "All minutes of {}: below, one per meeting. The bot creates new ones here.\n",
         plenum.name
     )
 }
@@ -344,6 +376,15 @@ pub struct OverviewLinks<'a> {
     pub calendar: Option<&'a str>,
 }
 
+/// "1 day", "3 days"
+fn days(n: u32) -> String {
+    if n == 1 {
+        "1 day".to_owned()
+    } else {
+        format!("{n} days")
+    }
+}
+
 /// The overview page the bot keeps (it overwrites it whenever something changes): the next
 /// dates with their agendas, how to bring in a topic, open tasks, the latest decisions, links.
 pub fn overview_text(
@@ -355,66 +396,66 @@ pub fn overview_text(
 ) -> String {
     let esc = |s: &str| s.replace('[', "\\[").replace(']', "\\]");
     let mut t = format!(
-        "_Diese Seite schreibt der Plenum-Bot neu, sobald sich etwas ändert. Was gilt, steht \
-         in den [Regeln]({}); eigene Texte gehören dorthin._\n\n## Nächste Termine\n\n",
+        "_The plenum bot rewrites this page whenever something changes. What applies is in \
+         the [rules]({}); your own texts belong there._\n\n## Next meetings\n\n",
         links.rules
     );
     if next.is_empty() {
-        t.push_str("Kein Termin geplant.\n");
+        t.push_str("No meeting planned.\n");
     }
     for (key, protocol) in next {
         match protocol {
             Some(link) => t.push_str(&format!(
-                "* {}: [Tagesordnung und Protokoll]({link})\n",
+                "* {}: [agenda and minutes]({link})\n",
                 describe_meeting(*key)
             )),
             None => t.push_str(&format!(
-                "* {} (die Tagesordnung kommt {} Tag(e) vorher)\n",
+                "* {} (the agenda comes {} before)\n",
                 describe_meeting(*key),
-                plenum.prepare_days
+                days(plenum.prepare_days)
             )),
         }
     }
     let calendar = match links.calendar {
-        Some(c) => format!("[„{}“ in Nextcloud]({c})", plenum.name),
-        None => format!("„{}“ in Nextcloud", plenum.name),
+        Some(c) => format!("[“{}” in Nextcloud]({c})", plenum.name),
+        None => format!("“{}” in Nextcloud", plenum.name),
     };
     t.push_str(&format!(
-        "\nDie Termine stehen im Kalender {calendar}: dort eintragen, verschieben, absagen oder \
-         als Serie anlegen. Diese Seite, die Tagesordnungen und die Erinnerungen folgen ihm.\n"
+        "\nThe meetings are in the calendar {calendar}: add, move or cancel them there, or \
+         make a series. This page, the agendas and the reminders follow it.\n"
     ));
     t.push_str(
-        "\n## Themen einbringen\n\nIm Chat `!top <Thema>` schreiben, auf eine Nachricht mit \
-         `!top` antworten, oder direkt in die Tagesordnung des nächsten Termins.\n",
+        "\n## Bringing in a topic\n\nWrite `!top <topic>` in the chat, reply to a message \
+         with `!top`, or write it into the agenda of the next meeting.\n",
     );
-    t.push_str("\n## Offene Aufgaben\n\n");
+    t.push_str("\n## Open tasks\n\n");
     if tasks.is_empty() {
-        t.push_str("Keine.\n");
+        t.push_str("None.\n");
     }
     for task in tasks {
         t.push_str(&format!(
-            "* {} (seit dem [Plenum am {}]({}))\n",
+            "* {} (since the [plenum on {}]({}))\n",
             esc(&task.text),
-            task.date.format("%d.%m.%Y"),
+            describe_day(task.date),
             task.link
         ));
     }
-    t.push_str("\n## Letzte Beschlüsse\n\n");
+    t.push_str("\n## Latest decisions\n\n");
     if decisions.is_empty() {
-        t.push_str("Noch keine.\n");
+        t.push_str("None yet.\n");
     }
     for d in decisions.iter().rev() {
         t.push_str(&format!(
             "* {} ([{}]({}))\n",
             esc(&d.text),
-            d.date.format("%d.%m.%Y"),
+            describe_day(d.date),
             d.link
         ));
     }
     t.push_str(&format!(
-        "\n## Alles zum {}\n\n* [{}]({}): was gerade gilt\n* [{}]({}): jeder Beschluss mit \
-         seinem Protokoll\n* [{}]({}): das Archiv, ein Protokoll pro Termin\n* [{}]({}): so \
-         beginnt jedes Protokoll (änderbar)\n",
+        "\n## Everything about {}\n\n* [{}]({}): what applies now\n* [{}]({}): every decision \
+         with its minutes\n* [{}]({}): the archive, one per meeting\n* [{}]({}): how all \
+         minutes start (you can change it)\n",
         plenum.name,
         plenum.rules_title(),
         links.rules,
@@ -431,7 +472,7 @@ pub fn overview_text(
 /// Said once when a meeting that was announced leaves the calendar.
 pub fn cancellation(plenum: &Plenum, key: MeetingKey, link: &str) -> String {
     format!(
-        "❌ **{}** am {} ist abgesagt (nicht mehr im Kalender). Das Protokoll bleibt im Wiki: {link}",
+        "❌ **{}** on {} is cancelled (no longer in the calendar). The minutes stay in the wiki: {link}",
         plenum.name,
         describe_meeting(key)
     )
@@ -446,31 +487,27 @@ pub fn announcement(
     moved_from: Option<MeetingKey>,
 ) -> String {
     let moved = moved_from
-        .map(|old| format!(" (verschoben vom {})", describe_meeting(old)))
+        .map(|old| format!(" (moved from {})", describe_meeting(old)))
         .unwrap_or_default();
     let mut text = format!(
-        "📋 **{}** am {}{moved}\n\nTagesordnung und Protokoll: {link}\n\nThemen dazu: `!top <Thema>`, \
-         auf eine Nachricht mit `!top` antworten, oder direkt ins Dokument schreiben.",
+        "📋 **{}** on {}{moved}\n\nAgenda and minutes: {link}\n\nAdd a topic: `!top <topic>`, \
+         reply to a message with `!top`, or write it into the document.",
         plenum.name,
         describe_meeting(key)
     );
-    if tops > 0 {
-        text.push_str(&format!(
-            "\n\n{tops} Punkt(e) aus dem Chat stehen schon drin."
-        ));
+    match tops {
+        0 => {}
+        1 => text.push_str("\n\n1 item from the chat is in it already."),
+        n => text.push_str(&format!("\n\n{n} items from the chat are in it already.")),
     }
     text
 }
 
 /// `started`: the bot came back during the meeting.
 pub fn reminder(plenum: &Plenum, key: MeetingKey, link: &str, started: bool) -> String {
-    let (before, after) = if started {
-        ("hat um", " Uhr begonnen")
-    } else {
-        ("beginnt um", " Uhr")
-    };
+    let verb = if started { "started" } else { "starts" };
     format!(
-        "⏰ **{}** {before} {}{after}.\n\nProtokoll: {link}",
+        "⏰ **{}** {verb} at {}.\n\nMinutes: {link}",
         plenum.name,
         key.0.format("%H:%M")
     )
@@ -486,33 +523,33 @@ pub fn summary(
     pdf: PdfNote,
 ) -> String {
     let mut text = format!(
-        "✅ Das Protokoll vom **{}** am {} ist abgeschlossen: {link}",
+        "✅ The minutes of **{}** on {} are closed: {link}",
         plenum.name,
         describe_meeting(key)
     );
     if outcome.decisions.is_empty() {
-        text.push_str("\n\nKeine Beschlüsse eingetragen.");
+        text.push_str("\n\nNo decisions recorded.");
     } else {
-        text.push_str("\n\n**Beschlüsse**\n");
+        text.push_str("\n\n**Decisions**\n");
         for d in &outcome.decisions {
             text.push_str(&format!("\n- {d}"));
         }
         if let Some(l) = decisions_link {
-            text.push_str(&format!("\n\nAlle Beschlüsse: {l}"));
+            text.push_str(&format!("\n\nAll decisions: {l}"));
         }
     }
     if !outcome.tasks.is_empty() {
-        text.push_str("\n\n**Offene Aufgaben**\n");
+        text.push_str("\n\n**Open tasks**\n");
         for t in &outcome.tasks {
             text.push_str(&format!("\n- {t}"));
         }
     }
     match pdf {
         PdfNote::Fine => {}
-        PdfNote::Failed => text.push_str("\n\n⚠️ Das PDF ließ sich nicht erstellen."),
-        PdfNote::OnlyInWiki => {
-            text.push_str("\n\n⚠️ Das PDF ging nicht in den Chat; es hängt im Wiki am Protokoll.")
-        }
+        PdfNote::Failed => text.push_str("\n\n⚠️ The PDF could not be made."),
+        PdfNote::OnlyInWiki => text.push_str(
+            "\n\n⚠️ The PDF did not go into the chat; it is attached to the minutes in the wiki.",
+        ),
     }
     text
 }
@@ -562,7 +599,10 @@ mod tests {
     #[test]
     fn the_template_is_filled_in() {
         let text = render_template(DEFAULT_TEMPLATE, &plenum(), key(), &[]);
-        assert!(text.starts_with("**Hausplenum** am Sonntag, 01.11.2026 um 19:00 Uhr"));
+        assert!(
+            text.starts_with("**Hausplenum** on Sunday, 1 November 2026 at 19:00"),
+            "{text}"
+        );
         assert!(text.contains(TOP_MARKER));
         assert!(!text.contains("{{"));
         assert!(!text.contains(OPEN_TASKS_HEADING));
@@ -572,50 +612,75 @@ mod tests {
     }
 
     #[test]
-    fn an_item_continues_the_list_above_the_marker() {
-        // As Outline stores it after a first item.
-        let doc = format!("## Tagesordnung\n\n* Müll (Ben)\n\n{TOP_MARKER}\n\n## Protokoll\n");
-        let out = insert_top(&doc, &top_line(&top("Kaffee")));
+    fn an_older_german_template_still_works() {
+        let old = "**{{plenum}}** am {{wochentag}}, {{datum}} um {{uhrzeit}} Uhr ({{iso_datum}})\n\n\
+                   ## Tagesordnung\n\n➕ Neue Punkte kommen mit !top im Chat hier dazu.\n\n{{offene_aufgaben}}\n";
+        let tasks = [carried("Ben: Putzplan")];
+        let text = render_template(old, &plenum(), key(), &tasks);
+        assert!(
+            text.starts_with("**Hausplenum** am Sonntag, 01.11.2026 um 19:00 Uhr (2026-11-01)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- [ ] Ben: Putzplan (since 18 Oct 2026)"),
+            "{text}"
+        );
+        assert!(!text.contains("{{"));
         assert_eq!(
-            out,
-            format!("## Tagesordnung\n\n* Müll (Ben)\n* Kaffee (Anna)\n\n{TOP_MARKER}\n\n## Protokoll\n")
+            insert_top(&text, "* Kaffee (Anna)")
+                .matches("* Kaffee (Anna)\n\n➕ Neue")
+                .count(),
+            1
         );
     }
 
     #[test]
+    fn an_item_continues_the_list_above_the_marker() {
+        // As Outline stores it after a first item.
+        for marker in TOP_MARKERS {
+            let doc = format!("## Agenda\n\n* Bins (Ben)\n\n{marker}\n\n## Minutes\n");
+            let out = insert_top(&doc, &top_line(&top("Coffee")));
+            assert_eq!(
+                out,
+                format!("## Agenda\n\n* Bins (Ben)\n* Coffee (Anna)\n\n{marker}\n\n## Minutes\n")
+            );
+        }
+    }
+
+    #[test]
     fn the_first_item_goes_above_the_marker() {
-        let doc = format!("## Tagesordnung\n\n{TOP_MARKER}\n\n## Protokoll\n");
-        let out = insert_top(&doc, "* Kaffee (Anna)");
+        let doc = format!("## Agenda\n\n{TOP_MARKER}\n\n## Minutes\n");
+        let out = insert_top(&doc, "* Coffee (Anna)");
         assert_eq!(
             out,
-            format!("## Tagesordnung\n\n* Kaffee (Anna)\n\n{TOP_MARKER}\n\n## Protokoll\n")
+            format!("## Agenda\n\n* Coffee (Anna)\n\n{TOP_MARKER}\n\n## Minutes\n")
         );
     }
 
     #[test]
     fn without_the_marker_the_item_ends_the_agenda_section() {
-        let doc = "## Tagesordnung\n\n1. Müll\n2. Kaffee\n\n## Protokoll\n\ntext\n";
+        let doc = "## Agenda\n\n1. Bins\n2. Coffee\n\n## Minutes\n\ntext\n";
         assert_eq!(
-            insert_top(doc, "* Garten (Anna)"),
-            "## Tagesordnung\n\n1. Müll\n2. Kaffee\n* Garten (Anna)\n\n## Protokoll\n\ntext\n"
+            insert_top(doc, "* Garden (Anna)"),
+            "## Agenda\n\n1. Bins\n2. Coffee\n* Garden (Anna)\n\n## Minutes\n\ntext\n"
         );
         let doc = "## Tagesordnung\n\nWir reden über:\n\n## Protokoll\n";
         assert_eq!(
             insert_top(doc, "* Garten (Anna)"),
             "## Tagesordnung\n\nWir reden über:\n\n* Garten (Anna)\n\n## Protokoll\n"
         );
-        let doc = "Nur Text.";
+        let doc = "Just text.";
         assert_eq!(
-            insert_top(doc, "* Garten (Anna)"),
-            "Nur Text.\n\n## Tagesordnung\n\n* Garten (Anna)\n"
+            insert_top(doc, "* Garden (Anna)"),
+            "Just text.\n\n## Agenda\n\n* Garden (Anna)\n"
         );
     }
 
     #[test]
     fn a_chat_item_cannot_bring_its_own_markdown_structure() {
         assert_eq!(
-            top_line(&top("## Überschrift\nzweite Zeile")),
-            "* Überschrift zweite Zeile (Anna)"
+            top_line(&top("## Heading\nsecond line")),
+            "* Heading second line (Anna)"
         );
         assert_eq!(top_line(&top("   ")), "* … (Anna)");
         assert_eq!(
@@ -627,23 +692,35 @@ mod tests {
     #[test]
     fn chat_items_bring_no_checkbox_and_no_decision() {
         assert_eq!(
-            top_line(&top("Spülmaschine [ ] kaputt")),
-            "* Spülmaschine ( ) kaputt (Anna)"
+            top_line(&top("Dishwasher [ ] broken")),
+            "* Dishwasher ( ) broken (Anna)"
         );
-        assert_eq!(top_line(&top("[x] erledigt")), "* (x) erledigt (Anna)");
+        assert_eq!(top_line(&top("[x] done")), "* (x) done (Anna)");
         assert_eq!(
-            top_line(&top("Beschluss: Kasse an Bob")),
-            "* TOP Beschluss: Kasse an Bob (Anna)"
+            top_line(&top("Decision: the cash box to Bob")),
+            "* Item: Decision: the cash box to Bob (Anna)"
+        );
+        assert_eq!(
+            top_line(&top("**Beschluss:** Kasse an Bob")),
+            "* Item: Beschluss:** Kasse an Bob (Anna)"
         );
         assert_eq!(
             top_line(&top("aufgabe: putzen")),
-            "* TOP aufgabe: putzen (Anna)"
+            "* Item: aufgabe: putzen (Anna)"
         );
+        assert_eq!(top_line(&top("Task force")), "* Task force (Anna)");
         // An undefused line on the agenda (typed by hand) is no decision either.
-        let doc = "## Tagesordnung\n\n* Beschluss: Kasse an Bob (Mallory)\n\n## Protokoll\n\nBeschluss: echt\n\n## Neue Punkte aus dem Chat\n\n- [ ] kein Task\n";
-        let o = extract(doc);
-        assert_eq!(o.decisions, vec!["echt"]);
-        assert!(o.tasks.is_empty(), "{:?}", o.tasks);
+        for (agenda, chat) in [
+            ("## Agenda", CHAT_ITEMS_HEADINGS[0]),
+            ("## Tagesordnung", CHAT_ITEMS_HEADINGS[1]),
+        ] {
+            let doc = format!(
+                "{agenda}\n\n* Decision: cash box to Bob (Mallory)\n\n## Minutes\n\nDecision: real\n\n{chat}\n\n- [ ] no task\n"
+            );
+            let o = extract(&doc);
+            assert_eq!(o.decisions, vec!["real"]);
+            assert!(o.tasks.is_empty(), "{:?}", o.tasks);
+        }
     }
 
     #[test]
@@ -655,43 +732,48 @@ mod tests {
     #[test]
     fn decisions_and_tasks_are_read_back() {
         let doc = "\
-## Protokoll
+## Minutes
 
-### Müll
+### Bins
 
-Beschluss: Die Tonnen stehen ab jetzt im Hof.
-**Beschluss:** Wir kaufen einen Kompost.
+Decision: The bins stay in the yard from now on.
+**Decision:** We buy a compost bin.
 * **Beschluss**: Ben fragt die Hausverwaltung.
-Beschluss:
-Beschlussfähig waren wir.
+Decision:
+Decisions were taken quickly.
 
-## Aufgaben
+## Tasks
 
-- [ ] Anna: Kompost bestellen bis Freitag
-- [x] Ben: schon erledigt
+- [ ] Anna: order the compost bin by Friday
+- [x] Ben: done already
 - [ ]
+* Task: paint a sign
 * Aufgabe: Schild malen
 ";
         let o = extract(doc);
         assert_eq!(
             o.decisions,
             vec![
-                "Die Tonnen stehen ab jetzt im Hof.",
-                "Wir kaufen einen Kompost.",
+                "The bins stay in the yard from now on.",
+                "We buy a compost bin.",
                 "Ben fragt die Hausverwaltung."
             ]
         );
         assert_eq!(
             o.tasks,
-            vec!["Anna: Kompost bestellen bis Freitag", "Schild malen"]
+            vec![
+                "Anna: order the compost bin by Friday",
+                "paint a sign",
+                "Schild malen"
+            ]
         );
     }
 
     #[test]
     fn the_summary_lists_what_was_decided() {
         let o = Outcome {
-            decisions: vec!["Kompost".into()],
-            tasks: vec!["Anna bestellt".into()],
+            decisions: vec!["Compost".into()],
+            tasks: vec!["Anna orders".into()],
         };
         let s = summary(
             &plenum(),
@@ -701,9 +783,9 @@ Beschlussfähig waren wir.
             Some("https://w/doc/b"),
             PdfNote::Failed,
         );
-        assert!(s.contains("- Kompost"));
-        assert!(s.contains("- Anna bestellt"));
-        assert!(s.contains("Alle Beschlüsse: https://w/doc/b"));
+        assert!(s.contains("- Compost"));
+        assert!(s.contains("- Anna orders"));
+        assert!(s.contains("All decisions: https://w/doc/b"));
         assert!(s.contains("PDF"));
         let none = summary(
             &plenum(),
@@ -713,7 +795,7 @@ Beschlussfähig waren wir.
             None,
             PdfNote::Fine,
         );
-        assert!(none.contains("Keine Beschlüsse"));
+        assert!(none.contains("No decisions"));
     }
 
     fn carried(text: &str) -> Carried {
@@ -726,29 +808,24 @@ Beschlussfähig waren wir.
 
     #[test]
     fn open_tasks_come_along_as_a_checklist_and_are_read_back() {
-        let tasks = [carried("Anna: Spülmaschine [reparieren]")];
+        let tasks = [carried("Anna: dishwasher [repair]")];
         let text = render_template(DEFAULT_TEMPLATE, &plenum(), key(), &tasks);
         assert!(text.contains(OPEN_TASKS_HEADING));
-        assert!(text.contains("- [ ] Anna: Spülmaschine (reparieren) (seit 18.10.2026)"));
+        assert!(text.contains("- [ ] Anna: dishwasher (repair) (since 18 Oct 2026)"));
         assert!(!text.contains("{{"));
         // left open: a task again at the end of this meeting
         assert_eq!(
             extract(&text).tasks,
-            vec!["Anna: Spülmaschine (reparieren) (seit 18.10.2026)".to_owned()]
+            vec!["Anna: dishwasher (repair) (since 18 Oct 2026)".to_owned()]
         );
         // ticked off: done
         let done = text.replace("- [ ] Anna", "- [x] Anna");
         assert!(extract(&done).tasks.is_empty());
         // a template of its own without the placeholder: at the end
-        let own = render_template(
-            "**{{plenum}}**\n\n## Tagesordnung\n",
-            &plenum(),
-            key(),
-            &tasks,
-        );
-        assert!(own.trim_end().ends_with("(seit 18.10.2026)"));
+        let own = render_template("**{{plenum}}**\n\n## Agenda\n", &plenum(), key(), &tasks);
+        assert!(own.trim_end().ends_with("(since 18 Oct 2026)"));
         assert_eq!(
-            render_template("x {{offene_aufgaben}}", &plenum(), key(), &[]).trim(),
+            render_template("x {{open_tasks}}", &plenum(), key(), &[]).trim(),
             "x"
         );
     }
@@ -769,21 +846,24 @@ Beschlussfähig waren wir.
         let t = overview_text(
             &plenum(),
             &next,
-            &[carried("Ben: Putzplan")],
-            &[carried("Beschluss [eins]")],
+            &[carried("Ben: cleaning rota")],
+            &[carried("Decision [one]")],
             &links,
         );
-        assert!(t.contains("[Tagesordnung und Protokoll](https://wiki.test/doc/p)"));
-        assert!(t.contains("15.11.2026") && t.contains("3 Tag(e) vorher"));
+        assert!(t.contains("[agenda and minutes](https://wiki.test/doc/p)"));
         assert!(
-            t.contains("[„Hausplenum“ in Nextcloud](https://cloud.test/apps/calendar)"),
+            t.contains("15 November 2026") && t.contains("3 days before"),
+            "{t}"
+        );
+        assert!(
+            t.contains("[“Hausplenum” in Nextcloud](https://cloud.test/apps/calendar)"),
             "{t}"
         );
         assert!(t.contains(
-            "* Ben: Putzplan (seit dem [Plenum am 18.10.2026](https://wiki.test/doc/old))"
+            "* Ben: cleaning rota (since the [plenum on 18 Oct 2026](https://wiki.test/doc/old))"
         ));
-        assert!(t.contains("Beschluss \\[eins\\]"));
-        assert!(t.contains("[Regeln Hausplenum](https://wiki.test/doc/rules)"));
+        assert!(t.contains("Decision \\[one\\]"));
+        assert!(t.contains("[Hausplenum: Rules](https://wiki.test/doc/rules)"));
         // the overview's own lines are no task and no decision
         assert_eq!(extract(&t), Outcome::default());
     }
