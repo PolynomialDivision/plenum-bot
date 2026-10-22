@@ -162,6 +162,9 @@ pub struct Engine<W, C> {
     pub calendar_url: Option<String>,
     pub(crate) state: Mutex<State>,
     state_path: PathBuf,
+    /// The plenums whose area was checked since the start: a restart (a deploy with a new
+    /// name, say) checks every area at once, not only an hour after the last check.
+    areas_checked: std::sync::Mutex<HashSet<String>>,
 }
 
 /// Who sent a command.
@@ -202,6 +205,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             calendar_url: None,
             state: Mutex::new(state),
             state_path,
+            areas_checked: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -238,15 +242,17 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     /// The area in the wiki: checked every [`AREA_EVERY`] (and right after the start), the
     /// protocols filed, the overview written when its text changed.
     async fn tick_area(&self, st: &mut State, p: &Plenum, now: DateTime<Utc>) -> Result<()> {
-        let due = st
-            .plenums
-            .get(&p.key)
-            .and_then(|ps| ps.area_checked)
-            .is_none_or(|at| now - at >= AREA_EVERY);
+        let due = !self.areas_checked.lock().unwrap().contains(&p.key)
+            || st
+                .plenums
+                .get(&p.key)
+                .and_then(|ps| ps.area_checked)
+                .is_none_or(|at| now - at >= AREA_EVERY);
         if due {
             self.setup(st, p).await?;
             self.file_protocols(st, p).await;
             st.plenums.entry(p.key.clone()).or_default().area_checked = Some(now);
+            self.areas_checked.lock().unwrap().insert(p.key.clone());
             self.save(st).await;
         }
         self.write_overview(st, p, now).await
@@ -2576,6 +2582,8 @@ mod tests {
             ps.rules_doc_id = Some("rules-de".into());
             ps.decisions_doc_id = Some("decisions-de".into());
             ps.template_doc_id = Some("template-de".into());
+            // checked a moment ago by the bot before the restart: checked again at once
+            ps.area_checked = Some(at(2026, 10, 20, 11, 55));
         }
         e.tick(at(2026, 10, 20, 12, 0)).await;
         let cols = e.wiki.collections.lock().unwrap().clone();

@@ -439,7 +439,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
     fn the_house_plenums_series_has_its_fifth_sundays() {
         let ics = std::fs::read_to_string(concat!(
             env!("HOME"),
-            "/unraid/house-infra/docs/plenum/hausplenum.ics"
+            "/unraid/house-infra/docs/plenum/house-plenum.ics"
         ));
         let Ok(ics) = ics else { return }; // house-infra not next to the bot
         let occ = occurrences(&ics::parse_ics(&ics), d(2026, 11, 1), d(2026, 11, 30));

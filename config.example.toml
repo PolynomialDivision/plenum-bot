@@ -52,10 +52,10 @@ enabled = true
 keep = ["@calendar-bot:example.org"]
 
 [[plenum]]
-key = "haus"
-name = "Hausplenum"
+key = "house"
+name = "House plenum"
 room = "!house:example.org"
-collection = "Hausplenum"
+collection = "House plenum"
 
 [[plenum]]
 key = "kueche-eg"
