@@ -69,6 +69,9 @@ pub struct PlenumState {
     /// When the calendar was last read; None: never (nothing is known about the dates yet).
     #[serde(default)]
     pub calendar_read: Option<DateTime<Utc>>,
+    /// The calendar was made anew (it was missing): its reads count only once it has events.
+    #[serde(default)]
+    pub calendar_remade: bool,
     /// Agenda items sent before the next protocol existed; they go into it.
     #[serde(default)]
     pub pending_tops: Vec<Top>,
@@ -161,6 +164,9 @@ pub struct Close {
     pub requested: bool,
     #[serde(default)]
     pub decisions_saved: bool,
+    /// The open tasks went into the next protocol made already (`carry_tasks_on`).
+    #[serde(default)]
+    pub tasks_carried: bool,
     /// The PDF attached to the protocol (its URL path).
     #[serde(default)]
     pub pdf_url: Option<String>,

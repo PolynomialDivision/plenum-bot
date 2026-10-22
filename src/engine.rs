@@ -325,23 +325,26 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     /// announced again, one gone from the calendar before it began is cancelled, one that
     /// comes back is not any more.
     async fn follow_calendar(&self, st: &mut State, p: &Plenum, now: DateTime<Utc>) {
+        let tz = self.tz;
         let ps = st.plenums.entry(p.key.clone()).or_default();
         if ps.calendar_read.is_none() {
             return;
         }
         let occurrences = ps.occurrences.clone();
         let ids: HashSet<&str> = occurrences.iter().map(|o| o.id.as_str()).collect();
-        let mut moved = Vec::new();
+        // What changed is recorded here, without a call that could fail: the notices and the
+        // titles below follow from it and are tried again at every tick until they went out.
         for occ in &occurrences {
             let Some(m) = ps.meetings.get_mut(&occ.id) else {
                 continue;
             };
+            let to_come = occ.start.start(tz) > now;
             if m.cancelled && !m.close.done {
                 info!(plenum = %p.key, meeting = %occ.id, "Back in the calendar");
                 m.cancelled = false;
                 m.skipped = false;
                 // The room was told it is cancelled: it hears that it is on again.
-                if m.cancel_notice.done {
+                if m.cancel_notice.done && to_come {
                     m.announce = Default::default();
                     m.remind = Default::default();
                     m.announce_again = true;
@@ -350,90 +353,111 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             }
             if let Some(old) = m.start {
                 if old != occ.start && m.created && !m.close.done {
-                    moved.push((occ.id.clone(), old));
+                    info!(plenum = %p.key, meeting = %occ.id, from = %old, to = %occ.start, "Moved in the calendar");
+                    // Still to come: announced again (at once if the room knew the old date,
+                    // saying from when) and reminded of again.
+                    if to_come {
+                        if m.announce.done {
+                            m.moved_from = Some(m.moved_from.unwrap_or(old));
+                            m.announce_again = true;
+                        }
+                        m.announce = Default::default();
+                        m.remind = Default::default();
+                    }
                 }
             }
             m.start = Some(occ.start);
             m.end = occ.end;
         }
-        let tz = self.tz;
-        let gone: Vec<String> = ps
-            .meetings
-            .iter()
-            .filter(|(id, m)| {
-                !ids.contains(id.as_str())
-                    && m.created
-                    && !m.close.done
-                    && !m.cancelled
-                    && !m.skipped
-                    && m.start.is_some_and(|s| s.start(tz) > now)
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        for (id, m) in ps.meetings.iter_mut() {
+            if !ids.contains(id.as_str())
+                && m.created
+                && !m.close.done
+                && !m.cancelled
+                && !m.skipped
+                && m.start.is_some_and(|s| s.start(tz) > now)
+            {
+                info!(plenum = %p.key, meeting = %id, "Gone from the calendar: cancelled");
+                m.cancelled = true;
+            }
+        }
         // occurrences not prepared yet that left the calendar: nothing to keep
         ps.meetings
             .retain(|id, m| m.created || m.close.done || m.skipped || ids.contains(id.as_str()));
-        for (id, old) in moved {
-            if let Err(e) = self.moved(st, p, &id, old, now).await {
-                warn!(plenum = %p.key, meeting = %id, "Following a move: {e:#}");
-            }
-        }
-        for id in gone {
-            if let Err(e) = self.cancelled(st, p, &id).await {
-                warn!(plenum = %p.key, meeting = %id, "Following a cancellation: {e:#}");
+        self.tell_cancellations(st, p).await;
+        self.retitle(st, p).await;
+    }
+
+    /// A cancelled meeting the room was told about hears that it is cancelled, once.
+    async fn tell_cancellations(&self, st: &mut State, p: &Plenum) {
+        let due: Vec<String> = st.plenums[&p.key]
+            .meetings
+            .iter()
+            .filter(|(_, m)| {
+                m.cancelled
+                    && m.created
+                    && m.announce.done
+                    && !m.cancel_notice.done
+                    && !m.close.done
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            if let Err(e) = self.tell_cancellation(st, p, &id).await {
+                warn!(plenum = %p.key, meeting = %id, "Telling the cancellation (again at the next tick): {e:#}");
             }
         }
     }
 
-    /// Moved in the calendar: the protocol's title follows, and a meeting still to come is
-    /// announced again (at once if the room knew the old date; the announcement says from
-    /// when) and reminded of again.
-    async fn moved(
-        &self,
-        st: &mut State,
-        p: &Plenum,
-        id: &str,
-        old: MeetingKey,
-        now: DateTime<Utc>,
-    ) -> Result<()> {
-        let new = meeting(st, p, id).start.expect("set from the calendar");
-        info!(plenum = %p.key, meeting = %id, from = %old, to = %new, "Moved in the calendar");
-        let title = self.free_title(st, p, id, new);
-        let doc_id = meeting(st, p, id).doc_id.clone();
-        if meeting(st, p, id).title.as_deref() != Some(title.as_str()) {
-            self.wiki.rename(&doc_id, &title).await?;
-            meeting(st, p, id).title = Some(title);
-        }
-        if new.start(self.tz) > now {
-            let m = meeting(st, p, id);
-            if m.announce.done {
-                m.moved_from = Some(m.moved_from.unwrap_or(old));
-                m.announce_again = true;
-            }
-            m.announce = Default::default();
-            m.remind = Default::default();
-        }
-        self.save(st).await?;
-        Ok(())
-    }
-
-    /// Gone from the calendar before it began: said once in the room if it was announced.
-    async fn cancelled(&self, st: &mut State, p: &Plenum, id: &str) -> Result<()> {
+    async fn tell_cancellation(&self, st: &mut State, p: &Plenum, id: &str) -> Result<()> {
         let m = meeting(st, p, id);
-        m.cancelled = true;
-        info!(plenum = %p.key, meeting = %id, "Gone from the calendar: cancelled");
-        if m.announce.done && !m.cancel_notice.done {
-            let txn = m.cancel_notice.txn();
-            let start = m.start.expect("a known meeting");
-            let link = self.link_of(m);
-            self.save(st).await?;
-            self.chat
-                .send(&p.room, &protocol::cancellation(p, start, &link), &txn)
-                .await?;
-            meeting(st, p, id).cancel_notice.done = true;
-        }
+        let txn = m.cancel_notice.txn();
+        let start = m.start.context("a meeting without a start")?;
+        let link = self.link_of(m);
         self.save(st).await?;
-        Ok(())
+        self.chat
+            .send(&p.room, &protocol::cancellation(p, start, &link), &txn)
+            .await?;
+        meeting(st, p, id).cancel_notice.done = true;
+        self.save(st).await
+    }
+
+    /// Every open protocol's title follows its meeting's date (a move); a rename that fails is
+    /// tried again at the next tick.
+    async fn retitle(&self, st: &mut State, p: &Plenum) {
+        let todo: Vec<(String, String, String)> = st.plenums[&p.key]
+            .meetings
+            .iter()
+            .filter(|(_, m)| m.created && !m.close.done)
+            .filter_map(|(id, m)| {
+                let title = self.free_title(st, p, id, m.start?);
+                (m.title.as_deref() != Some(title.as_str()))
+                    .then(|| (id.clone(), m.doc_id.clone(), title))
+            })
+            .collect();
+        for (id, doc_id, title) in todo {
+            match self.wiki.rename(&doc_id, &title).await {
+                Ok(()) => {
+                    info!(plenum = %p.key, meeting = %id, %title, "Protocol renamed");
+                    meeting(st, p, &id).title = Some(title);
+                }
+                Err(e) => {
+                    warn!(plenum = %p.key, meeting = %id, "Renaming the protocol (again at the next tick): {e:#}")
+                }
+            }
+        }
+    }
+
+    /// The plenum's calendar was missing and made anew (main.rs): someone deleted it, maybe by
+    /// mistake. Until it has events again, its empty reads change nothing (they would cancel
+    /// every meeting).
+    pub async fn calendar_remade(&self, key: &str) {
+        let mut st = self.state.lock().await;
+        st.plenums
+            .entry(key.to_owned())
+            .or_default()
+            .calendar_remade = true;
+        self.save_or_log(&st).await;
     }
 
     /// The calendar's occurrences of the plenum, as just read (main.rs, every few minutes).
@@ -445,6 +469,13 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     ) {
         let mut st = self.state.lock().await;
         let ps = st.plenums.entry(key.to_owned()).or_default();
+        if ps.calendar_remade {
+            if occurrences.is_empty() {
+                warn!(plenum = %key, "The calendar was made anew and is empty: the dates stay as they were until it has events again");
+                return;
+            }
+            ps.calendar_remade = false;
+        }
         ps.occurrences = occurrences;
         ps.calendar_read = Some(now);
         self.save_or_log(&st).await;
@@ -733,6 +764,10 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             None => {
                 let ps = &st.plenums[&p.key];
                 let mut text = protocol::render_template(&template, p, start, &ps.open_tasks);
+                let unknown = protocol::placeholders(&text);
+                if !unknown.is_empty() {
+                    warn!(plenum = %p.key, placeholders = %unknown.join(" "), "The template has placeholders the bot does not know: left as they are");
+                }
                 for line in &pending {
                     text = protocol::insert_top(&text, line);
                 }
@@ -881,7 +916,11 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             ps.decisions.extend(outcome.decisions.iter().map(carried));
             ps.decisions.sort_by_key(|d| d.date);
         }
-        self.carry_tasks_on(st, p, start).await?;
+        if !meeting(st, p, key).close.tasks_carried {
+            self.carry_tasks_on(st, p, start).await?;
+            meeting(st, p, key).close.tasks_carried = true;
+            self.save(st).await?;
+        }
 
         // 1. the decisions into the plenum's list (found or created again)
         let mut decisions_link = None;
@@ -2577,6 +2616,105 @@ mod tests {
             .collection_id
             .clone();
         assert!(id.is_some_and(|id| id != "col-other"));
+    }
+
+    #[tokio::test]
+    async fn a_move_is_not_lost_when_the_wiki_or_the_room_fails_meanwhile() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 29, 19, 0)).await; // announced
+        let move_to = |l: &mut Vec<Occurrence>| {
+            for o in l.iter_mut().filter(|o| o.id == "house-series#2026-11-01") {
+                *o = occ(&o.id, "2026-11-08 18:00");
+            }
+        };
+        calendar(e, "house", move_to, at(2026, 10, 30, 9, 0)).await;
+        // Outline and the room are down at the tick that sees the move
+        *e.wiki.fail.lock().unwrap() = true;
+        *e.chat.fail.lock().unwrap() = true;
+        e.tick(at(2026, 10, 30, 9, 0)).await;
+        assert_eq!(e.chat.texts().len(), 1);
+        // back: renamed and told, from the date the room knew
+        *e.wiki.fail.lock().unwrap() = false;
+        *e.chat.fail.lock().unwrap() = false;
+        e.tick(at(2026, 10, 30, 9, 1)).await;
+        assert!(e.wiki.by_title("House plenum 2026-11-08").is_some());
+        let texts = e.chat.texts();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(
+            texts[1].contains("moved from Sunday, 1 November 2026"),
+            "{}",
+            texts[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_is_told_once_the_room_answers_again() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 29, 19, 0)).await; // announced
+        calendar(
+            e,
+            "house",
+            |l| l.retain(|o| o.id != "house-series#2026-11-01"),
+            at(2026, 10, 30, 9, 0),
+        )
+        .await;
+        *e.chat.fail.lock().unwrap() = true;
+        e.tick(at(2026, 10, 30, 9, 0)).await;
+        *e.chat.fail.lock().unwrap() = false;
+        e.tick(at(2026, 10, 30, 9, 1)).await;
+        e.tick(at(2026, 10, 30, 9, 2)).await;
+        let texts = e.chat.texts();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(texts[1].contains("cancelled"), "{}", texts[1]);
+    }
+
+    #[tokio::test]
+    async fn a_calendar_made_anew_cancels_nothing_until_it_has_events() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 29, 19, 0)).await; // announced
+        e.calendar_remade("house").await;
+        e.apply_calendar("house", vec![], at(2026, 10, 30, 9, 0))
+            .await;
+        e.tick(at(2026, 10, 30, 9, 0)).await;
+        assert_eq!(e.chat.texts().len(), 1, "nothing cancelled");
+        assert_eq!(e.state.lock().await.plenums["house"].occurrences.len(), 9);
+        // once it has events again, they count (and the guard is gone)
+        e.apply_calendar(
+            "house",
+            vec![occ("new", "2026-11-04 20:00")],
+            at(2026, 10, 30, 10, 0),
+        )
+        .await;
+        let st = e.state.lock().await;
+        assert!(!st.plenums["house"].calendar_remade);
+        assert_eq!(st.plenums["house"].occurrences.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_meeting_back_after_its_start_is_not_announced_again() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 29, 19, 0)).await; // announced
+        let all = e.state.lock().await.plenums["house"].occurrences.clone();
+        calendar(
+            e,
+            "house",
+            |l| l.retain(|o| o.id != "house-series#2026-11-01"),
+            at(2026, 10, 30, 9, 0),
+        )
+        .await;
+        e.tick(at(2026, 10, 30, 9, 0)).await; // cancelled, said
+        e.apply_calendar("house", all, at(2026, 11, 1, 19, 30))
+            .await;
+        e.tick(at(2026, 11, 1, 19, 30)).await;
+        let texts = e.chat.texts();
+        assert!(
+            !texts.iter().skip(2).any(|t| t.starts_with("📋")),
+            "no announcement after the start: {texts:?}"
+        );
     }
 
     #[tokio::test]

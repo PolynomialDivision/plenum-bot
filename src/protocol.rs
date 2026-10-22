@@ -90,6 +90,24 @@ pub fn render_template(
     text
 }
 
+/// The `{{…}}` left in a filled-in template: placeholders the bot does not know (a typo, or
+/// the German ones of before 2026-10-22).
+pub fn placeholders(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("{{") {
+        let Some(j) = rest[i..].find("}}") else {
+            break;
+        };
+        let p = &rest[i..i + j + 2];
+        if !out.iter().any(|o| o == p) {
+            out.push(p.to_owned());
+        }
+        rest = &rest[i + j + 2..];
+    }
+    out
+}
+
 /// The protocol's title: "House plenum 2026-11-01" (sorts and searches well).
 pub fn title(plenum: &Plenum, key: MeetingKey) -> String {
     format!("{} {}", plenum.name, key.0.format("%Y-%m-%d"))
@@ -598,6 +616,8 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("- [ ] Ben: cleaning rota (since 18 Oct 2026)"));
+        assert_eq!(placeholders(&text), ["{{datum}}"]);
+        assert!(placeholders(&render_template(DEFAULT_TEMPLATE, &plenum(), key(), &[])).is_empty());
     }
 
     #[test]

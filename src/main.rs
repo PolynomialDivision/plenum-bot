@@ -283,7 +283,8 @@ async fn calendar_loop(
                     // A calendar made just now is empty: read at the next round, so that one
                     // someone deleted by mistake cancels nothing before it is noticed.
                     Ok(true) => {
-                        warn!(plenum = %p.key, calendar = %p.calendar, "Calendar made (it was missing): read at the next round");
+                        warn!(plenum = %p.key, calendar = %p.calendar, "Calendar made (it was missing): its dates count once it has events");
+                        engine.calendar_remade(&p.key).await;
                         continue;
                     }
                     Ok(false) => {}
