@@ -10,7 +10,10 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::engine::{Doc, Wiki};
+use crate::{
+    config::Access,
+    engine::{Doc, Wiki},
+};
 
 pub struct Outline {
     http: reqwest::Client,
@@ -57,6 +60,8 @@ struct ApiDoc {
     #[serde(default)]
     collection_id: Option<String>,
     #[serde(default)]
+    parent_document_id: Option<String>,
+    #[serde(default)]
     deleted_at: Option<String>,
     #[serde(default)]
     archived_at: Option<String>,
@@ -71,6 +76,7 @@ impl From<ApiDoc> for Doc {
             url: d.url,
             revision: d.revision,
             collection_id: d.collection_id,
+            parent_id: d.parent_document_id,
         }
     }
 }
@@ -79,6 +85,30 @@ impl From<ApiDoc> for Doc {
 struct ApiCollection {
     id: String,
     name: String,
+    /// "read_write", "read", or null (only its members and groups).
+    #[serde(default)]
+    permission: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ApiGroup {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct GroupList {
+    #[serde(default)]
+    groups: Vec<ApiGroup>,
+}
+
+/// The collection permission for everyone in the workspace.
+fn permission(access: Access) -> Option<&'static str> {
+    match access {
+        Access::House => Some("read_write"),
+        Access::Members => Some("read"),
+        Access::Private => None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -151,20 +181,52 @@ fn status_of(e: &anyhow::Error) -> Option<u16> {
 }
 
 impl Wiki for Outline {
-    async fn ensure_collection(&self, name: &str) -> Result<String> {
+    async fn ensure_collection(&self, name: &str, access: Access) -> Result<String> {
+        let wanted = permission(access);
         let found: Vec<ApiCollection> = self
             .call("collections.list", json!({"query": name, "limit": 100}))
             .await?;
         if let Some(c) = found.into_iter().find(|c| c.name.trim() == name) {
+            if c.permission.as_deref() != wanted {
+                // Outline answers 403 when the key's account is no admin of the collection
+                // (one made by hand): an error, so it shows in the log until fixed.
+                let _: ApiCollection = self
+                    .call(
+                        "collections.update",
+                        json!({"id": c.id, "permission": wanted}),
+                    )
+                    .await
+                    .context("setting the collection's access")?;
+                tracing::info!(collection = %name, ?wanted, "Collection access set");
+            }
             return Ok(c.id);
         }
         let c: ApiCollection = self
             .call(
                 "collections.create",
-                json!({"name": name, "permission": "read_write", "sharing": false}),
+                json!({"name": name, "permission": wanted, "sharing": false}),
             )
             .await?;
         Ok(c.id)
+    }
+
+    async fn grant_group(&self, collection_id: &str, group: &str) -> Result<bool> {
+        // Outline 1.11 answers {groups, groupMemberships} here, not a list (checked 2026-10-22).
+        let found: GroupList = self
+            .call("groups.list", json!({"query": group, "limit": 100}))
+            .await?;
+        let Some(g) = found.groups.into_iter().find(|g| g.name == group) else {
+            return Ok(false);
+        };
+        // Outline keeps one membership per group and collection: adding again only sets the
+        // permission.
+        let _: Value = self
+            .call(
+                "collections.add_group",
+                json!({"id": collection_id, "groupId": g.id, "permission": "read_write"}),
+            )
+            .await?;
+        Ok(true)
     }
 
     async fn find_doc(&self, collection_id: &str, title: &str) -> Result<Option<Doc>> {
@@ -195,17 +257,45 @@ impl Wiki for Outline {
         &self,
         id: &str,
         collection_id: &str,
+        parent_id: Option<&str>,
         title: &str,
         text: &str,
     ) -> Result<Doc> {
         let d: ApiDoc = self
             .call(
                 "documents.create",
-                json!({"id": id, "title": title, "text": text,
-                       "collectionId": collection_id, "publish": true}),
+                json!({"id": id, "title": title, "text": text, "collectionId": collection_id,
+                       "parentDocumentId": parent_id, "publish": true}),
             )
             .await?;
         Ok(d.into())
+    }
+
+    async fn move_doc(&self, id: &str, collection_id: &str, parent_id: &str) -> Result<()> {
+        let _: Value = self
+            .call(
+                "documents.move",
+                json!({"id": id, "collectionId": collection_id, "parentDocumentId": parent_id}),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn rename(&self, id: &str, title: &str) -> Result<()> {
+        let _: ApiDoc = self
+            .call("documents.update", json!({"id": id, "title": title}))
+            .await?;
+        Ok(())
+    }
+
+    async fn replace(&self, id: &str, text: &str) -> Result<()> {
+        let _: ApiDoc = self
+            .call(
+                "documents.update",
+                json!({"id": id, "text": text, "editMode": "replace"}),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn doc(&self, id: &str) -> Result<Option<Doc>> {
@@ -320,11 +410,20 @@ mod against_outline {
         commands,
         config::{PdfConfig, Plenum},
         engine::{fakes::FakeChat, Engine, Sender},
-        schedule::Recurrence,
         state::State,
     };
     use chrono::TimeZone;
     use std::collections::HashSet;
+
+    fn occurrence(id: &str, start: &str) -> crate::calendar::Occurrence {
+        let start: crate::schedule::MeetingKey = start.parse().unwrap();
+        crate::calendar::Occurrence {
+            id: id.into(),
+            start,
+            end: Some(start.0 + chrono::Duration::hours(2)),
+            summary: "Plenum".into(),
+        }
+    }
 
     /// A document Outline lists a moment after creating it (seen 2026-10-20: right after
     /// documents.create, documents.list and the title search may not have it yet).
@@ -355,17 +454,14 @@ mod against_outline {
             name: "Hausplenum".into(),
             room: "!haus:x".try_into().unwrap(),
             collection: collection.clone(),
-            recurrence: Some(
-                toml::from_str::<Recurrence>(
-                    "kind = 'monthly_nth'\nweekday = 'sun'\nnths = [1]\ntime = '19:00'",
-                )
-                .unwrap(),
-            ),
+            calendar: "plenum-haus".into(),
             prepare_days: 3,
             remind_minutes: 30,
             duration_minutes: 120,
             close_after_hours: 12,
             organizers: HashSet::new(),
+            group: None,
+            access: crate::config::Access::House,
         };
         let fonts = ["/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/TTF"]
             .into_iter()
@@ -400,6 +496,13 @@ mod against_outline {
         };
         let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
         let cmd = |s: &str| commands::parse_for(s, today, &["haus"]).unwrap();
+        engine
+            .apply_calendar(
+                "haus",
+                vec![occurrence("ev#2026-11-01", "2026-11-01 19:00")],
+                at(10, 1, 0),
+            )
+            .await;
 
         let a = engine
             .command(&room, &anna, cmd("!top Müll trennen"), at(10, 20, 12))
@@ -408,7 +511,11 @@ mod against_outline {
         engine.tick(at(10, 29, 19)).await;
         let texts = engine.chat.texts();
         assert_eq!(texts.len(), 1, "announced: {texts:?}");
-        let col = engine.wiki.ensure_collection(&collection).await.unwrap();
+        let col = engine
+            .wiki
+            .ensure_collection(&collection, crate::config::Access::House)
+            .await
+            .unwrap();
         let doc = listed(&engine.wiki, &col, "Hausplenum 2026-11-01").await;
         assert!(doc.text.contains("* Müll trennen (Anna)"), "{}", doc.text);
 
@@ -487,5 +594,200 @@ mod against_outline {
             "--- protocol:\n{}\n--- decisions:\n{}",
             doc.text, decisions.text
         );
+    }
+
+    /// An admin's call (the test's stand-in for outline-roles and for looking).
+    async fn admin(url: &str, key: &str, method: &str, body: Value) -> Value {
+        let r = reqwest::Client::new()
+            .post(format!("{url}/api/{method}"))
+            .bearer_auth(key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = r.status();
+        let v: Value = r.json().await.unwrap();
+        assert!(status.is_success(), "{method}: {status} {v}");
+        v["data"].clone()
+    }
+
+    /// The areas of a kitchen (everyone reads, its group writes) and of the finance group
+    /// (only its group) with the bot's key as a member, as in production
+    /// (`OUTLINE_IT_ADMIN_KEY`: an admin's key, which makes the group as outline-roles does).
+    #[tokio::test]
+    #[ignore = "needs a running Outline"]
+    async fn areas_with_their_access_in_a_real_outline() {
+        let (Ok(url), Ok(key), Ok(admin_key)) = (
+            std::env::var("OUTLINE_IT_URL"),
+            std::env::var("OUTLINE_IT_KEY"),
+            std::env::var("OUTLINE_IT_ADMIN_KEY"),
+        ) else {
+            panic!("set OUTLINE_IT_URL, OUTLINE_IT_KEY and OUTLINE_IT_ADMIN_KEY");
+        };
+        mxbot_common::logging::init("plenum_bot");
+        let run = uuid::Uuid::new_v4().to_string()[..8].to_owned();
+        let group = format!("it-kitchen-{run}");
+        admin(&url, &admin_key, "groups.create", json!({"name": group})).await;
+        let wiki = Outline::new(&url, &url, &key, Duration::from_secs(30)).unwrap();
+        let base = |key: &str, name: &str, room: &str| Plenum {
+            key: key.into(),
+            name: name.into(),
+            room: room.try_into().unwrap(),
+            collection: format!("IT {name} {run}"),
+            calendar: "plenum-haus".into(),
+            prepare_days: 3,
+            remind_minutes: 30,
+            duration_minutes: 120,
+            close_after_hours: 12,
+            organizers: HashSet::new(),
+            group: None,
+            access: crate::config::Access::House,
+        };
+        let kitchen = Plenum {
+            group: Some(group.clone()),
+            access: crate::config::Access::Members,
+            ..base("kitchen", "Küchenplenum", "!k:x")
+        };
+        let finance = Plenum {
+            group: Some(format!("it-finance-{run}")), // not in the wiki: no grant yet
+            access: crate::config::Access::Private,
+            ..base("finance", "Finanzplenum", "!f:x")
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            vec![kitchen.clone(), finance.clone()],
+            "Europe/Berlin".parse().unwrap(),
+            wiki,
+            FakeChat::default(),
+            PdfConfig {
+                enabled: false,
+                font_dir: String::new(),
+                post_to_room: false,
+            },
+            HashSet::new(),
+            State::default(),
+            dir.path().join("state.json"),
+        );
+        let tz: chrono_tz::Tz = "Europe/Berlin".parse().unwrap();
+        let at = |m, d, h| {
+            tz.with_ymd_and_hms(2026, m, d, h, 0, 0)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        for p in ["kitchen", "finance"] {
+            engine
+                .apply_calendar(
+                    p,
+                    vec![occurrence(&format!("{p}#2026-11-01"), "2026-11-01 19:00")],
+                    at(10, 1, 0),
+                )
+                .await;
+        }
+        engine.tick(at(10, 29, 19)).await; // the areas, and the protocols of 1.11.
+
+        // access: as the config says (seen by an admin)
+        let cols = admin(&url, &admin_key, "collections.list", json!({"limit": 100})).await;
+        let col = |name: &str| {
+            cols.as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing: {cols}"))
+                .clone()
+        };
+        let k = col(&kitchen.collection);
+        assert_eq!(k["permission"], "read", "{k}");
+        // private: not even the wiki's admins see it (only the bot, which made it, and the group)
+        assert!(!cols.to_string().contains(&finance.collection), "{cols}");
+        let mine = admin(&url, &key, "collections.list", json!({"limit": 100})).await;
+        let f = mine
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == finance.collection.as_str())
+            .unwrap()
+            .clone();
+        assert!(f["permission"].is_null(), "{f}");
+        let grants = admin(
+            &url,
+            &admin_key,
+            "collections.group_memberships",
+            json!({"id": k["id"]}),
+        )
+        .await;
+        assert!(grants.to_string().contains(&group), "{grants}");
+        assert!(grants.to_string().contains("read_write"), "{grants}");
+
+        // the documents: overview written, protocol filed under the protocols
+        let kc = k["id"].as_str().unwrap();
+        let overview = listed(&engine.wiki, kc, "Übersicht Küchenplenum").await;
+        assert!(
+            overview.text.contains("Nächste Termine"),
+            "{}",
+            overview.text
+        );
+        assert!(
+            overview.text.contains("Regeln Küchenplenum"),
+            "{}",
+            overview.text
+        );
+        let protocols = listed(&engine.wiki, kc, "Protokolle Küchenplenum").await;
+        let protocol = listed(&engine.wiki, kc, "Küchenplenum 2026-11-01").await;
+        assert_eq!(protocol.parent_id.as_deref(), Some(protocols.id.as_str()));
+
+        // an older protocol at the top is filed (the next hourly check), a move renames
+        let old = engine
+            .wiki
+            .create_doc(
+                &uuid::Uuid::new_v4().to_string(),
+                kc,
+                None,
+                "Küchenplenum 2026-10-04",
+                "alt",
+            )
+            .await
+            .unwrap();
+        {
+            let mut st = engine.state.lock().await;
+            let ps = st.plenums.get_mut("kitchen").unwrap();
+            let mut m = crate::state::Meeting {
+                doc_id: old.id.clone(),
+                created: true,
+                ..Default::default()
+            };
+            m.close.done = true;
+            ps.meetings.insert("kitchen#2026-10-04".into(), m);
+        }
+        engine.tick(at(10, 29, 21)).await;
+        let old = engine.wiki.doc(&old.id).await.unwrap().unwrap();
+        assert_eq!(old.parent_id.as_deref(), Some(protocols.id.as_str()));
+        // moved in the calendar: the same protocol, renamed
+        engine
+            .apply_calendar(
+                "kitchen",
+                vec![occurrence("kitchen#2026-11-01", "2026-11-08 19:00")],
+                at(10, 29, 22),
+            )
+            .await;
+        engine.tick(at(10, 29, 22)).await;
+        let moved = engine.wiki.doc(&protocol.id).await.unwrap().unwrap();
+        assert_eq!(moved.title, "Küchenplenum 2026-11-08");
+
+        // the overview again, now with the new date (only rewritten when it changed)
+        engine.tick(at(10, 29, 23)).await;
+        let overview = engine.wiki.doc(&overview.id).await.unwrap().unwrap();
+        assert!(overview.text.contains("08.11.2026"), "{}", overview.text);
+
+        // the access is put back when someone changed it, at the next check
+        admin(
+            &url,
+            &admin_key,
+            "collections.update",
+            json!({"id": kc, "permission": "read_write"}),
+        )
+        .await;
+        engine.tick(at(10, 30, 1)).await;
+        let k = admin(&url, &admin_key, "collections.info", json!({"id": kc})).await;
+        assert_eq!(k["permission"], "read", "{k}");
     }
 }

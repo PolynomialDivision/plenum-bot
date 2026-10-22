@@ -16,6 +16,15 @@ url = "http://outline:3000"               # the API, without /api
 public_url = "https://wiki.example.org"   # for links in the chat
 # api_key: OUTLINE_API_KEY in the environment
 
+# The dates: one Nextcloud calendar per plenum, owned by this account.
+[calendar]
+url = "https://cloud.example.org/remote.php/dav/calendars/plenum-bot/"
+username = "plenum-bot"
+# password: CALDAV_PASSWORD in the environment (an app password; password_env)
+house_group = "residents"                 # writes the house's, reads the groups' calendars
+readers = ["calendar-bot"]                # read every calendar that is not private
+web_url = "https://cloud.example.org/apps/calendar"
+
 [defaults]
 timezone = "Europe/Berlin"
 prepare_days = 3        # protocol created and announced this many days before
@@ -28,18 +37,32 @@ enabled = true
 font_dir = "/usr/share/fonts/truetype/dejavu"
 post_to_room = true
 
+# Who is in a plenum's group (only needed for plenums with a group).
+[directory]
+provider = "authentik"
+api_url = "https://login.example.org/api/v3"
+server_name = "example.org"           # house accounts: @<login>:example.org
+localpart_attribute = "matrix_localpart"
+matrix_ids_attribute = "matrix_ids"   # a person's other accounts
+# token: DIRECTORY_TOKEN in the environment (token_env)
+
+# The rooms of plenums with a group follow it; never removed: these, and room admins.
+[members]
+enabled = true
+keep = ["@calendar-bot:example.org"]
+
 [[plenum]]
 key = "haus"
 name = "Hausplenum"
 room = "!house:example.org"
 collection = "Hausplenum"
-recurrence = { kind = "monthly_nth", weekday = "sun", nths = [1], time = "19:00" }
 
 [[plenum]]
 key = "kueche-eg"
 name = "Küchenplenum EG"
 room = "!kitchen:example.org"
-collection = "Küchenplena"
+collection = "Küche EG"
+group = "kitchen-ground-floor"   # its room and its editors follow this directory group
+access = "members"                # everyone reads, the group writes (house | members | private)
 prepare_days = 1
 organizers = ["@anna:example.org"]
-recurrence = { kind = "weekly", weekday = "mon", time = "20:00", every_weeks = 2, anchor = "2026-10-26" }

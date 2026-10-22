@@ -14,7 +14,7 @@ chrono         = { version = "0.4", features = ["serde"] }
 chrono-tz      = "0.10"
 genpdf         = "0.2"
 mime           = "0.3"
-mxbot-common   = { git = "https://github.com/PolynomialDivision/mxbot-common" }
+mxbot-common   = { git = "https://github.com/PolynomialDivision/mxbot-common", features = ["calendar"] }
 # The same printpdf as genpdf (its built-in font names; genpdf does not re-export them).
 printpdf       = { version = "=0.3.4", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }

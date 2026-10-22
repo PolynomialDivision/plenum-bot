@@ -2,9 +2,6 @@
 //! the room is left alone (other bots share the house chat).
 
 use chrono::NaiveDate;
-use mxbot_common::config::TimeOfDay;
-
-use crate::schedule::parse_date;
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
@@ -17,15 +14,6 @@ pub enum Command {
     },
     /// `!protokoll fertig [key]`
     Close(Option<String>),
-    Cancel {
-        key: Option<String>,
-        date: NaiveDate,
-    },
-    Extra {
-        key: Option<String>,
-        date: NaiveDate,
-        time: TimeOfDay,
-    },
     /// A command of the bot with a mistake in it; the text says what is wrong.
     Invalid(String),
 }
@@ -38,7 +26,7 @@ pub fn parse(body: &str, today: NaiveDate) -> Option<Command> {
 
 /// The command in a message, if it is one of the bot's. `keys`: the plenum keys of the room,
 /// recognised where a command takes one.
-pub fn parse_for(body: &str, today: NaiveDate, keys: &[&str]) -> Option<Command> {
+pub fn parse_for(body: &str, _today: NaiveDate, keys: &[&str]) -> Option<Command> {
     let body = body.trim();
     let (head, rest) = match body.split_once(char::is_whitespace) {
         Some((h, r)) => (h, r.trim()),
@@ -90,28 +78,13 @@ pub fn parse_for(body: &str, today: NaiveDate, keys: &[&str]) -> Option<Command>
             match sub.as_deref() {
                 None => Some(Command::Overview(None)),
                 Some("hilfe") | Some("help") => Some(Command::Help),
-                Some("absagen") => {
-                    let (key, rest) = split_key(&words[1..]);
-                    let Some(date) = rest.first().and_then(|d| parse_date(d, today)) else {
-                        return Some(Command::Invalid(
-                            "Welcher Tag? Zum Beispiel `!plenum absagen 27.10.`".to_owned(),
-                        ));
-                    };
-                    Some(Command::Cancel { key, date })
-                }
-                Some("extra") | Some("zusatz") => {
-                    let (key, rest) = split_key(&words[1..]);
-                    let date = rest.first().and_then(|d| parse_date(d, today));
-                    let time = rest
-                        .get(1)
-                        .and_then(|t| t.trim_end_matches("Uhr").parse::<TimeOfDay>().ok());
-                    match (date, time) {
-                        (Some(date), Some(time)) => Some(Command::Extra { key, date, time }),
-                        _ => Some(Command::Invalid(
-                            "Tag und Uhrzeit, zum Beispiel `!plenum extra 30.10. 19:00`".to_owned(),
-                        )),
-                    }
-                }
+                // Dates are the calendar's now (2026-10-22): moved, cancelled and added there.
+                Some("absagen") | Some("extra") | Some("zusatz") | Some("verschieben")
+                | Some("verlegen") => Some(Command::Invalid(
+                    "Termine stehen jetzt im Nextcloud-Kalender des Plenums: dort eintragen, \
+                         verschieben oder absagen. Der Bot folgt dem Kalender."
+                        .to_owned(),
+                )),
                 Some(w) if is_key(w) && words.len() == 1 => {
                     Some(Command::Overview(Some(w.to_owned())))
                 }
@@ -134,10 +107,6 @@ mod tests {
 
     fn p(s: &str) -> Option<Command> {
         parse_for(s, today(), &["kueche-eg", "kueche-og"])
-    }
-
-    fn d(m: u32, day: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(2026, m, day).unwrap()
     }
 
     #[test]
@@ -187,44 +156,16 @@ mod tests {
     }
 
     #[test]
-    fn dates_are_cancelled_and_added() {
-        assert_eq!(
-            p("!plenum absagen 27.10."),
-            Some(Command::Cancel {
-                key: None,
-                date: d(10, 27)
-            })
-        );
-        assert_eq!(
-            p("!plenum absagen kueche-eg 27.10."),
-            Some(Command::Cancel {
-                key: Some("kueche-eg".into()),
-                date: d(10, 27)
-            })
-        );
-        assert_eq!(
-            p("!plenum extra 30.10. 19:30 kueche-og"),
-            Some(Command::Extra {
-                key: Some("kueche-og".into()),
-                date: d(10, 30),
-                time: TimeOfDay::new(19, 30)
-            })
-        );
-        assert_eq!(
-            p("!plenum extra 30.10. 19:30Uhr"),
-            Some(Command::Extra {
-                key: None,
-                date: d(10, 30),
-                time: TimeOfDay::new(19, 30)
-            })
-        );
-        assert!(matches!(
-            p("!plenum absagen morgen"),
-            Some(Command::Invalid(_))
-        ));
-        assert!(matches!(
-            p("!plenum extra 30.10."),
-            Some(Command::Invalid(_))
-        ));
+    fn date_commands_point_to_the_calendar() {
+        for body in [
+            "!plenum absagen 27.10.",
+            "!plenum extra 30.10. 19:00",
+            "!plenum verschieben 1.11. 8.11.",
+        ] {
+            match p(body) {
+                Some(Command::Invalid(why)) => assert!(why.contains("Nextcloud-Kalender"), "{why}"),
+                other => panic!("{body}: {other:?}"),
+            }
+        }
     }
 }

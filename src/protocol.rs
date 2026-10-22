@@ -5,7 +5,7 @@
 use crate::{
     config::Plenum,
     schedule::{describe_meeting, weekday_de, MeetingKey},
-    state::Top,
+    state::{Carried, Top},
 };
 use chrono::Datelike;
 
@@ -33,18 +33,60 @@ Zu jedem Punkt eine Überschrift (###) und darunter, was besprochen wurde.
 ## Beschlüsse und Aufgaben
 
 Eine Zeile, die mit „Beschluss:“ beginnt, kommt nach dem Plenum in die Beschlussliste. \
-Aufgaben als Checkliste (in Outline „[]“ am Zeilenanfang tippen): wer macht was bis wann.
+Aufgaben als Checkliste (in Outline „[]“ am Zeilenanfang tippen): wer macht was bis wann. \
+Was hier offen bleibt, steht im nächsten Protokoll wieder da.
+
+{{offene_aufgaben}}
 ";
 
-/// Fill in a template for one meeting.
-pub fn render_template(template: &str, plenum: &Plenum, key: MeetingKey) -> String {
+/// Where the open tasks of the last protocol go in a template; a template without it gets
+/// them at its end, under [`OPEN_TASKS_HEADING`].
+pub const OPEN_TASKS_PLACEHOLDER: &str = "{{offene_aufgaben}}";
+
+pub const OPEN_TASKS_HEADING: &str = "## Offene Aufgaben vom letzten Plenum";
+
+/// The open tasks as a checklist (each with the day it comes from): ticked off they are done,
+/// left open they come along to the next protocol again.
+pub fn open_tasks_block(tasks: &[Carried]) -> String {
+    if tasks.is_empty() {
+        return String::new();
+    }
+    let mut block = format!("{OPEN_TASKS_HEADING}\n\n");
+    for t in tasks {
+        let text = t.text.replace('[', "(").replace(']', ")");
+        block.push_str(&format!(
+            "- [ ] {text} (seit {})\n",
+            t.date.format("%d.%m.%Y")
+        ));
+    }
+    block
+}
+
+/// Fill in a template for one meeting, with the open tasks of the last protocol.
+pub fn render_template(
+    template: &str,
+    plenum: &Plenum,
+    key: MeetingKey,
+    tasks: &[Carried],
+) -> String {
     let date = key.0.date();
-    template
+    let tasks_block = open_tasks_block(tasks);
+    let mut text = template
         .replace("{{plenum}}", &plenum.name)
         .replace("{{wochentag}}", weekday_de(date.weekday()))
         .replace("{{datum}}", &date.format("%d.%m.%Y").to_string())
         .replace("{{iso_datum}}", &date.format("%Y-%m-%d").to_string())
-        .replace("{{uhrzeit}}", &key.0.format("%H:%M").to_string())
+        .replace("{{uhrzeit}}", &key.0.format("%H:%M").to_string());
+    if text.contains(OPEN_TASKS_PLACEHOLDER) {
+        text = text.replace(OPEN_TASKS_PLACEHOLDER, tasks_block.trim_end());
+        // an empty placeholder leaves no blank lines behind
+        while text.contains("\n\n\n") {
+            text = text.replace("\n\n\n", "\n\n");
+        }
+    } else if !tasks_block.is_empty() {
+        text = format!("{}\n\n{tasks_block}", text.trim_end());
+    }
+    text
 }
 
 /// The protocol's title: "Hausplenum 2026-11-01" (sorts and searches well).
@@ -276,10 +318,139 @@ pub fn decisions_doc_text(plenum: &Plenum) -> String {
     )
 }
 
-/// The announcement a few days before.
-pub fn announcement(plenum: &Plenum, key: MeetingKey, link: &str, tops: usize) -> String {
+pub fn rules_doc_text(plenum: &Plenum) -> String {
+    format!(
+        "Was beim {} gerade gilt: Absprachen, Pläne, Zuständigkeiten. Diese Seite pflegt ihr \
+         selbst. Wenn ein Beschluss etwas ändert, kommt es hierher; die Protokolle bleiben, \
+         wie sie waren.\n",
+        plenum.name
+    )
+}
+
+pub fn protocols_doc_text(plenum: &Plenum) -> String {
+    format!(
+        "Alle Protokolle vom {}: darunter, eins pro Termin. Neue legt der Bot hier an.\n",
+        plenum.name
+    )
+}
+
+/// What the overview links to.
+pub struct OverviewLinks<'a> {
+    pub rules: &'a str,
+    pub decisions: &'a str,
+    pub protocols: &'a str,
+    pub template: &'a str,
+    /// The calendars in Nextcloud (where the dates are kept), if known.
+    pub calendar: Option<&'a str>,
+}
+
+/// The overview page the bot keeps (it overwrites it whenever something changes): the next
+/// dates with their agendas, how to bring in a topic, open tasks, the latest decisions, links.
+pub fn overview_text(
+    plenum: &Plenum,
+    next: &[(MeetingKey, Option<String>)],
+    tasks: &[Carried],
+    decisions: &[Carried],
+    links: &OverviewLinks<'_>,
+) -> String {
+    let esc = |s: &str| s.replace('[', "\\[").replace(']', "\\]");
+    let mut t = format!(
+        "_Diese Seite schreibt der Plenum-Bot neu, sobald sich etwas ändert. Was gilt, steht \
+         in den [Regeln]({}); eigene Texte gehören dorthin._\n\n## Nächste Termine\n\n",
+        links.rules
+    );
+    if next.is_empty() {
+        t.push_str("Kein Termin geplant.\n");
+    }
+    for (key, protocol) in next {
+        match protocol {
+            Some(link) => t.push_str(&format!(
+                "* {}: [Tagesordnung und Protokoll]({link})\n",
+                describe_meeting(*key)
+            )),
+            None => t.push_str(&format!(
+                "* {} (die Tagesordnung kommt {} Tag(e) vorher)\n",
+                describe_meeting(*key),
+                plenum.prepare_days
+            )),
+        }
+    }
+    let calendar = match links.calendar {
+        Some(c) => format!("[„{}“ in Nextcloud]({c})", plenum.name),
+        None => format!("„{}“ in Nextcloud", plenum.name),
+    };
+    t.push_str(&format!(
+        "\nDie Termine stehen im Kalender {calendar}: dort eintragen, verschieben, absagen oder \
+         als Serie anlegen. Diese Seite, die Tagesordnungen und die Erinnerungen folgen ihm.\n"
+    ));
+    t.push_str(
+        "\n## Themen einbringen\n\nIm Chat `!top <Thema>` schreiben, auf eine Nachricht mit \
+         `!top` antworten, oder direkt in die Tagesordnung des nächsten Termins.\n",
+    );
+    t.push_str("\n## Offene Aufgaben\n\n");
+    if tasks.is_empty() {
+        t.push_str("Keine.\n");
+    }
+    for task in tasks {
+        t.push_str(&format!(
+            "* {} (seit dem [Plenum am {}]({}))\n",
+            esc(&task.text),
+            task.date.format("%d.%m.%Y"),
+            task.link
+        ));
+    }
+    t.push_str("\n## Letzte Beschlüsse\n\n");
+    if decisions.is_empty() {
+        t.push_str("Noch keine.\n");
+    }
+    for d in decisions.iter().rev() {
+        t.push_str(&format!(
+            "* {} ([{}]({}))\n",
+            esc(&d.text),
+            d.date.format("%d.%m.%Y"),
+            d.link
+        ));
+    }
+    t.push_str(&format!(
+        "\n## Alles zum {}\n\n* [{}]({}): was gerade gilt\n* [{}]({}): jeder Beschluss mit \
+         seinem Protokoll\n* [{}]({}): das Archiv, ein Protokoll pro Termin\n* [{}]({}): so \
+         beginnt jedes Protokoll (änderbar)\n",
+        plenum.name,
+        plenum.rules_title(),
+        links.rules,
+        plenum.decisions_title(),
+        links.decisions,
+        plenum.protocols_title(),
+        links.protocols,
+        plenum.template_title(),
+        links.template,
+    ));
+    t
+}
+
+/// Said once when a meeting that was announced leaves the calendar.
+pub fn cancellation(plenum: &Plenum, key: MeetingKey, link: &str) -> String {
+    format!(
+        "❌ **{}** am {} ist abgesagt (nicht mehr im Kalender). Das Protokoll bleibt im Wiki: {link}",
+        plenum.name,
+        describe_meeting(key)
+    )
+}
+
+/// The announcement a few days before (again after a move: `moved_from`).
+pub fn announcement(
+    plenum: &Plenum,
+    key: MeetingKey,
+    link: &str,
+    tops: usize,
+    moved_from: Option<MeetingKey>,
+) -> String {
+    let moved = moved_from
+        .map(|old| format!(" (verschoben vom {})", describe_meeting(old)))
+        .unwrap_or_default();
     let mut text = format!(
-        "📋 **{}** am {}\n\nProtokoll und Tagesordnung: {link}\n\nPunkte für die Tagesordnung: `!top <Thema>`",
+        "📋 **{}** am {}{moved}\n\nTagesordnung und Protokoll: {link}\n\nThemen dazu: `!top <Thema>`, \
+         auf eine Nachricht mit `!top` antworten, oder direkt ins Dokument schreiben.",
         plenum.name,
         describe_meeting(key)
     );
@@ -365,12 +536,14 @@ mod tests {
             name: "Hausplenum".into(),
             room: "!r:x".try_into().unwrap(),
             collection: "Hausplenum".into(),
-            recurrence: None,
+            calendar: "plenum-haus".into(),
             prepare_days: 3,
             remind_minutes: 30,
             duration_minutes: 120,
             close_after_hours: 12,
             organizers: HashSet::new(),
+            group: None,
+            access: crate::config::Access::House,
         }
     }
 
@@ -388,10 +561,11 @@ mod tests {
 
     #[test]
     fn the_template_is_filled_in() {
-        let text = render_template(DEFAULT_TEMPLATE, &plenum(), key());
+        let text = render_template(DEFAULT_TEMPLATE, &plenum(), key(), &[]);
         assert!(text.starts_with("**Hausplenum** am Sonntag, 01.11.2026 um 19:00 Uhr"));
         assert!(text.contains(TOP_MARKER));
         assert!(!text.contains("{{"));
+        assert!(!text.contains(OPEN_TASKS_HEADING));
         assert_eq!(title(&plenum(), key()), "Hausplenum 2026-11-01");
         // The template's own hints are no decision and no task.
         assert_eq!(extract(&text), Outcome::default());
@@ -540,5 +714,77 @@ Beschlussfähig waren wir.
             PdfNote::Fine,
         );
         assert!(none.contains("Keine Beschlüsse"));
+    }
+
+    fn carried(text: &str) -> Carried {
+        Carried {
+            text: text.into(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap(),
+            link: "https://wiki.test/doc/old".into(),
+        }
+    }
+
+    #[test]
+    fn open_tasks_come_along_as_a_checklist_and_are_read_back() {
+        let tasks = [carried("Anna: Spülmaschine [reparieren]")];
+        let text = render_template(DEFAULT_TEMPLATE, &plenum(), key(), &tasks);
+        assert!(text.contains(OPEN_TASKS_HEADING));
+        assert!(text.contains("- [ ] Anna: Spülmaschine (reparieren) (seit 18.10.2026)"));
+        assert!(!text.contains("{{"));
+        // left open: a task again at the end of this meeting
+        assert_eq!(
+            extract(&text).tasks,
+            vec!["Anna: Spülmaschine (reparieren) (seit 18.10.2026)".to_owned()]
+        );
+        // ticked off: done
+        let done = text.replace("- [ ] Anna", "- [x] Anna");
+        assert!(extract(&done).tasks.is_empty());
+        // a template of its own without the placeholder: at the end
+        let own = render_template(
+            "**{{plenum}}**\n\n## Tagesordnung\n",
+            &plenum(),
+            key(),
+            &tasks,
+        );
+        assert!(own.trim_end().ends_with("(seit 18.10.2026)"));
+        assert_eq!(
+            render_template("x {{offene_aufgaben}}", &plenum(), key(), &[]).trim(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn the_overview_lists_dates_tasks_decisions_and_links() {
+        let next = [
+            (key(), Some("https://wiki.test/doc/p".to_owned())),
+            ("2026-11-15 19:00".parse().unwrap(), None),
+        ];
+        let links = OverviewLinks {
+            rules: "https://wiki.test/doc/rules",
+            decisions: "https://wiki.test/doc/dec",
+            protocols: "https://wiki.test/doc/protocols",
+            template: "https://wiki.test/doc/tpl",
+            calendar: Some("https://cloud.test/apps/calendar"),
+        };
+        let t = overview_text(
+            &plenum(),
+            &next,
+            &[carried("Ben: Putzplan")],
+            &[carried("Beschluss [eins]")],
+            &links,
+        );
+        assert!(t.contains("[Tagesordnung und Protokoll](https://wiki.test/doc/p)"));
+        assert!(t.contains("15.11.2026") && t.contains("3 Tag(e) vorher"));
+        assert!(
+            t.contains("[„Hausplenum“ in Nextcloud](https://cloud.test/apps/calendar)"),
+            "{t}"
+        );
+        assert!(t.contains(
+            "* Ben: Putzplan (seit dem [Plenum am 18.10.2026](https://wiki.test/doc/old))"
+        ));
+        assert!(t.contains("Beschluss \\[eins\\]"));
+        assert!(t.contains("[Regeln Hausplenum](https://wiki.test/doc/rules)"));
+        // the overview's own lines are no task and no decision
+        assert_eq!(extract(&t), Outcome::default());
     }
 }

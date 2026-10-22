@@ -4,24 +4,27 @@
 //! ID before it is sent: a restart in the middle repeats nothing that already happened
 //! (the homeserver drops a resend with the same transaction ID) and skips nothing.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::{collections::BTreeMap, path::Path};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::schedule::MeetingKey;
+use crate::{calendar::Occurrence, members::RoomMembers, schedule::MeetingKey};
 
 /// Meetings kept per plenum; older ones are dropped (their protocols stay in Outline).
 const KEEP_MEETINGS: usize = 60;
+
+/// Decisions the overview shows (the full list is the decision document).
+pub const KEEP_DECISIONS: usize = 10;
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct State {
     #[serde(default)]
     pub plenums: BTreeMap<String, PlenumState>,
+    /// Per room ID: whom the bot invited there (rooms of plenums with a group).
+    #[serde(default)]
+    pub rooms: BTreeMap<String, RoomMembers>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
@@ -32,17 +35,52 @@ pub struct PlenumState {
     pub template_doc_id: Option<String>,
     #[serde(default)]
     pub decisions_doc_id: Option<String>,
-    /// Dates added with `!plenum extra`.
+    /// The overview the bot keeps up to date, the rules people keep, and the document the
+    /// protocols are filed under.
     #[serde(default)]
-    pub extra: BTreeSet<MeetingKey>,
-    /// Dates cancelled with `!plenum absagen`.
+    pub overview_doc_id: Option<String>,
     #[serde(default)]
-    pub cancelled: BTreeSet<MeetingKey>,
+    pub rules_doc_id: Option<String>,
+    #[serde(default)]
+    pub protocols_doc_id: Option<String>,
+    /// The documents' paths in the wiki (`/doc/…`), by role: overview, rules, protocols,
+    /// decisions, template.
+    #[serde(default)]
+    pub urls: BTreeMap<String, String>,
+    /// The overview's text as last written (it is only written when it changes).
+    #[serde(default)]
+    pub overview_text: Option<String>,
+    /// When the collection, its access and its documents were last checked.
+    #[serde(default)]
+    pub area_checked: Option<DateTime<Utc>>,
+    /// The open tasks of the last closed protocol: they go into the next one.
+    #[serde(default)]
+    pub open_tasks: Vec<Carried>,
+    /// The latest decisions (newest last), for the overview.
+    #[serde(default)]
+    pub decisions: Vec<Carried>,
+    /// The calendar's occurrences as last read (kept while the calendar cannot be read).
+    #[serde(default)]
+    pub occurrences: Vec<Occurrence>,
+    /// When the calendar was last read; None: never (nothing is known about the dates yet).
+    #[serde(default)]
+    pub calendar_read: Option<DateTime<Utc>>,
     /// Agenda items sent before the next protocol existed; they go into it.
     #[serde(default)]
     pub pending_tops: Vec<Top>,
+    /// By the calendar occurrence's ID (before 2026-10-22: by the start, "2026-11-01 19:00";
+    /// such a one is taken over by the occurrence with that start).
     #[serde(default)]
-    pub meetings: BTreeMap<MeetingKey, Meeting>,
+    pub meetings: BTreeMap<String, Meeting>,
+}
+
+/// A task or a decision from a closed protocol: its text, the meeting's day and protocol.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Carried {
+    pub text: String,
+    pub date: chrono::NaiveDate,
+    #[serde(default)]
+    pub link: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -72,6 +110,34 @@ pub struct Meeting {
     /// The meeting ended before the bot got to prepare it (it was down): nothing happens.
     #[serde(default)]
     pub skipped: bool,
+    /// The protocol is filed under the plenum's protocols document (older ones were made
+    /// at the top of the collection and are moved there once).
+    #[serde(default)]
+    pub filed: bool,
+    /// When it starts and ends (local), as the calendar says now.
+    #[serde(default)]
+    pub start: Option<MeetingKey>,
+    #[serde(default)]
+    pub end: Option<chrono::NaiveDateTime>,
+    /// The protocol's title as made (it follows a move).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Gone from the calendar before it began: no protocol steps any more (it comes back if
+    /// the occurrence does).
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub cancel_notice: Step,
+    /// Moved in the calendar after it was announced: the new announcement says from when.
+    #[serde(default)]
+    pub moved_from: Option<MeetingKey>,
+}
+
+impl Meeting {
+    /// Its start: as the calendar said, or for a meeting from before the calendar its key.
+    pub fn start_of(&self, id: &str) -> Option<MeetingKey> {
+        self.start.or_else(|| id.parse().ok())
+    }
 }
 
 /// A message that is sent once: its transaction ID, then whether it went out.
@@ -125,22 +191,24 @@ pub struct Close {
 }
 
 impl PlenumState {
-    /// Forget the oldest finished meetings beyond [`KEEP_MEETINGS`], and dates that passed.
-    pub fn prune(&mut self, today: chrono::NaiveDate) {
+    /// Forget the oldest finished meetings beyond [`KEEP_MEETINGS`].
+    pub fn prune(&mut self) {
         while self.meetings.len() > KEEP_MEETINGS {
             let Some(oldest) = self
                 .meetings
                 .iter()
-                .find(|(_, m)| m.close.done || m.skipped)
-                .map(|(k, _)| *k)
+                .filter(|(_, m)| m.close.done || m.skipped || m.cancelled)
+                .min_by_key(|(id, m)| m.start_of(id))
+                .map(|(id, _)| id.clone())
             else {
                 break;
             };
             self.meetings.remove(&oldest);
         }
-        let old = today - chrono::Duration::days(400);
-        self.extra.retain(|k| k.date() >= old);
-        self.cancelled.retain(|k| k.date() >= old);
+        if self.decisions.len() > KEEP_DECISIONS {
+            self.decisions
+                .drain(..self.decisions.len() - KEEP_DECISIONS);
+        }
     }
 }
 
@@ -164,22 +232,38 @@ mod tests {
         let path = dir.path().join("state.json");
         let mut st = State::default();
         let p = st.plenums.entry("haus".into()).or_default();
-        let key: MeetingKey = "2026-11-01 19:00".parse().unwrap();
+        let key = "plenum-1#2026-11-01".to_owned();
         let mut m = Meeting {
             doc_id: "d1".into(),
             created: true,
+            start: Some("2026-11-01 19:00".parse().unwrap()),
             ..Default::default()
         };
         let txn = m.announce.txn();
-        p.meetings.insert(key, m);
-        p.cancelled.insert("2026-12-06 19:00".parse().unwrap());
+        p.meetings.insert(key.clone(), m);
         st.save(&path).await.unwrap();
 
         let back = State::load(&path).await.unwrap();
         let p = &back.plenums["haus"];
         assert_eq!(p.meetings[&key].announce.txn.as_deref(), Some(txn.as_str()));
         assert!(p.meetings[&key].created);
-        assert_eq!(p.cancelled.len(), 1);
+        assert_eq!(
+            p.meetings[&key].start_of(&key).unwrap().to_string(),
+            "2026-11-01 19:00"
+        );
+    }
+
+    #[test]
+    fn a_state_from_before_the_calendar_still_loads() {
+        let old = r#"{"plenums": {"haus": {"extra": ["2026-11-08 19:00"], "cancelled": [],
+            "meetings": {"2026-11-01 19:00": {"doc_id": "d1", "created": true}}}}}"#;
+        let st: State = serde_json::from_str(old).unwrap();
+        let m = &st.plenums["haus"].meetings["2026-11-01 19:00"];
+        assert_eq!(
+            m.start_of("2026-11-01 19:00").unwrap().to_string(),
+            "2026-11-01 19:00"
+        );
+        assert!(m.start.is_none() && st.plenums["haus"].calendar_read.is_none());
     }
 
     #[test]
@@ -196,10 +280,12 @@ mod tests {
             let day = start + chrono::Duration::days(i as i64);
             let mut m = Meeting::default();
             m.close.done = i != 0; // the oldest is still open
-            p.meetings
-                .insert(MeetingKey(day.and_hms_opt(19, 0, 0).unwrap()), m);
+            p.meetings.insert(
+                MeetingKey(day.and_hms_opt(19, 0, 0).unwrap()).to_string(),
+                m,
+            );
         }
-        p.prune(start);
+        p.prune();
         assert_eq!(p.meetings.len(), KEEP_MEETINGS);
         assert!(
             !p.meetings.values().next().unwrap().close.done,
