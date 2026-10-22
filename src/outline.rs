@@ -486,6 +486,7 @@ mod against_outline {
             close_after_hours: 12,
             organizers: HashSet::new(),
             group: None,
+            require_group: None,
             access: crate::config::Access::House,
         };
         let fonts = ["/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/TTF"]
@@ -665,6 +666,7 @@ mod against_outline {
             close_after_hours: 12,
             organizers: HashSet::new(),
             group: None,
+            require_group: None,
             access: crate::config::Access::House,
         };
         let kitchen = Plenum {

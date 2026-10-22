@@ -64,5 +64,7 @@ room = "!kitchen:example.org"
 collection = "Kitchen ground floor"
 group = "kitchen-floor-0"   # its room and its editors follow this directory group
 access = "members"                # everyone reads, the group writes (house | members | private)
+# require_group = "residents"     # only who is in this group too counts; default for members
+#                                 # and private: the house plenum's group; "" for none
 prepare_days = 1
 organizers = ["@anna:example.org"]

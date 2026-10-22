@@ -21,7 +21,7 @@ mod protocol;
 mod schedule;
 mod state;
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use mxbot_common::directory::{self, Directory};
 
@@ -338,21 +338,19 @@ async fn keep_calendar(
 }
 
 /// The groups from the directory now and every `refresh_minutes`, the rooms after them.
-/// While the directory cannot be read, the rooms stay as they are.
+/// While the directory cannot be read (its people or which groups exist), the rooms stay as
+/// they are; a group that exists with nobody in it empties its room.
 async fn members_loop(engine: Arc<PlenumEngine>, directory: Directory) {
-    let wanted: BTreeSet<String> = engine
-        .plenums
-        .iter()
-        .filter_map(|p| p.group.clone())
-        .collect();
+    let wanted = config::directory_groups(&engine.plenums);
     loop {
-        match directory.people().await {
-            Ok(people) => {
-                let groups = directory::groups(&people, &wanted);
-                engine.sync_members(&groups, chrono::Utc::now()).await
-            }
-            Err(e) => warn!("Rooms: the directory could not be read ({e:#}); nothing changed"),
-        }
+        let read = async {
+            let people = directory.people().await?;
+            let existing = directory.existing_groups(&wanted).await?;
+            anyhow::Ok(directory::groups_with_empty(&people, &wanted, &existing))
+        };
+        engine
+            .sync_members_after(read.await, chrono::Utc::now())
+            .await;
         tokio::time::sleep(directory.config().refresh()).await;
     }
 }

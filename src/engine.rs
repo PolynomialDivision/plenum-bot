@@ -1406,10 +1406,22 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
 }
 
 impl<W: Wiki, C: Chat> Engine<W, C> {
+    /// [`Self::sync_members`] after a read of the directory: when it failed (its people or
+    /// which groups exist), every room stays as it is.
+    pub async fn sync_members_after(&self, read: Result<Groups>, now: DateTime<Utc>) {
+        match read {
+            Ok(groups) => self.sync_members(&groups, now).await,
+            Err(e) => warn!("Members: the directory could not be read ({e:#}); nothing changed"),
+        }
+    }
+
     /// The rooms of plenums with a group follow it (see [`members`]). A room shared by
     /// plenums follows all their groups; a room with a plenum without a group (the house
-    /// chat) is left alone, and so is one whose group the directory does not know or has
-    /// nobody in.
+    /// chat) is left alone, and so is one whose group (or required group) the directory
+    /// does not know: `groups` has an entry for every group that exists, empty when nobody
+    /// is in it ([`mxbot_common::directory::groups_with_empty`]). A group that exists with
+    /// nobody in it empties its room, but for the kept accounts and the room's admins. Only
+    /// who is in a plenum's `require_group` too counts as its group's member.
     pub async fn sync_members(&self, groups: &Groups, now: DateTime<Utc>) {
         let Some(me) = self.me.clone() else {
             return;
@@ -1423,15 +1435,32 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 continue;
             }
             let names: BTreeSet<&str> = here.iter().filter_map(|p| p.group.as_deref()).collect();
-            if let Some(missing) = names.iter().find(|g| !groups.contains_key(**g)) {
-                warn!(%room, group = %missing, "Members: the directory has nobody in the group; the room is left as it is");
+            let required: BTreeSet<&str> = here
+                .iter()
+                .filter_map(|p| p.require_group.as_deref())
+                .collect();
+            if let Some(missing) = names
+                .iter()
+                .chain(&required)
+                .find(|g| !groups.contains_key(**g))
+            {
+                warn!(%room, group = %missing, "Members: the directory does not know the group; the room is left as it is");
                 continue;
             }
-            let wanted: BTreeSet<OwnedUserId> = names
+            let wanted: BTreeSet<OwnedUserId> = here
                 .iter()
-                .flat_map(|g| groups[*g].iter().cloned())
+                .filter_map(|p| p.group.as_deref().map(|g| (g, p.require_group.as_deref())))
+                .flat_map(|(g, require)| {
+                    groups[g]
+                        .iter()
+                        .filter(move |id| require.is_none_or(|r| groups[r].contains(*id)))
+                        .cloned()
+                })
                 .collect();
-            if let Err(e) = self.sync_room(&room, &wanted, &names, &me, now).await {
+            if let Err(e) = self
+                .sync_room(&room, &wanted, &names, &required, &me, now)
+                .await
+            {
                 warn!(%room, "Members: {e:#}");
             }
         }
@@ -1442,6 +1471,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         room: &RoomId,
         wanted: &BTreeSet<OwnedUserId>,
         groups: &BTreeSet<&str>,
+        required: &BTreeSet<&str>,
         me: &UserId,
         now: DateTime<Utc>,
     ) -> Result<()> {
@@ -1451,7 +1481,16 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         members::forget_others(remembered, wanted);
         let plan = members::plan(wanted, &current, &self.keep, me, remembered, now);
         let groups: Vec<&str> = groups.iter().copied().collect();
-        let reason = format!("not in the group {} (house account)", groups.join(", "));
+        let required: Vec<&str> = required.iter().copied().collect();
+        let reason = if required.is_empty() {
+            format!("not in the group {} (house account)", groups.join(", "))
+        } else {
+            format!(
+                "not in the group {} or not in {} (house account)",
+                groups.join(", "),
+                required.join(", ")
+            )
+        };
         for user in &plan.remove {
             match self.chat.remove(room, user, &reason).await {
                 Ok(()) => info!(%room, %user, "Members: removed (not in the group)"),
@@ -1832,6 +1871,7 @@ mod tests {
             close_after_hours: 12,
             organizers: HashSet::new(),
             group: None,
+            require_group: None,
             access: Access::House,
         }
     }
@@ -3099,11 +3139,175 @@ mod tests {
             .unwrap()
             .iter()
             .any(|(_, m)| m.id == "@ghost:x"));
-        // a group the directory has nobody in: the room is left alone
+        // a group the directory does not know: the room is left alone
         let before = e.chat.members.lock().unwrap().len();
         e.sync_members(&Groups::new(), at(2026, 10, 23, 12, 0))
             .await;
         assert_eq!(e.chat.members.lock().unwrap().len(), before);
+    }
+
+    fn in_room(room: &str, id: &str, admin: bool) -> (String, Member) {
+        (
+            room.to_owned(),
+            Member {
+                id: id.try_into().unwrap(),
+                admin,
+            },
+        )
+    }
+
+    fn group(name: &str, ids: &[&str]) -> (String, BTreeSet<OwnedUserId>) {
+        (
+            name.to_owned(),
+            ids.iter().map(|s| (*s).try_into().unwrap()).collect(),
+        )
+    }
+
+    fn members_of(e: &Engine<FakeWiki, FakeChat>, room: &str) -> BTreeSet<String> {
+        e.chat
+            .members
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(r, _)| r == room)
+            .map(|(_, m)| m.id.to_string())
+            .collect()
+    }
+
+    fn set_of(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn an_emptied_group_empties_its_room_but_for_the_admins_and_the_bots() {
+        let t = setup(vec![kitchen(), finance()]);
+        let mut e = t.engine;
+        e.me = Some("@plenum-bot:x".try_into().unwrap());
+        e.keep = HashSet::from([
+            "@calendar-bot:x".try_into().unwrap(),
+            "@schnick:matrix.org".try_into().unwrap(),
+        ]);
+        e.chat.members.lock().unwrap().extend([
+            in_room("!k1:x", "@plenum-bot:x", true),
+            in_room("!k1:x", "@calendar-bot:x", false),
+            in_room("!k1:x", "@nick:x", true),
+            in_room("!k1:x", "@schnick:matrix.org", false),
+            in_room("!k1:x", "@anna:x", false),
+            in_room("!k1:x", "@eve:x", false),
+            in_room("!fin:x", "@plenum-bot:x", true),
+            in_room("!fin:x", "@ben:x", false),
+        ]);
+        // the last members left the kitchen's group: it exists, with nobody in it
+        let groups: Groups = [group("kitchen-floor-1", &[]), group("finance", &["@ben:x"])].into();
+        e.sync_members(&groups, at(2026, 10, 22, 10, 0)).await;
+        assert_eq!(
+            members_of(&e, "!k1:x"),
+            set_of(&[
+                "@plenum-bot:x",
+                "@calendar-bot:x",
+                "@nick:x",
+                "@schnick:matrix.org"
+            ])
+        );
+        // only that room's members: the finance room is as it was
+        assert_eq!(
+            members_of(&e, "!fin:x"),
+            set_of(&["@plenum-bot:x", "@ben:x"])
+        );
+        let removed = e.chat.removed.lock().unwrap().clone();
+        assert_eq!(removed.len(), 2, "{removed:?}");
+        assert!(removed.iter().all(|(r, _, _)| r == "!k1:x"));
+        assert!(e.state.lock().await.rooms["!k1:x"].invited.is_empty());
+        // someone joins the group again: invited again
+        let groups: Groups = [
+            group("kitchen-floor-1", &["@anna:x"]),
+            group("finance", &["@ben:x"]),
+        ]
+        .into();
+        e.sync_members(&groups, at(2026, 10, 22, 10, 15)).await;
+        assert!(members_of(&e, "!k1:x").contains("@anna:x"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_directory_read_changes_nothing() {
+        let t = setup(vec![kitchen(), plenum("house", "House plenum", "!house:x")]);
+        let mut e = t.engine;
+        e.me = Some("@plenum-bot:x".try_into().unwrap());
+        e.chat.members.lock().unwrap().extend([
+            in_room("!k1:x", "@plenum-bot:x", true),
+            in_room("!k1:x", "@anna:x", false),
+            in_room("!k1:x", "@eve:x", false),
+        ]);
+        let before = e.chat.members.lock().unwrap().clone();
+        e.sync_members_after(
+            Err(anyhow::anyhow!("reading the directory: 403")),
+            at(2026, 10, 22, 10, 0),
+        )
+        .await;
+        assert_eq!(*e.chat.members.lock().unwrap(), before);
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+        assert!(e.state.lock().await.rooms.is_empty());
+        // a read that worked: the same path changes the room
+        e.sync_members_after(
+            Ok([group("kitchen-floor-1", &["@anna:x"])].into()),
+            at(2026, 10, 22, 10, 15),
+        )
+        .await;
+        assert_eq!(
+            members_of(&e, "!k1:x"),
+            set_of(&["@plenum-bot:x", "@anna:x"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_teams_group_counts_only_for_residents() {
+        let mut house = plenum("house", "House plenum", "!house:x");
+        house.group = Some("residents".into());
+        let mut k = kitchen();
+        k.require_group = Some("residents".into());
+        let t = setup(vec![house, k]);
+        let mut e = t.engine;
+        e.me = Some("@plenum-bot:x".try_into().unwrap());
+        e.chat.members.lock().unwrap().extend([
+            in_room("!k1:x", "@plenum-bot:x", true),
+            in_room("!k1:x", "@nick:x", true),
+            in_room("!k1:x", "@anna:x", false),
+            in_room("!k1:x", "@olaf:x", false), // moved out, still in the kitchen's group
+            in_room("!house:x", "@plenum-bot:x", true),
+            in_room("!house:x", "@anna:x", false),
+            in_room("!house:x", "@olaf:x", false),
+        ]);
+        let groups: Groups = [
+            group("residents", &["@anna:x", "@cara:x"]),
+            group(
+                "kitchen-floor-1",
+                &["@anna:x", "@olaf:x", "@ben:x", "@cara:x"],
+            ),
+        ]
+        .into();
+        // without the house group in the answer, the kitchen is left alone
+        let partial: Groups = [group("kitchen-floor-1", &["@anna:x"])].into();
+        e.sync_members(&partial, at(2026, 10, 22, 9, 0)).await;
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+        e.sync_members(&groups, at(2026, 10, 22, 10, 0)).await;
+        // olaf is removed, ben (not living here) is not invited, cara (lives here) is
+        assert_eq!(
+            members_of(&e, "!k1:x"),
+            set_of(&["@plenum-bot:x", "@nick:x", "@anna:x", "@cara:x"])
+        );
+        assert_eq!(
+            members_of(&e, "!house:x"),
+            set_of(&["@plenum-bot:x", "@anna:x", "@cara:x"])
+        );
+        let removed = e.chat.removed.lock().unwrap().clone();
+        let kitchen_removal = removed.iter().find(|(r, _, _)| r == "!k1:x").unwrap();
+        assert_eq!(kitchen_removal.1, "@olaf:x");
+        assert!(
+            kitchen_removal.2.contains("kitchen-floor-1")
+                && kitchen_removal.2.contains("residents"),
+            "{}",
+            kitchen_removal.2
+        );
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 //! `[directory]` (who is in which group), `[members]` (the rooms' members follow the groups)
 //! and one `[[plenum]]` table per plenum.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use anyhow::{bail, Context, Result};
 use chrono_tz::Tz;
@@ -212,6 +212,12 @@ pub struct PlenumConfig {
     /// follow it. None: a room nobody manages.
     #[serde(default)]
     pub group: Option<String>,
+    /// Only who is also in this directory group counts as a member of `group` (a former
+    /// resident still in a kitchen's group is neither kept nor invited). Default for a plenum
+    /// with access `members` or `private`: the group of the house plenum (access `house`), if
+    /// it has one; `""`: no such rule.
+    #[serde(default)]
+    pub require_group: Option<String>,
     #[serde(default)]
     pub access: Access,
 }
@@ -231,6 +237,8 @@ pub struct Plenum {
     pub close_after_hours: u32,
     pub organizers: HashSet<OwnedUserId>,
     pub group: Option<String>,
+    /// Only the members of `group` who are in this group too count (None: all of them).
+    pub require_group: Option<String>,
     pub access: Access,
 }
 
@@ -293,6 +301,13 @@ impl Config {
         let mut titles = HashSet::new();
         let mut calendars = HashSet::new();
         let mut out = Vec::new();
+        // The house plenum's group (who lives here): what the other plenums' groups require.
+        let house_groups: BTreeSet<&str> = self
+            .plenums
+            .iter()
+            .filter(|p| p.access == Access::House)
+            .filter_map(|p| trimmed(&p.group))
+            .collect();
         for p in &self.plenums {
             let at = format!("[[plenum]] {:?}", p.key);
             if p.key.is_empty()
@@ -339,15 +354,28 @@ impl Config {
             if duration == 0 {
                 bail!("{at}: duration_minutes must be more than 0");
             }
-            let group = p
-                .group
-                .as_deref()
-                .map(str::trim)
-                .filter(|g| !g.is_empty())
-                .map(str::to_owned);
+            let group = trimmed(&p.group).map(str::to_owned);
             if p.access != Access::House && group.is_none() {
                 bail!("{at}: access members or private needs a group (who writes in it)");
             }
+            let require_group = match (&p.require_group, &group) {
+                (Some(r), None) if !r.trim().is_empty() => {
+                    bail!("{at}: require_group needs a group")
+                }
+                (_, None) => None,
+                (Some(r), Some(_)) => Some(r.trim()).filter(|r| !r.is_empty()),
+                (None, Some(_)) if p.access == Access::House => None,
+                (None, Some(_)) => match house_groups.len() {
+                    0 => None,
+                    1 => house_groups.first().copied(),
+                    _ => bail!(
+                        "{at}: the house plenums have several groups ({}): set require_group",
+                        house_groups.iter().copied().collect::<Vec<_>>().join(", ")
+                    ),
+                },
+            }
+            .filter(|r| group.as_deref() != Some(*r))
+            .map(str::to_owned);
             let organizers = p
                 .organizers
                 .iter()
@@ -370,6 +398,7 @@ impl Config {
                     .unwrap_or(self.defaults.close_after_hours),
                 organizers,
                 group,
+                require_group,
                 access: p.access,
             });
         }
@@ -384,6 +413,19 @@ impl Config {
             .trim_end_matches('/')
             .to_owned()
     }
+}
+
+/// Every directory group the plenums read: their own and the ones these require.
+pub fn directory_groups(plenums: &[Plenum]) -> BTreeSet<String> {
+    plenums
+        .iter()
+        .flat_map(|p| p.group.iter().chain(p.require_group.iter()))
+        .cloned()
+        .collect()
+}
+
+fn trimmed(group: &Option<String>) -> Option<&str> {
+    group.as_deref().map(str::trim).filter(|g| !g.is_empty())
 }
 
 #[cfg(test)]
@@ -501,6 +543,96 @@ access = "members"
         assert_eq!(c.members.keep.len(), 1);
     }
 
+    const DIRECTORY: &str =
+        "[directory]\nprovider = 'authentik'\napi_url = 'https://login.example.org/api/v3'\n";
+
+    fn grouped(key: &str, extra: &str) -> String {
+        format!(
+            "[[plenum]]\nkey = '{key}'\nname = '{key}'\nroom = '!{key}:x'\ncollection = '{key}'\n{extra}\n"
+        )
+    }
+
+    #[test]
+    fn the_team_groups_require_the_house_plenums_group() {
+        // as house-infra renders it: the house (access house, residents), kitchens, finance
+        let c = parse(&format!(
+            "{DIRECTORY}{}{}{}{}",
+            grouped("house", "group = 'residents'\naccess = 'house'"),
+            grouped(
+                "kitchen-floor-1",
+                "group = 'kitchen-floor-1'\naccess = 'members'"
+            ),
+            grouped("finance", "group = 'finance'\naccess = 'private'"),
+            grouped("open", ""),
+        ));
+        let ps = c.plenums().unwrap();
+        let req: Vec<Option<&str>> = ps.iter().map(|p| p.require_group.as_deref()).collect();
+        assert_eq!(req, [None, Some("residents"), Some("residents"), None]);
+        assert_eq!(
+            directory_groups(&ps),
+            ["residents", "kitchen-floor-1", "finance"]
+                .map(String::from)
+                .into()
+        );
+
+        // explicit: another group, or "" for no such rule
+        let c = parse(&format!(
+            "{DIRECTORY}{}{}{}",
+            grouped("house", "group = 'residents'"),
+            grouped(
+                "a",
+                "group = 'a'\naccess = 'members'\nrequire_group = 'guests'"
+            ),
+            grouped("b", "group = 'b'\naccess = 'members'\nrequire_group = ''"),
+        ));
+        let req: Vec<Option<String>> = c
+            .plenums()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.require_group)
+            .collect();
+        assert_eq!(req, [None, Some("guests".into()), None]);
+
+        // no house plenum with a group: no rule
+        let c = parse(&format!(
+            "{DIRECTORY}{}",
+            grouped("a", "group = 'a'\naccess = 'members'")
+        ));
+        assert!(c.plenums().unwrap()[0].require_group.is_none());
+        // its own group is no rule either
+        let c = parse(&format!(
+            "{DIRECTORY}{}{}",
+            grouped("house", "group = 'residents'"),
+            grouped("all", "group = 'residents'\naccess = 'members'"),
+        ));
+        assert!(c.plenums().unwrap()[1].require_group.is_none());
+
+        // two house plenums with different groups: which one is meant must be said
+        let two = |extra: &str| {
+            parse(&format!(
+                "{DIRECTORY}{}{}{}",
+                grouped("house", "group = 'residents'"),
+                grouped("work", "group = 'workers'"),
+                grouped("a", &format!("group = 'a'\naccess = 'members'{extra}")),
+            ))
+            .plenums()
+        };
+        assert!(two("").is_err());
+        assert_eq!(
+            two("\nrequire_group = 'residents'").unwrap()[2]
+                .require_group
+                .as_deref(),
+            Some("residents")
+        );
+        // a rule without a group of its own
+        assert!(parse(&format!(
+            "{DIRECTORY}{}",
+            grouped("a", "require_group = 'residents'")
+        ))
+        .plenums()
+        .is_err());
+    }
+
     #[test]
     fn a_closed_collection_needs_a_group_and_a_group_the_directory() {
         let one = |body: &str| {
@@ -567,7 +699,10 @@ mod rendered {
         let ps = c.plenums().unwrap();
         c.timezone().unwrap();
         for p in &ps {
-            println!("{} {} {:?}", p.key, p.calendar, p.prepare_days);
+            println!(
+                "{} {} {:?} {:?} {:?}",
+                p.key, p.calendar, p.prepare_days, p.group, p.require_group
+            );
         }
     }
 }

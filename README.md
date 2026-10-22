@@ -11,6 +11,12 @@ A plenum may belong to a directory group (`group`): its room's members follow th
 (`[directory]`, `[members]`: who is in it is invited once, who is not is removed; the house's
 bots and the room's admins never), and the group writes in its collection (`access`: `house`
 everyone writes, `members` everyone reads and the group writes, `private` only the group).
+A group that exists with nobody in it empties its room (but for those never removed); a group
+the directory does not know, or a directory that cannot be read, leaves the room as it is.
+Only who lives here counts in a team's group: a plenum with access `members` or `private`
+requires the house plenum's group (access `house`, e.g. `residents`) by default
+(`require_group`, `""` for none), so a former resident still in a kitchen's group is neither
+kept nor invited. The directory token needs to view users and groups.
 
 The dates are the plenum's Nextcloud calendar (`[calendar]`; one per plenum, `plenum-<key>`,
 owned by the bot's own Nextcloud account, which makes it and shares it by `access`: the house

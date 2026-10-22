@@ -574,6 +574,7 @@ mod tests {
             close_after_hours: 12,
             organizers: HashSet::new(),
             group: None,
+            require_group: None,
             access: crate::config::Access::House,
         }
     }

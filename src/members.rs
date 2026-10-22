@@ -1,6 +1,7 @@
 //! The members of a plenum's room follow its directory group: who is in the group is invited
-//! once, who is in the room without being in it is removed. Pure planning here; the engine
-//! reads the room and the directory and carries the plan out.
+//! once, who is in the room without being in it is removed (all of them when the group is
+//! empty). Pure planning here; the engine reads the room and the directory (who is in the
+//! group and in its `require_group`) and carries the plan out.
 //!
 //! Never removed: the bot itself, the accounts in `[members] keep` (the house's bots, the
 //! provisioner's room admins) and anyone with power level 100 in the room (its admins). Who
