@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("[members] keep: {u:?} is no Matrix ID"))
         })
         .collect::<Result<_>>()?;
-    let nextcloud = calendar::Nextcloud::new(
+    let nextcloud = calendar::connect(
         &config.calendar.url,
         &config.calendar.username,
         &config.caldav_password()?,

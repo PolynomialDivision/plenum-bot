@@ -9,15 +9,15 @@
 //! edited by the house group; a kitchen's by its group and read by the house; a private one
 //! (the Finanz-AG) only by its group. The readers of `[calendar] readers` (calendar-bot) read
 //! every calendar that is not private. Nothing else is shared: a share made by hand goes.
+//!
+//! The Nextcloud side (making, sharing and reading a calendar) is mxbot-common's
+//! `calendar::nextcloud` since 2026-10-22; this module keeps what is the plenums' own.
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Context, Result};
 use chrono::{NaiveDate, NaiveDateTime};
-use mxbot_common::calendar::{
-    caldav,
-    ics::{self, EntryTime, IcsEvent},
-};
+use mxbot_common::calendar::ics::{self, EntryTime, IcsEvent};
+pub use mxbot_common::calendar::nextcloud::{group, plan_shares, user, Nextcloud, Share};
 use serde::{Deserialize, Serialize};
 
 use crate::{config::Access, schedule::MeetingKey};
@@ -56,20 +56,13 @@ pub fn occurrences(events: &[IcsEvent], from: NaiveDate, to: NaiveDate) -> Vec<O
     list
 }
 
-/// Someone a calendar is shared with: `principal:principals/groups/<gid>` or
-/// `principal:principals/users/<uid>`, and whether they may edit it.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Share {
-    pub principal: String,
-    pub write: bool,
-}
-
-pub fn group(gid: &str) -> String {
-    format!("principal:principals/groups/{gid}")
-}
-
-pub fn user(uid: &str) -> String {
-    format!("principal:principals/users/{uid}")
+/// The bot's Nextcloud account (`account`: its calendar home), with the bot's user agent.
+pub fn connect(account: &str, username: &str, password: &str) -> anyhow::Result<Nextcloud> {
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("plenum-bot/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    Ok(Nextcloud::with_client(http, account, username, password))
 }
 
 /// Who a plenum's calendar is shared with.
@@ -104,228 +97,10 @@ pub fn wanted_shares(
     out
 }
 
-/// `(set, remove)`: shares to make or change, principals to take away.
-pub fn plan_shares(current: &[Share], wanted: &[Share]) -> (Vec<Share>, Vec<String>) {
-    let set = wanted
-        .iter()
-        .filter(|w| !current.contains(w))
-        .cloned()
-        .collect();
-    let remove = current
-        .iter()
-        .filter(|c| !wanted.iter().any(|w| w.principal == c.principal))
-        .map(|c| c.principal.clone())
-        .collect();
-    (set, remove)
-}
-
-/// The shares in a PROPFIND answer with `oc:invite` (Nextcloud: one `user` element per
-/// sharee, `read-write` among its access when it may edit).
-pub fn parse_shares(xml: &str) -> Vec<Share> {
-    let mut out: Vec<Share> = caldav::xml_elements(xml, "invite")
-        .into_iter()
-        .flat_map(|invite| caldav::xml_elements(invite, "user"))
-        .filter_map(|u| {
-            let href = caldav::xml_elements(u, "href").first()?.trim().to_owned();
-            let write = !caldav::xml_elements(u, "read-write").is_empty();
-            Some(Share {
-                principal: href,
-                write,
-            })
-        })
-        .collect();
-    out.sort();
-    out
-}
-
-/// The bot's Nextcloud account over CalDAV: `account` is its calendar home
-/// (`https://cloud.example.org/remote.php/dav/calendars/plenum-bot/`).
-pub struct Nextcloud {
-    http: reqwest::Client,
-    account: String,
-    username: String,
-    password: String,
-}
-
-fn method(name: &str) -> reqwest::Method {
-    reqwest::Method::from_bytes(name.as_bytes()).expect("a valid method")
-}
-
-impl Nextcloud {
-    pub fn new(account: &str, username: &str, password: &str) -> Result<Self> {
-        Ok(Self {
-            http: reqwest::Client::builder()
-                .user_agent(concat!("plenum-bot/", env!("CARGO_PKG_VERSION")))
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?,
-            account: format!("{}/", account.trim_end_matches('/')),
-            username: username.to_owned(),
-            password: password.to_owned(),
-        })
-    }
-
-    pub fn calendar_url(&self, slug: &str) -> String {
-        format!("{}{slug}/", self.account)
-    }
-
-    async fn dav(
-        &self,
-        m: &str,
-        url: &str,
-        depth: Option<&str>,
-        body: String,
-    ) -> Result<(u16, String)> {
-        let mut req = self
-            .http
-            .request(method(m), url)
-            .basic_auth(&self.username, Some(&self.password))
-            .header("Content-Type", "application/xml; charset=utf-8")
-            .body(body);
-        if let Some(d) = depth {
-            req = req.header("Depth", d);
-        }
-        let resp = req.send().await.with_context(|| format!("{m} {url}"))?;
-        let status = resp.status().as_u16();
-        Ok((status, resp.text().await.unwrap_or_default()))
-    }
-
-    /// The calendar `slug` with this display name; made when missing. True when it was made.
-    pub async fn ensure_calendar(&self, slug: &str, name: &str) -> Result<bool> {
-        let url = self.calendar_url(slug);
-        let (status, body) = self
-            .dav(
-                "PROPFIND",
-                &url,
-                Some("0"),
-                r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:displayname/></d:prop></d:propfind>"#.to_owned(),
-            )
-            .await?;
-        match status {
-            207 => {
-                let current = caldav::xml_elements(&body, "displayname")
-                    .first()
-                    .map(|s| caldav::xml_unescape(s.trim()));
-                if current.as_deref() != Some(name) {
-                    let (status, _) = self
-                        .dav(
-                            "PROPPATCH",
-                            &url,
-                            None,
-                            format!(r#"<?xml version="1.0" encoding="utf-8"?><d:propertyupdate xmlns:d="DAV:"><d:set><d:prop><d:displayname>{}</d:displayname></d:prop></d:set></d:propertyupdate>"#, caldav::xml_escape(name)),
-                        )
-                        .await?;
-                    if status != 207 {
-                        bail!("renaming the calendar {slug}: {status}");
-                    }
-                }
-                Ok(false)
-            }
-            404 => {
-                let (status, body) = self
-                    .dav(
-                        "MKCALENDAR",
-                        &url,
-                        None,
-                        format!(r#"<?xml version="1.0" encoding="utf-8"?><c:mkcalendar xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:set><d:prop><d:displayname>{}</d:displayname><c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set></d:prop></d:set></c:mkcalendar>"#, caldav::xml_escape(name)),
-                    )
-                    .await?;
-                if status != 201 {
-                    bail!(
-                        "making the calendar {slug}: {status} {}",
-                        body.chars().take(200).collect::<String>()
-                    );
-                }
-                Ok(true)
-            }
-            other => bail!(
-                "the calendar {slug}: {other} {}",
-                body.chars().take(200).collect::<String>()
-            ),
-        }
-    }
-
-    pub async fn shares(&self, slug: &str) -> Result<Vec<Share>> {
-        let (status, body) = self
-            .dav(
-                "PROPFIND",
-                &self.calendar_url(slug),
-                Some("0"),
-                r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><oc:invite/></d:prop></d:propfind>"#.to_owned(),
-            )
-            .await?;
-        if status != 207 {
-            bail!("the shares of {slug}: {status}");
-        }
-        Ok(parse_shares(&body))
-    }
-
-    async fn share_request(&self, slug: &str, inner: String) -> Result<()> {
-        let (status, body) = self
-            .dav(
-                "POST",
-                &self.calendar_url(slug),
-                None,
-                format!(r#"<?xml version="1.0" encoding="utf-8"?><oc:share xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">{inner}</oc:share>"#),
-            )
-            .await?;
-        if !(200..300).contains(&status) {
-            bail!(
-                "sharing {slug}: {status} {}",
-                body.chars().take(200).collect::<String>()
-            );
-        }
-        Ok(())
-    }
-
-    pub async fn share(&self, slug: &str, share: &Share) -> Result<()> {
-        let write = if share.write { "<oc:read-write/>" } else { "" };
-        self.share_request(
-            slug,
-            format!(
-                "<oc:set><d:href>{}</d:href>{write}</oc:set>",
-                caldav::xml_escape(&share.principal)
-            ),
-        )
-        .await
-    }
-
-    pub async fn unshare(&self, slug: &str, principal: &str) -> Result<()> {
-        self.share_request(
-            slug,
-            format!(
-                "<oc:remove><d:href>{}</d:href></oc:remove>",
-                caldav::xml_escape(principal)
-            ),
-        )
-        .await
-    }
-
-    /// The calendar's events touching `from`..`to`, their times in `zone` (a failure is an
-    /// error, never "none").
-    pub async fn events(
-        &self,
-        slug: &str,
-        from: NaiveDate,
-        to: NaiveDate,
-        zone: &chrono_tz::Tz,
-    ) -> Result<Vec<IcsEvent>> {
-        caldav::fetch_calendar(
-            &self.http,
-            &self.calendar_url(slug),
-            &self.username,
-            &self.password,
-            from,
-            to,
-            zone,
-        )
-        .await
-        .with_context(|| format!("reading the calendar {slug}"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mxbot_common::calendar::nextcloud::parse_shares;
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
@@ -485,6 +260,11 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
 mod against_nextcloud {
     use super::*;
     use crate::config::Access;
+    use mxbot_common::calendar::caldav;
+
+    fn method(name: &str) -> reqwest::Method {
+        reqwest::Method::from_bytes(name.as_bytes()).expect("a valid method")
+    }
 
     fn pass(user: &str) -> String {
         std::env::var(format!(
