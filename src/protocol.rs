@@ -355,8 +355,56 @@ pub fn rules_doc_text(plenum: &Plenum) -> String {
 
 pub fn protocols_doc_text(plenum: &Plenum) -> String {
     format!(
-        "All minutes of {}: below, one per meeting. The bot creates new ones here.\n",
+        "The minutes of every meeting of {} are the pages inside this one: open the arrow \
+         next to it in the sidebar. The bot makes a new one before each meeting.\n",
         plenum.name
+    )
+}
+
+/// An example of finished minutes (the page `<Name>: Example minutes`): how the template
+/// looks once a meeting was written down. Never read for decisions or tasks.
+pub fn example_doc_text(plenum: &Plenum) -> String {
+    format!(
+        "_An example of finished minutes, to copy from. The real ones are under “{protocols}”; \
+         the bot makes them from the template before each meeting._
+
+**{name}** on Sunday, 1 November 2026 at 19:00
+
+| Facilitation | Minutes | Present |
+|---|---|---|
+| Anna | Ben | Anna, Ben, Cara, Dan |
+
+## Agenda
+
+* Bins in the yard (Ben)
+* Compost bin (Cara)
+
+## Minutes
+
+### Bins in the yard
+
+The yellow bin is often full by Thursday. A second one would fit next to the door.
+
+Decision: we ask the landlord for a second yellow bin.
+
+### Compost bin
+
+Cara found one for 40 €. Everyone agrees, Dan would rather have a bigger one next year.
+
+Decision: we buy the compost bin from the house cash box.
+
+## Decisions and tasks
+
+- [ ] Ben: write to the landlord about the second bin by Friday
+- [ ] Cara: buy the compost bin by next Sunday
+- [x] Dan: put up the new cleaning rota
+
+_After the meeting the two lines starting with “Decision:” go into the list of decisions. Ben's \
+and Cara's tasks are still open, so they come along to the next minutes; Dan's is ticked off \
+and done._
+",
+        name = plenum.name,
+        protocols = plenum.protocols_title(),
     )
 }
 
@@ -366,6 +414,8 @@ pub struct OverviewLinks<'a> {
     pub decisions: &'a str,
     pub protocols: &'a str,
     pub template: &'a str,
+    /// The example of finished minutes, once the area has it.
+    pub example: Option<&'a str>,
     /// The calendars in Nextcloud (where the dates are kept), if known.
     pub calendar: Option<&'a str>,
 }
@@ -376,6 +426,15 @@ fn days(n: u32) -> String {
         "1 day".to_owned()
     } else {
         format!("{n} days")
+    }
+}
+
+/// "1 hour", "12 hours"
+fn hours(n: u32) -> String {
+    if n == 1 {
+        "1 hour".to_owned()
+    } else {
+        format!("{n} hours")
     }
 }
 
@@ -422,6 +481,36 @@ pub fn overview_text(
         "\n## Bringing in a topic\n\nWrite `!top <topic>` in the chat, reply to a message \
          with `!top`, or write it into the agenda of the next meeting.\n",
     );
+    t.push_str(&format!(
+        "\n## How the minutes work\n\n\
+         1. **Before the meeting.** {before} before it, the bot makes the minutes from the \
+         [template]({template}) and posts the link in the chat. Topics from the chat are on \
+         the agenda already.\n\
+         2. **During the meeting.** Someone writes the minutes into that document: a heading \
+         (type `###` and a space) for each topic, and below it what was said.\n\
+         3. **Decisions.** Start a line with the word `Decision` and a colon, then what was \
+         decided, for example `Decision: the bins go out on Sunday evening`. After the meeting \
+         every such line goes into the [list of decisions]({decisions}). Lines on the agenda \
+         are no decisions yet.\n\
+         4. **Tasks.** Make them a checklist: type `[]` and a space at the start of a line, \
+         then who does what by when, for example `Anna: order the compost bin by Friday`. A \
+         task that is not ticked off comes along to the next minutes and shows here under \
+         \"Open tasks\"; tick it off when it is done.\n\
+         5. **After the meeting.** {after} after its end (or at once when someone writes \
+         `!minutes done` in the chat), the bot closes the minutes: the decisions go into the \
+         list, the minutes are attached as a PDF and posted in the chat with a short \
+         summary.\n",
+        before = days(plenum.prepare_days),
+        after = hours(plenum.close_after_hours),
+        template = links.template,
+        decisions = links.decisions,
+    ));
+    if let Some(example) = links.example {
+        t.push_str(&format!(
+            "\nHow finished minutes look: [{}]({example}).\n",
+            plenum.example_title()
+        ));
+    }
     t.push_str("\n## Open tasks\n\n");
     if tasks.is_empty() {
         t.push_str("None.\n");
@@ -824,6 +913,7 @@ Decisions were taken quickly.
             decisions: "https://wiki.test/doc/dec",
             protocols: "https://wiki.test/doc/protocols",
             template: "https://wiki.test/doc/tpl",
+            example: Some("https://wiki.test/doc/example"),
             calendar: Some("https://cloud.test/apps/calendar"),
         };
         let t = overview_text(
@@ -847,7 +937,16 @@ Decisions were taken quickly.
         ));
         assert!(t.contains("Decision \\[one\\]"));
         assert!(t.contains("[House plenum: Rules](https://wiki.test/doc/rules)"));
-        // the overview's own lines are no task and no decision
+        // how the minutes work, with the plenum's own times and links
+        assert!(
+            t.contains("## How the minutes work")
+                && t.contains("3 days before it, the bot makes the minutes from the [template](https://wiki.test/doc/tpl)")
+                && t.contains("12 hours after its end")
+                && t.contains("[list of decisions](https://wiki.test/doc/dec)")
+                && t.contains("[House plenum: Example minutes](https://wiki.test/doc/example)"),
+            "{t}"
+        );
+        // the overview's own lines are no task and no decision, its examples neither
         assert_eq!(extract(&t), Outcome::default());
     }
 }

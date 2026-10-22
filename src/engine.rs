@@ -287,11 +287,13 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 (start, link)
             })
             .collect();
+        let example = url("example");
         let links = protocol::OverviewLinks {
             rules: &rules,
             decisions: &decisions,
             protocols: &protocols,
             template: &template,
+            example: example.as_deref(),
             calendar: self.calendar_url.as_deref(),
         };
         Some(protocol::overview_text(
@@ -648,6 +650,16 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             .await?;
         ps.urls.insert("protocols".into(), protocols.url);
         ps.protocols_doc_id = Some(protocols.id);
+        let example = self
+            .ensure_doc(
+                &collection,
+                &p.example_title(),
+                &protocol::example_doc_text(p),
+                ps.example_doc_id.as_deref(),
+            )
+            .await?;
+        ps.urls.insert("example".into(), example.url);
+        ps.example_doc_id = Some(example.id);
         let overview = self
             .ensure_doc(
                 &collection,
@@ -698,12 +710,15 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         if let Some(id) = known {
             if let Some(mut d) = self.wiki.doc(id).await? {
                 if d.collection_id.as_deref().is_none_or(|c| c == collection) {
+                    // Nobody changed it since the bot made it: it gets the bot's newest text
+                    // (a better explanation reaches every area).
+                    if d.untouched && !text.is_empty() && d.text.trim() != text.trim() {
+                        info!(title = %title, "The bot's text of an untouched document, renewed");
+                        self.wiki.replace(&d.id, text).await?;
+                        d.text = text.to_owned();
+                    }
                     if d.title != title {
                         info!(from = %d.title, to = %title, "Renaming the document");
-                        if d.untouched && !text.is_empty() && d.text != text {
-                            self.wiki.replace(&d.id, text).await?;
-                            d.text = text.to_owned();
-                        }
                         self.wiki.rename(&d.id, title).await?;
                         d.title = title.to_owned();
                     }
@@ -2369,6 +2384,7 @@ mod tests {
                 .find(|(d, _)| d.title == "House plenum: Template")
                 .unwrap();
             d.text = "Our own template for {{plenum}} on {{iso_date}}\n\n## Agenda\n".into();
+            d.untouched = false; // an edit in Outline sets updatedAt
         }
         e.tick(at(2026, 12, 3, 19, 0)).await;
         let dec = e.wiki.by_title("House plenum 2026-12-06").unwrap();
@@ -2387,6 +2403,7 @@ mod tests {
             .find(|(d, del)| d.title == title && !del)
             .unwrap();
         f(&mut d.text);
+        d.untouched = false; // an edit in Outline sets updatedAt
     }
 
     fn delete_doc(e: &Engine<FakeWiki, FakeChat>, title: &str) {
@@ -3263,6 +3280,47 @@ mod tests {
         e.sync_members(&groups, at(2026, 10, 22, 10, 0)).await;
         assert_eq!(*e.chat.members.lock().unwrap(), before);
         assert!(e.chat.removed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_area_has_an_example_and_untouched_pages_get_the_newest_text() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 20, 12, 0)).await;
+        let example = e
+            .wiki
+            .by_title("House plenum: Example minutes")
+            .expect("the example");
+        assert_eq!(example.text, protocol::example_doc_text(&e.plenums[0]));
+        // the example is linked from the overview, its decisions count nowhere
+        let o = e.wiki.by_title("House plenum: Overview").unwrap();
+        assert!(
+            o.text
+                .contains("How finished minutes look: [House plenum: Example minutes]"),
+            "{}",
+            o.text
+        );
+        assert!(e.state.lock().await.plenums["house"].decisions.is_empty());
+        // an untouched page of the bot's with an older text: renewed at the next check
+        {
+            let mut docs = e.wiki.docs.lock().unwrap();
+            let (d, _) = docs
+                .iter_mut()
+                .find(|(d, _)| d.title == "House plenum: Minutes")
+                .unwrap();
+            d.text = "an older text".into();
+        }
+        // ... one someone wrote in: left alone
+        edit_doc(e, "House plenum: Rules", |t| t.push_str("\nOur rule."));
+        e.tick(at(2026, 10, 20, 13, 1)).await;
+        let minutes = e.wiki.by_title("House plenum: Minutes").unwrap();
+        assert_eq!(minutes.text, protocol::protocols_doc_text(&e.plenums[0]));
+        assert!(e
+            .wiki
+            .by_title("House plenum: Rules")
+            .unwrap()
+            .text
+            .ends_with("Our rule."));
     }
 
     #[tokio::test]

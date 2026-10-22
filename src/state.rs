@@ -43,6 +43,9 @@ pub struct PlenumState {
     pub rules_doc_id: Option<String>,
     #[serde(default)]
     pub protocols_doc_id: Option<String>,
+    /// An example of finished minutes, to show how they are written.
+    #[serde(default)]
+    pub example_doc_id: Option<String>,
     /// The documents' paths in the wiki (`/doc/…`), by role: overview, rules, protocols,
     /// decisions, template.
     #[serde(default)]

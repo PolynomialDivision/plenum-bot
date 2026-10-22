@@ -262,6 +262,10 @@ impl Plenum {
     pub fn protocols_title(&self) -> String {
         format!("{}: Minutes", self.name)
     }
+
+    pub fn example_title(&self) -> String {
+        format!("{}: Example minutes", self.name)
+    }
 }
 
 impl Config {
