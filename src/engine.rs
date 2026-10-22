@@ -1426,6 +1426,18 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let Some(me) = self.me.clone() else {
             return;
         };
+        // The house's own group (the house plenum's) with nobody in it is a broken directory,
+        // not a house where nobody lives: it would empty every room. Nothing changes then.
+        if let Some(empty) = self
+            .plenums
+            .iter()
+            .filter(|p| p.access == Access::House)
+            .filter_map(|p| p.group.as_deref())
+            .find(|g| groups.get(*g).is_some_and(|members| members.is_empty()))
+        {
+            error!(group = %empty, "Members: the house's group has nobody in it; no room is changed");
+            return;
+        }
         let mut rooms: Vec<OwnedRoomId> = self.plenums.iter().map(|p| p.room.clone()).collect();
         rooms.sort();
         rooms.dedup();
@@ -3226,6 +3238,31 @@ mod tests {
         .into();
         e.sync_members(&groups, at(2026, 10, 22, 10, 15)).await;
         assert!(members_of(&e, "!k1:x").contains("@anna:x"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_house_group_changes_no_room() {
+        let mut house = plenum("house", "House plenum", "!house:x");
+        house.group = Some("residents".into());
+        let t = setup(vec![kitchen(), house]);
+        let mut e = t.engine;
+        e.me = Some("@plenum-bot:x".try_into().unwrap());
+        e.chat.members.lock().unwrap().extend([
+            in_room("!house:x", "@plenum-bot:x", true),
+            in_room("!house:x", "@anna:x", false),
+            in_room("!k1:x", "@plenum-bot:x", true),
+            in_room("!k1:x", "@anna:x", false),
+        ]);
+        let before = e.chat.members.lock().unwrap().clone();
+        // a broken directory: residents exists with nobody in it
+        let groups: Groups = [
+            group("residents", &[]),
+            group("kitchen-floor-1", &["@anna:x"]),
+        ]
+        .into();
+        e.sync_members(&groups, at(2026, 10, 22, 10, 0)).await;
+        assert_eq!(*e.chat.members.lock().unwrap(), before);
+        assert!(e.chat.removed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
