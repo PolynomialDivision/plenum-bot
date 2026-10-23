@@ -31,7 +31,7 @@
 //! comes back as a checkbox).
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::PathBuf,
 };
 
@@ -120,6 +120,14 @@ pub trait Wiki {
 pub trait Chat {
     /// Send Markdown with this transaction ID (a resend with the same ID is dropped).
     async fn send(&self, room: &RoomId, markdown: &str, txn: &str) -> Result<()>;
+    /// [`Self::send`], pinging `users` (Matrix mentions).
+    async fn send_mentioning(
+        &self,
+        room: &RoomId,
+        markdown: &str,
+        users: &[OwnedUserId],
+        txn: &str,
+    ) -> Result<()>;
     async fn send_file(&self, room: &RoomId, name: &str, bytes: Vec<u8>, txn: &str) -> Result<()>;
     /// Who is in the room, joined or invited.
     async fn members(&self, room: &RoomId) -> Result<Vec<Member>>;
@@ -160,6 +168,9 @@ pub struct Engine<W, C> {
     pub keep: HashSet<OwnedUserId>,
     /// Where people open the calendars (Nextcloud's calendar app), for the links.
     pub calendar_url: Option<String>,
+    /// The house account of each person by the name the wiki shows for them (and by their
+    /// login), from the last read of the directory; None for a name two people share.
+    accounts_by_name: std::sync::Mutex<HashMap<String, Option<OwnedUserId>>>,
     pub(crate) state: Mutex<State>,
     state_path: PathBuf,
     /// The plenums whose area was checked since the start: a restart (a deploy with a new
@@ -203,6 +214,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             me: None,
             keep: HashSet::new(),
             calendar_url: None,
+            accounts_by_name: std::sync::Mutex::new(HashMap::new()),
             state: Mutex::new(state),
             state_path,
             areas_checked: std::sync::Mutex::new(HashSet::new()),
@@ -998,7 +1010,11 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             self.save(st).await?;
             let text =
                 protocol::summary(p, start, &link, &outcome, decisions_link.as_deref(), note);
-            self.chat.send(&p.room, &text, &txn).await?;
+            // who a task or a decision mentions in the wiki is mentioned in the chat too
+            let (text, users) = protocol::for_matrix(&text, |name| self.account_of(name));
+            self.chat
+                .send_mentioning(&p.room, &text, &users, &txn)
+                .await?;
             meeting(st, p, key).close.summary.done = true;
         }
         meeting(st, p, key).close.done = true;
@@ -1420,7 +1436,53 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     }
 }
 
+/// A name as it is compared: lower case, whitespace collapsed.
+fn name_key(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 impl<W: Wiki, C: Chat> Engine<W, C> {
+    /// Who the wiki's mentions are: the house account of every person of a fresh read of the
+    /// directory, by their shown name and by their login (a mention carries the name the wiki
+    /// shows, which it takes from the house login). A name two people share names nobody.
+    pub fn set_people(&self, people: &[mxbot_common::directory::Person]) {
+        let mut index: HashMap<String, Option<OwnedUserId>> = HashMap::new();
+        for person in people {
+            let Some(account) = person.accounts.first() else {
+                continue;
+            };
+            let mut keys = vec![name_key(&person.username)];
+            if !person.name.trim().is_empty() {
+                keys.push(name_key(&person.name));
+            }
+            keys.dedup();
+            for key in keys {
+                index
+                    .entry(key)
+                    .and_modify(|known| {
+                        if known.as_ref() != Some(account) {
+                            *known = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(account.clone()));
+            }
+        }
+        *self.accounts_by_name.lock().unwrap() = index;
+    }
+
+    /// The house account of the person the wiki shows as `name`, if exactly one.
+    fn account_of(&self, name: &str) -> Option<OwnedUserId> {
+        self.accounts_by_name
+            .lock()
+            .unwrap()
+            .get(&name_key(name))
+            .cloned()
+            .flatten()
+    }
+
     /// [`Self::sync_members`] after a read of the directory: when it failed (its people or
     /// which groups exist), every room stays as it is.
     pub async fn sync_members_after(&self, read: Result<Groups>, now: DateTime<Utc>) {
@@ -1786,6 +1848,8 @@ pub(crate) mod fakes {
     #[derive(Default)]
     pub struct FakeChat {
         pub sent: StdMutex<Vec<(String, String, String)>>, // (room, text, txn)
+        /// (txn, accounts) of every message that pinged someone
+        pub pinged: StdMutex<Vec<(String, Vec<String>)>>,
         pub files: StdMutex<Vec<(String, String, usize)>>,
         pub fail: StdMutex<bool>,
         pub fail_files: StdMutex<bool>,
@@ -1816,6 +1880,22 @@ pub(crate) mod fakes {
             // like a homeserver: a resend with the same transaction ID is dropped
             if !sent.iter().any(|(_, _, t)| t == txn) {
                 sent.push((room.to_string(), markdown.to_owned(), txn.to_owned()));
+            }
+            Ok(())
+        }
+        async fn send_mentioning(
+            &self,
+            room: &RoomId,
+            markdown: &str,
+            users: &[OwnedUserId],
+            txn: &str,
+        ) -> Result<()> {
+            self.send(room, markdown, txn).await?;
+            if !users.is_empty() {
+                self.pinged.lock().unwrap().push((
+                    txn.to_owned(),
+                    users.iter().map(|u| u.to_string()).collect(),
+                ));
             }
             Ok(())
         }
@@ -2980,6 +3060,61 @@ mod tests {
         let protocols = e.wiki.by_title("House plenum: Minutes").unwrap();
         let new = e.wiki.by_title("House plenum 2026-11-01").unwrap();
         assert_eq!(new.parent_id.as_deref(), Some(protocols.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn people_mentioned_in_the_minutes_are_mentioned_in_the_chat() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        let person = |username: &str, name: &str, account: &str| mxbot_common::directory::Person {
+            username: username.into(),
+            name: name.into(),
+            accounts: vec![account.try_into().unwrap()],
+            groups: Default::default(),
+        };
+        e.set_people(&[
+            person("ben", "Ben Berg", "@ben:house.org"),
+            person("anna", "Anna", "@anna:house.org"),
+            person("anna2", "Anna", "@anna2:house.org"), // two Annas: neither is pinged
+        ]);
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        {
+            let mut docs = e.wiki.docs.lock().unwrap();
+            let (d, _) = docs
+                .iter_mut()
+                .find(|(d, _)| d.title == "House plenum 2026-11-01")
+                .unwrap();
+            d.text.push_str(
+                "\n- [ ] @[Ben Berg](mention://m1/user/u1): Tonne kaufen\n\
+                 - [ ] @[Anna](mention://m2/user/u2): Liste\n",
+            );
+        }
+        e.tick(at(2026, 11, 2, 9, 0)).await; // closed
+        let summary = e
+            .chat
+            .texts()
+            .into_iter()
+            .find(|t| t.contains("are closed"))
+            .expect("the summary");
+        assert!(
+            summary.contains("[Ben Berg](https://matrix.to/#/@ben:house.org): Tonne kaufen"),
+            "{summary}"
+        );
+        assert!(summary.contains("@Anna: Liste"), "{summary}");
+        let pinged = e.chat.pinged.lock().unwrap().clone();
+        assert_eq!(pinged.len(), 1);
+        assert_eq!(pinged[0].1, vec!["@ben:house.org".to_owned()]);
+        // the wiki keeps the mention as it was: the next minutes mention Ben again
+        let st = e.state.lock().await;
+        let carried: Vec<&str> = st.plenums["house"]
+            .open_tasks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert!(
+            carried.contains(&"@[Ben Berg](mention://m1/user/u1): Tonne kaufen"),
+            "{carried:?}"
+        );
     }
 
     #[tokio::test]

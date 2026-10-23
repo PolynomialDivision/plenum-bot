@@ -7,6 +7,7 @@ use crate::{
     schedule::{describe_day, describe_meeting, MeetingKey},
     state::{Carried, Top},
 };
+use mxbot_common::matrix_sdk::ruma::OwnedUserId;
 
 /// The line agenda items from the chat are put above. It is plain text on purpose: Outline
 /// keeps it exactly as it is, while formatting would come back in another spelling.
@@ -32,8 +33,9 @@ A heading (###) for each item, and below it what was discussed.
 ## Decisions and tasks
 
 A line that starts with \"Decision:\" goes into the list of decisions after the plenum. \
-Tasks as a checklist (type \"[]\" at the start of a line in Outline): who does what by when. \
-What stays open here is in the next minutes again.
+Tasks as a checklist (type \"[]\" at the start of a line in Outline): who does what by when; \
+type \"@\" and pick the person, they are told in the wiki and in the plenum's chat. What \
+stays open here is in the next minutes again.
 
 {{open_tasks}}
 ";
@@ -493,9 +495,11 @@ pub fn overview_text(
          every such line goes into the [list of decisions]({decisions}). Lines on the agenda \
          are no decisions yet.\n\
          4. **Tasks.** Make them a checklist: type `[]` and a space at the start of a line, \
-         then who does what by when, for example `Anna: order the compost bin by Friday`. A \
-         task that is not ticked off comes along to the next minutes and shows here under \
-         \"Open tasks\"; tick it off when it is done.\n\
+         then who does what by when, for example `@Anna: order the compost bin by Friday` \
+         (type `@` and pick the person: the wiki tells them, and when the minutes close the \
+         bot mentions them in the plenum's chat). A task that is not ticked off comes along \
+         to the next minutes and shows here under \"Open tasks\"; tick it off when it is \
+         done.\n\
          5. **After the meeting.** {after} after its end (or at once when someone writes \
          `!minutes done` in the chat), the bot closes the minutes: the decisions go into the \
          list, the minutes are attached as a PDF and posted in the chat with a short \
@@ -635,6 +639,48 @@ pub fn summary(
         ),
     }
     text
+}
+
+/// The text for Matrix: each mention of a wiki user in Outline's Markdown
+/// (`@[Ben](mention://<id>/user/<user id>)`, the form Outline writes and reads back as a live
+/// mention) as a Matrix mention of the person `account` finds for the shown name, else as
+/// the plain `@Ben`; a mention of something else (`mention://…/issue/…`) as its label. With
+/// the accounts it mentions, each once, so the message can ping them.
+pub fn for_matrix(
+    text: &str,
+    account: impl Fn(&str) -> Option<OwnedUserId>,
+) -> (String, Vec<OwnedUserId>) {
+    let mut out = String::with_capacity(text.len());
+    let mut users: Vec<OwnedUserId> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("@[") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + 2..];
+        let parsed = tail.split_once("](mention://").and_then(|(label, after)| {
+            let end = after.find(')')?;
+            let plain = !label.is_empty() && !label.contains(['[', ']', '\n']);
+            plain.then(|| (label, &after[..end], &after[end + 1..]))
+        });
+        let Some((label, target, after)) = parsed else {
+            out.push_str("@[");
+            rest = tail;
+            continue;
+        };
+        let is_user = target.split('/').nth(1) == Some("user");
+        match is_user.then(|| account(label)).flatten() {
+            Some(id) => {
+                out.push_str(&format!("[{label}](https://matrix.to/#/{id})"));
+                if !users.contains(&id) {
+                    users.push(id);
+                }
+            }
+            None if is_user => out.push_str(&format!("@{label}")),
+            None => out.push_str(label),
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    (out, users)
 }
 
 /// What the summary says about the PDF.
@@ -803,6 +849,32 @@ mod tests {
     fn escaped_lines_are_found_again() {
         assert!(contains_line("* c\\*d (Anna)", "* c*d (Anna)"));
         assert!(!contains_line("* cd (Anna)", "* c*d (Anna)"));
+    }
+
+    #[test]
+    fn wiki_mentions_become_matrix_mentions() {
+        let ben: OwnedUserId = "@ben:house.org".try_into().unwrap();
+        let known = {
+            let ben = ben.clone();
+            move |label: &str| (label == "Ben Berg").then(|| ben.clone())
+        };
+        let (text, users) = for_matrix(
+            "- @[Ben Berg](mention://a1/user/u1): bins, and @[Ben Berg](mention://a2/user/u1) \
+             again; @[Cara](mention://a3/user/u2) too, see @[Epic](mention://a4/issue/i1). \
+             Mail me @[home] or (here)",
+            &known,
+        );
+        assert_eq!(
+            text,
+            "- [Ben Berg](https://matrix.to/#/@ben:house.org): bins, and \
+             [Ben Berg](https://matrix.to/#/@ben:house.org) again; @Cara too, see Epic. \
+             Mail me @[home] or (here)"
+        );
+        assert_eq!(users, vec![ben]);
+        assert_eq!(
+            for_matrix("no mention", &known),
+            ("no mention".to_owned(), vec![])
+        );
     }
 
     #[test]

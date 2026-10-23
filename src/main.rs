@@ -39,7 +39,7 @@ use mxbot_common::{
                 },
                 AnySyncMessageLikeEvent, AnySyncTimelineEvent, Mentions, SyncMessageLikeEvent,
             },
-            OwnedTransactionId, RoomId, UserId,
+            OwnedTransactionId, OwnedUserId, RoomId, UserId,
         },
         Client, Room, RoomMemberships, RoomState,
     },
@@ -55,9 +55,10 @@ use crate::{
 };
 
 /// A message from Markdown (raw HTML in it, from a protocol, is shown as text); nobody is
-/// pinged.
-fn message(markdown: &str) -> RoomMessageEventContent {
-    mxbot_common::format::markdown(markdown).add_mentions(Mentions::new())
+/// pinged but `users`.
+fn message(markdown: &str, users: &[OwnedUserId]) -> RoomMessageEventContent {
+    mxbot_common::format::markdown(markdown)
+        .add_mentions(Mentions::with_user_ids(users.iter().cloned()))
 }
 
 /// Matrix behind [`Chat`].
@@ -85,8 +86,18 @@ fn is_admin(m: &RoomMember) -> bool {
 
 impl Chat for MatrixChat {
     async fn send(&self, room: &RoomId, markdown: &str, txn: &str) -> Result<()> {
+        self.send_mentioning(room, markdown, &[], txn).await
+    }
+
+    async fn send_mentioning(
+        &self,
+        room: &RoomId,
+        markdown: &str,
+        users: &[OwnedUserId],
+        txn: &str,
+    ) -> Result<()> {
         let room = self.room(room)?;
-        let content = message(markdown);
+        let content = message(markdown, users);
         let txn: OwnedTransactionId = txn.into();
         mxbot_common::send::send_with_retry_txn(&room, content, &txn).await?;
         Ok(())
@@ -345,6 +356,8 @@ async fn members_loop(engine: Arc<PlenumEngine>, directory: Directory) {
     loop {
         let read = async {
             let people = directory.people().await?;
+            // who the wiki's @ mentions are, for the summaries in the chat
+            engine.set_people(&people);
             let existing = directory.existing_groups(&wanted).await?;
             anyhow::Ok(directory::groups_with_empty(&people, &wanted, &existing))
         };
@@ -478,7 +491,7 @@ fn install_handler(bot: &Bot, engine: &Arc<PlenumEngine>) {
                 let answer = engine
                     .command_in(room.room_id(), &sender, command, now, scope)
                     .await;
-                let content = message(&answer);
+                let content = message(&answer, &[]);
                 if let Err(e) = mxbot_common::send::send_with_retry(&room, content).await {
                     error!("Answering in {} failed: {e}", room.room_id());
                 }
