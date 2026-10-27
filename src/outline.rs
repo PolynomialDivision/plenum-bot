@@ -488,6 +488,7 @@ mod against_outline {
             group: None,
             require_group: None,
             access: crate::config::Access::House,
+            publication: crate::config::Publication::Full,
         };
         let fonts = ["/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/TTF"]
             .into_iter()
@@ -668,6 +669,7 @@ mod against_outline {
             group: None,
             require_group: None,
             access: crate::config::Access::House,
+            publication: crate::config::Publication::Full,
         };
         let kitchen = Plenum {
             group: Some(group.clone()),

@@ -1,6 +1,10 @@
 //! Chat commands. Only `!plenum`, `!top` and `!minutes` are the bot's; everything else in
 //! the room is left alone (other bots may share the room).
 
+use chrono::{Datelike, NaiveDate, NaiveTime};
+
+use crate::{config::Publication, schedule::MeetingKey};
+
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Help,
@@ -12,8 +16,100 @@ pub enum Command {
     },
     /// `!minutes done [key]`
     Close(Option<String>),
+    /// `!minutes full|link|confidential [key] [day [time]]`: what of a meeting's minutes
+    /// goes into the chat; without a day the open or the next meeting's.
+    Publish {
+        key: Option<String>,
+        mode: Publication,
+        when: Option<When>,
+    },
     /// A command of the bot with a mistake in it; the text says what is wrong.
     Invalid(String),
+}
+
+/// A meeting by its day (the year may be left out: the next such day) and maybe its time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct When {
+    pub day: u32,
+    pub month: u32,
+    pub year: Option<i32>,
+    pub time: Option<NaiveTime>,
+}
+
+impl When {
+    pub fn matches(&self, start: MeetingKey) -> bool {
+        let date = start.date();
+        date.day() == self.day
+            && date.month() == self.month
+            && self.year.is_none_or(|y| y == date.year())
+            && self.time.is_none_or(|t| t == start.0.time())
+    }
+
+    /// "14 Nov", "14 Nov 2026 19:00"
+    pub fn describe(&self) -> String {
+        let month = NaiveDate::from_ymd_opt(2000, self.month, 1)
+            .map(|d| d.format("%b").to_string())
+            .unwrap_or_default();
+        let mut s = format!("{} {month}", self.day);
+        if let Some(y) = self.year {
+            s.push_str(&format!(" {y}"));
+        }
+        if let Some(t) = self.time {
+            s.push_str(&t.format(" %H:%M").to_string());
+        }
+        s
+    }
+}
+
+/// `14.11.`, `14.11`, `14.11.2026`, `14.11.26` or `2026-11-14`, maybe followed by `19:00`.
+fn parse_when(words: &[String]) -> Result<Option<When>, String> {
+    let wrong = |w: &str| {
+        format!("I don't understand “{w}”. A day goes like this: `14.11.` or `14.11. 19:00`.")
+    };
+    let Some(first) = words.first() else {
+        return Ok(None);
+    };
+    if words.len() > 2 {
+        return Err(wrong(&words[2..].join(" ")));
+    }
+    let (day, month, year) = if let Ok(d) = NaiveDate::parse_from_str(first, "%Y-%m-%d") {
+        (d.day(), d.month(), Some(d.year()))
+    } else {
+        let parts: Vec<&str> = first.trim_end_matches('.').split('.').collect();
+        let num = |s: &str| s.parse::<u32>().ok();
+        match parts.as_slice() {
+            [d, m] => match (num(d), num(m)) {
+                (Some(d), Some(m)) => (d, m, None),
+                _ => return Err(wrong(first)),
+            },
+            [d, m, y] => {
+                let y = match y.len() {
+                    2 => y.parse::<i32>().ok().map(|y| 2000 + y),
+                    4 => y.parse::<i32>().ok(),
+                    _ => None,
+                };
+                match (num(d), num(m), y) {
+                    (Some(d), Some(m), Some(y)) => (d, m, Some(y)),
+                    _ => return Err(wrong(first)),
+                }
+            }
+            _ => return Err(wrong(first)),
+        }
+    };
+    // 29 Feb is a day in a leap year
+    if NaiveDate::from_ymd_opt(year.unwrap_or(2000), month, day).is_none() {
+        return Err(wrong(first));
+    }
+    let time = match words.get(1) {
+        None => None,
+        Some(t) => Some(NaiveTime::parse_from_str(t, "%H:%M").map_err(|_| wrong(t))?),
+    };
+    Ok(Some(When {
+        day,
+        month,
+        year,
+        time,
+    }))
 }
 
 /// [`parse_for`] without plenum keys (every word is text).
@@ -64,7 +160,17 @@ pub fn parse_for(body: &str, keys: &[&str]) -> Option<Command> {
             match rest.first().map(|w| w.to_lowercase()).as_deref() {
                 None => Some(Command::Overview(key)),
                 Some("done") | Some("close") => Some(Command::Close(key)),
-                Some(_) => Some(Command::Invalid("Did you mean `!minutes done`?".to_owned())),
+                Some(w) => match Publication::from_word(w) {
+                    Some(mode) => match parse_when(&rest[1..]) {
+                        Ok(when) => Some(Command::Publish { key, mode, when }),
+                        Err(why) => Some(Command::Invalid(why)),
+                    },
+                    None => Some(Command::Invalid(
+                        "Did you mean `!minutes done`, or `!minutes full`, `!minutes link` or \
+                         `!minutes confidential` (what of the minutes comes into the chat)?"
+                            .to_owned(),
+                    )),
+                },
             }
         }
         "!plenum" => {
@@ -148,6 +254,76 @@ mod tests {
         assert_eq!(p("!plenum help"), Some(Command::Help));
         assert!(matches!(p("!minutes now"), Some(Command::Invalid(_))));
         assert!(matches!(p("!plenum xyz"), Some(Command::Invalid(_))));
+    }
+
+    #[test]
+    fn what_comes_into_the_chat_for_a_meeting() {
+        let publish = |mode, when| {
+            Some(Command::Publish {
+                key: None,
+                mode,
+                when,
+            })
+        };
+        assert_eq!(
+            p("!minutes confidential"),
+            publish(Publication::Confidential, None)
+        );
+        assert_eq!(p("!Minutes LINK"), publish(Publication::Link, None));
+        assert_eq!(p("!minutes full"), publish(Publication::Full, None));
+        assert_eq!(p("!minutes summary"), publish(Publication::Full, None));
+        let nov14 = When {
+            day: 14,
+            month: 11,
+            year: None,
+            time: None,
+        };
+        for day in ["14.11.", "14.11"] {
+            assert_eq!(
+                p(&format!("!minutes confidential {day}")),
+                publish(Publication::Confidential, Some(nov14))
+            );
+        }
+        let at_seven = When {
+            year: Some(2026),
+            time: NaiveTime::from_hms_opt(19, 0, 0),
+            ..nov14
+        };
+        for day in ["14.11.2026 19:00", "14.11.26 19:00", "2026-11-14 19:00"] {
+            assert_eq!(
+                p(&format!("!minutes link {day}")),
+                publish(Publication::Link, Some(at_seven))
+            );
+        }
+        assert_eq!(
+            p("!minutes confidential kitchen-floor-1 14.11."),
+            Some(Command::Publish {
+                key: Some("kitchen-floor-1".into()),
+                mode: Publication::Confidential,
+                when: Some(nov14),
+            })
+        );
+        assert_eq!(
+            p("!minutes kitchen-floor-3 link"),
+            Some(Command::Publish {
+                key: Some("kitchen-floor-3".into()),
+                mode: Publication::Link,
+                when: None,
+            })
+        );
+        for wrong in [
+            "!minutes confidential 31.11.",
+            "!minutes confidential tomorrow",
+            "!minutes confidential 14.11. 7pm",
+            "!minutes confidential 14.11. 19:00 please",
+            "!minutes secret",
+        ] {
+            assert!(matches!(p(wrong), Some(Command::Invalid(_))), "{wrong}");
+        }
+        assert!(at_seven.matches("2026-11-14 19:00".parse().unwrap()));
+        assert!(!at_seven.matches("2026-11-14 10:00".parse().unwrap()));
+        assert!(nov14.matches("2027-11-14 10:00".parse().unwrap()));
+        assert_eq!(at_seven.describe(), "14 Nov 2026 19:00");
     }
 
     #[test]

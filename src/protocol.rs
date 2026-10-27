@@ -3,7 +3,7 @@
 //! and gives it back in its own spelling (`*` for bullets, `- [ ]` for checkboxes).
 
 use crate::{
-    config::Plenum,
+    config::{Plenum, Publication},
     schedule::{describe_day, describe_meeting, MeetingKey},
     state::{Carried, Top},
 };
@@ -444,7 +444,7 @@ fn hours(n: u32) -> String {
 /// dates with their agendas, how to bring in a topic, open tasks, the latest decisions, links.
 pub fn overview_text(
     plenum: &Plenum,
-    next: &[(MeetingKey, Option<String>)],
+    next: &[(MeetingKey, Option<String>, Publication)],
     tasks: &[Carried],
     decisions: &[Carried],
     links: &OverviewLinks<'_>,
@@ -458,14 +458,19 @@ pub fn overview_text(
     if next.is_empty() {
         t.push_str("No meeting planned.\n");
     }
-    for (key, protocol) in next {
+    for (key, protocol, publication) in next {
+        let chat = match publication {
+            Publication::Full => "",
+            Publication::Link => " · in the chat only the link",
+            Publication::Confidential => " · confidential: nothing of it in the chat",
+        };
         match protocol {
             Some(link) => t.push_str(&format!(
-                "* {}: [agenda and minutes]({link})\n",
+                "* {}: [agenda and minutes]({link}){chat}\n",
                 describe_meeting(*key)
             )),
             None => t.push_str(&format!(
-                "* {} (the agenda comes {} before)\n",
+                "* {} (the agenda comes {} before){chat}\n",
                 describe_meeting(*key),
                 days(plenum.prepare_days)
             )),
@@ -503,7 +508,12 @@ pub fn overview_text(
          5. **After the meeting.** {after} after its end (or at once when someone writes \
          `!minutes done` in the chat), the bot closes the minutes: the decisions go into the \
          list, the minutes are attached as a PDF and posted in the chat with a short \
-         summary.\n",
+         summary.\n\
+         6. **Confidential meetings.** `!minutes confidential` in the chat keeps everything \
+         from the minutes out of the chat (no link, no summary, no PDF), `!minutes link` \
+         posts only the link; `!minutes full` is the summary again. It is for the meeting \
+         that is on or comes next, or the one on a day: `!minutes confidential 14.11.`. The \
+         minutes are made, closed and filed here all the same.\n",
         before = days(plenum.prepare_days),
         after = hours(plenum.close_after_hours),
         template = links.template,
@@ -557,25 +567,45 @@ pub fn overview_text(
 }
 
 /// Said once when a meeting that was announced leaves the calendar.
-pub fn cancellation(plenum: &Plenum, key: MeetingKey, link: &str) -> String {
-    format!(
-        "❌ **{}** on {} is cancelled (no longer in the calendar). The minutes stay in the wiki: {link}",
+pub fn cancellation(
+    plenum: &Plenum,
+    key: MeetingKey,
+    link: &str,
+    publication: Publication,
+) -> String {
+    let mut text = format!(
+        "❌ **{}** on {} is cancelled (no longer in the calendar).",
         plenum.name,
         describe_meeting(key)
-    )
+    );
+    if publication != Publication::Confidential {
+        text.push_str(&format!(" The minutes stay in the wiki: {link}"));
+    }
+    text
 }
 
-/// The announcement a few days before (again after a move: `moved_from`).
+/// The announcement a few days before (again after a move: `moved_from`). A confidential
+/// meeting's says when it is and nothing from the wiki: no link, no number of items.
 pub fn announcement(
     plenum: &Plenum,
     key: MeetingKey,
     link: &str,
     tops: usize,
     moved_from: Option<MeetingKey>,
+    publication: Publication,
 ) -> String {
     let moved = moved_from
         .map(|old| format!(" (moved from {})", describe_meeting(old)))
         .unwrap_or_default();
+    if publication == Publication::Confidential {
+        return format!(
+            "🔒 **{}** on {}{moved}: confidential\n\nThe minutes are made in the wiki as \
+             usual; nothing from them comes into the chat. Add a topic: `!top <topic>`, or \
+             reply to a message with `!top`.",
+            plenum.name,
+            describe_meeting(key)
+        );
+    }
     let mut text = format!(
         "📋 **{}** on {}{moved}\n\nAgenda and minutes: {link}\n\nAdd a topic: `!top <topic>`, \
          reply to a message with `!top`, or write it into the document.",
@@ -587,17 +617,101 @@ pub fn announcement(
         1 => text.push_str("\n\n1 item from the chat is in it already."),
         n => text.push_str(&format!("\n\n{n} items from the chat are in it already.")),
     }
+    text.push_str(match publication {
+        Publication::Link => "\n\nAfter the meeting only the link comes here, no summary.",
+        _ => {
+            "\n\nAfter the meeting a summary comes here; `!minutes link` (only the link) or \
+             `!minutes confidential` (nothing) changes that for this meeting."
+        }
+    });
     text
 }
 
 /// `started`: the bot came back during the meeting.
-pub fn reminder(plenum: &Plenum, key: MeetingKey, link: &str, started: bool) -> String {
+pub fn reminder(
+    plenum: &Plenum,
+    key: MeetingKey,
+    link: &str,
+    started: bool,
+    publication: Publication,
+) -> String {
     let verb = if started { "started" } else { "starts" };
-    format!(
-        "⏰ **{}** {verb} at {}.\n\nMinutes: {link}",
+    let mut text = format!(
+        "⏰ **{}** {verb} at {}.",
         plenum.name,
         key.0.format("%H:%M")
-    )
+    );
+    if publication != Publication::Confidential {
+        text.push_str(&format!("\n\nMinutes: {link}"));
+    }
+    text
+}
+
+/// When the minutes of a meeting that shares only the link, or nothing, are closed: no
+/// decision, task or name from them.
+pub fn closed_note(
+    plenum: &Plenum,
+    key: MeetingKey,
+    link: &str,
+    publication: Publication,
+    pdf: PdfNote,
+) -> String {
+    let mut text = match publication {
+        Publication::Confidential => format!(
+            "🔒 The minutes of **{}** on {} are closed. They are confidential: the decisions \
+             and tasks are in the wiki only.",
+            plenum.name,
+            describe_meeting(key)
+        ),
+        _ => format!(
+            "✅ The minutes of **{}** on {} are closed: {link}",
+            plenum.name,
+            describe_meeting(key)
+        ),
+    };
+    if pdf == PdfNote::Failed {
+        text.push_str("\n\n⚠️ The PDF could not be made.");
+    }
+    text
+}
+
+/// A task for a summary in the chat: false when it contains a withheld one (one from minutes
+/// that did not go into the chat, come along as "<task> (since <day>)").
+pub fn may_share_task(task: &str, withheld: &[String]) -> bool {
+    let plain = |s: &str| s.replace('\\', "").replace('[', "(").replace(']', ")");
+    let task = plain(task);
+    !withheld
+        .iter()
+        .map(|w| plain(w))
+        .any(|w| !w.trim().is_empty() && task.contains(w.trim()))
+}
+
+/// The minutes for the room: without the lines of withheld tasks ([`may_share_task`]).
+pub fn without_withheld(markdown: &str, withheld: &[String]) -> String {
+    if withheld.is_empty() {
+        return markdown.to_owned();
+    }
+    let mut text: String = markdown
+        .lines()
+        .filter(|line| {
+            let (_, rest) = strip_list_marker(line.trim());
+            may_share_task(rest, withheld)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if markdown.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// What a meeting's minutes bring into the chat, for the answers in the room.
+pub fn publication_text(publication: Publication) -> &'static str {
+    match publication {
+        Publication::Full => "the link, and after the meeting a summary with the decisions and open tasks and the PDF",
+        Publication::Link => "only the link to the minutes, no summary and no PDF",
+        Publication::Confidential => "nothing from the minutes: no link, no summary, no PDF",
+    }
 }
 
 /// The summary when the protocol is closed.
@@ -711,6 +825,7 @@ mod tests {
             group: None,
             require_group: None,
             access: crate::config::Access::House,
+            publication: crate::config::Publication::Full,
         }
     }
 
@@ -975,10 +1090,79 @@ Decisions were taken quickly.
     }
 
     #[test]
+    fn a_confidential_meeting_brings_nothing_from_the_wiki_into_the_chat() {
+        let link = "https://wiki.test/doc/house-plenum-2026-11-01";
+        let moved = Some("2026-10-31 19:00".parse().unwrap());
+        let texts = [
+            announcement(&plenum(), key(), link, 2, moved, Publication::Confidential),
+            reminder(&plenum(), key(), link, false, Publication::Confidential),
+            cancellation(&plenum(), key(), link, Publication::Confidential),
+            closed_note(
+                &plenum(),
+                key(),
+                link,
+                Publication::Confidential,
+                PdfNote::Fine,
+            ),
+        ];
+        for t in &texts {
+            assert!(!t.contains("wiki.test") && !t.contains("2 items"), "{t}");
+            assert!(t.contains("House plenum"), "{t}");
+        }
+        assert!(texts[0].contains("Sunday, 1 November 2026 at 19:00 (moved from Saturday"));
+        assert!(texts[0].contains("confidential") && texts[0].contains("!top"));
+        assert!(texts[3].contains("are closed") && texts[3].contains("confidential"));
+
+        // link only: the link, never a decision or a task
+        let a = announcement(&plenum(), key(), link, 2, None, Publication::Link);
+        assert!(a.contains(link) && a.contains("2 items") && a.contains("only the link"));
+        assert!(reminder(&plenum(), key(), link, true, Publication::Link).contains(link));
+        let closed = closed_note(&plenum(), key(), link, Publication::Link, PdfNote::Failed);
+        assert!(closed.contains(link) && closed.contains("PDF could not be made"));
+
+        // full: as always, and how to share less
+        let a = announcement(&plenum(), key(), link, 0, None, Publication::Full);
+        assert!(a.contains(&format!("Agenda and minutes: {link}")));
+        assert!(a.contains("`!minutes confidential`"), "{a}");
+        assert!(cancellation(&plenum(), key(), link, Publication::Full).contains(link));
+    }
+
+    #[test]
+    fn tasks_withheld_once_stay_out_of_the_chat_when_they_come_along() {
+        let withheld = ["Ben: talk to [the landlord]".to_owned()];
+        // as the next minutes have it: from the checklist, with the day it is from
+        assert!(!may_share_task(
+            "Ben: talk to (the landlord) (since 1 Nov 2026)",
+            &withheld
+        ));
+        assert!(!may_share_task(
+            "Ben: talk to \\(the landlord\\) (since 1 Nov 2026) (since 6 Dec 2026)",
+            &withheld
+        ));
+        assert!(may_share_task("Cara: buy the compost bin", &withheld));
+        assert!(may_share_task("anything", &["  ".to_owned()]));
+        // and out of the PDF for the room
+        let md = "## Open tasks from the last plenum\n\n- [ ] Ben: talk to (the landlord) (since 1 Nov 2026)\n- [ ] Cara: buy the compost bin\n";
+        assert_eq!(
+            without_withheld(md, &withheld),
+            "## Open tasks from the last plenum\n\n- [ ] Cara: buy the compost bin\n"
+        );
+        assert_eq!(without_withheld(md, &[]), md);
+    }
+
+    #[test]
     fn the_overview_lists_dates_tasks_decisions_and_links() {
         let next = [
-            (key(), Some("https://wiki.test/doc/p".to_owned())),
-            ("2026-11-15 19:00".parse().unwrap(), None),
+            (
+                key(),
+                Some("https://wiki.test/doc/p".to_owned()),
+                Publication::Full,
+            ),
+            (
+                "2026-11-15 19:00".parse().unwrap(),
+                None,
+                Publication::Confidential,
+            ),
         ];
         let links = OverviewLinks {
             rules: "https://wiki.test/doc/rules",
@@ -995,7 +1179,14 @@ Decisions were taken quickly.
             &[carried("Decision [one]")],
             &links,
         );
-        assert!(t.contains("[agenda and minutes](https://wiki.test/doc/p)"));
+        assert!(t.contains("[agenda and minutes](https://wiki.test/doc/p)\n"));
+        assert!(
+            t.contains(
+                "(the agenda comes 3 days before) · confidential: nothing of it in the chat"
+            ),
+            "{t}"
+        );
+        assert!(t.contains("`!minutes confidential`"), "{t}");
         assert!(
             t.contains("15 November 2026") && t.contains("3 days before"),
             "{t}"

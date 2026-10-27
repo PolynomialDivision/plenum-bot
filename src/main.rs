@@ -145,7 +145,7 @@ impl Chat for MatrixChat {
 
 const ADMIN_HELP: &str =
     "For everyone in the plenum rooms: !plenum · !top <topic> (also as a reply to a message) · \
-!minutes done · !plenum help. The meetings are in the plenums' Nextcloud calendars. \
+!minutes done · !minutes confidential|link|full [day] · !plenum help. The meetings are in the plenums' Nextcloud calendars. \
 Here in the admin chat !plenum shows every plenum.";
 
 type PlenumEngine = Engine<Outline, MatrixChat>;

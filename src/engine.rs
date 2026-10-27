@@ -47,8 +47,8 @@ use tracing::{error, info, warn};
 
 use crate::{
     calendar::Occurrence,
-    commands::Command,
-    config::{Access, PdfConfig, Plenum},
+    commands::{Command, When},
+    config::{Access, PdfConfig, Plenum, Publication},
     members::{self, Member},
     protocol::{self, PdfNote},
     schedule::{self, MeetingKey},
@@ -184,6 +184,11 @@ pub struct Sender {
     pub name: String,
 }
 
+/// What of a meeting's minutes goes into the room: its own setting, else the plenum's.
+fn publication(p: &Plenum, m: &Meeting) -> Publication {
+    m.publication.unwrap_or(p.publication)
+}
+
 /// The meeting `id` of plenum `p` in the state (it must exist).
 fn meeting<'a>(st: &'a mut State, p: &Plenum, id: &str) -> &'a mut Meeting {
     st.plenums
@@ -288,15 +293,13 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         ) else {
             return None;
         };
-        let next: Vec<(MeetingKey, Option<String>)> = next
+        let next: Vec<(MeetingKey, Option<String>, Publication)> = next
             .into_iter()
             .map(|(id, start)| {
-                let link = ps
-                    .meetings
-                    .get(&id)
-                    .filter(|m| m.created)
-                    .map(|m| self.link_of(m));
-                (start, link)
+                let m = ps.meetings.get(&id);
+                let link = m.filter(|m| m.created).map(|m| self.link_of(m));
+                let shared = m.map_or(p.publication, |m| publication(p, m));
+                (start, link, shared)
             })
             .collect();
         let example = url("example");
@@ -428,9 +431,14 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let txn = m.cancel_notice.txn();
         let start = m.start.context("a meeting without a start")?;
         let link = self.link_of(m);
+        let shared = publication(p, m);
         self.save(st).await?;
         self.chat
-            .send(&p.room, &protocol::cancellation(p, start, &link), &txn)
+            .send(
+                &p.room,
+                &protocol::cancellation(p, start, &link, shared),
+                &txn,
+            )
             .await?;
         meeting(st, p, id).cancel_notice.done = true;
         self.save(st).await
@@ -869,18 +877,22 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let doc_id = m.doc_id.clone();
         let start = m.start.context("a meeting without a start")?;
         let moved_from = m.moved_from;
+        let shared = publication(p, m);
         self.save(st).await?;
         // The number of items is only known in the document now; count the list lines.
-        let tops = self
-            .wiki
-            .doc(&doc_id)
-            .await?
-            .map(|d| count_tops(&d.text))
-            .unwrap_or(0);
+        let tops = if shared == Publication::Confidential {
+            0
+        } else {
+            self.wiki
+                .doc(&doc_id)
+                .await?
+                .map(|d| count_tops(&d.text))
+                .unwrap_or(0)
+        };
         self.chat
             .send(
                 &p.room,
-                &protocol::announcement(p, start, &link, tops, moved_from),
+                &protocol::announcement(p, start, &link, tops, moved_from, shared),
                 &txn,
             )
             .await?;
@@ -900,9 +912,14 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let txn = m.remind.txn();
         let link = self.link_of(m);
         let start = m.start.context("a meeting without a start")?;
+        let shared = publication(p, m);
         self.save(st).await?;
         self.chat
-            .send(&p.room, &protocol::reminder(p, start, &link, started), &txn)
+            .send(
+                &p.room,
+                &protocol::reminder(p, start, &link, started, shared),
+                &txn,
+            )
             .await?;
         meeting(st, p, key).remind.done = true;
         self.save(st).await?;
@@ -923,10 +940,20 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             return Ok(());
         };
         let outcome = protocol::extract(&doc.text);
+        // Read at every try: a change in the chat while a step fails reaches the next one.
+        let shared = publication(p, meeting(st, p, key));
         // What the next protocol and the overview carry on with (each close sets it anew,
         // so a repeated close changes nothing).
         {
             let ps = st.plenums.entry(p.key.clone()).or_default();
+            // Tasks of minutes kept out of the chat stay out of it when they come along.
+            if shared != Publication::Full {
+                for task in &outcome.tasks {
+                    if !ps.withheld_tasks.contains(task) {
+                        ps.withheld_tasks.push(task.clone());
+                    }
+                }
+            }
             let date = start.date();
             let carried = |text: &String| Carried {
                 text: text.clone(),
@@ -982,7 +1009,12 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             }
         }
         let c = &meeting(st, p, key).close;
-        if self.pdf.post_to_room && c.pdf_url.is_some() && !c.pdf_room.done && !c.pdf_room_failed {
+        if self.pdf.post_to_room
+            && shared == Publication::Full
+            && c.pdf_url.is_some()
+            && !c.pdf_room.done
+            && !c.pdf_room_failed
+        {
             if let Err(e) = self.post_pdf(st, p, key, &doc, &title, now).await {
                 let c = &mut meeting(st, p, key).close;
                 c.pdf_room_attempts += 1;
@@ -1008,17 +1040,30 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 PdfNote::Fine
             };
             self.save(st).await?;
-            let text =
-                protocol::summary(p, start, &link, &outcome, decisions_link.as_deref(), note);
-            // who a task or a decision mentions in the wiki is mentioned in the chat too
-            let (text, users) = protocol::for_matrix(&text, |name| self.account_of(name));
-            self.chat
-                .send_mentioning(&p.room, &text, &users, &txn)
-                .await?;
+            if shared == Publication::Full {
+                let withheld = &st.plenums[&p.key].withheld_tasks;
+                let shown = protocol::Outcome {
+                    decisions: outcome.decisions.clone(),
+                    tasks: (outcome.tasks.iter())
+                        .filter(|t| protocol::may_share_task(t, withheld))
+                        .cloned()
+                        .collect(),
+                };
+                let text =
+                    protocol::summary(p, start, &link, &shown, decisions_link.as_deref(), note);
+                // who a task or a decision mentions in the wiki is mentioned in the chat too
+                let (text, users) = protocol::for_matrix(&text, |name| self.account_of(name));
+                self.chat
+                    .send_mentioning(&p.room, &text, &users, &txn)
+                    .await?;
+            } else {
+                let text = protocol::closed_note(p, start, &link, shared, note);
+                self.chat.send(&p.room, &text, &txn).await?;
+            }
             meeting(st, p, key).close.summary.done = true;
         }
         meeting(st, p, key).close.done = true;
-        info!(plenum = %p.key, meeting = %key, decisions = outcome.decisions.len(), "Protocol closed");
+        info!(plenum = %p.key, meeting = %key, decisions = outcome.decisions.len(), publication = shared.word(), "Protocol closed");
         self.save(st).await?;
         Ok(())
     }
@@ -1063,7 +1108,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         Ok(())
     }
 
-    fn render_pdf(&self, doc: &Doc, title: &str, now: DateTime<Utc>) -> Result<Vec<u8>> {
+    fn render_pdf(&self, text: &str, title: &str, now: DateTime<Utc>) -> Result<Vec<u8>> {
         let stand = format!(
             "Minutes from the wiki, as of {}",
             now.with_timezone(&self.tz).format("%-d %b %Y %H:%M")
@@ -1071,7 +1116,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         crate::pdf::render(
             title,
             &stand,
-            &doc.text,
+            text,
             std::path::Path::new(&self.pdf.font_dir),
         )
     }
@@ -1088,7 +1133,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     ) -> Result<()> {
         let file = format!("{title}.pdf");
         if meeting(st, p, key).close.pdf_url.is_none() {
-            let pdf = self.render_pdf(doc, title, now)?;
+            let pdf = self.render_pdf(&doc.text, title, now)?;
             let url = self
                 .wiki
                 .attach(&doc.id, &file, "application/pdf", pdf)
@@ -1115,7 +1160,8 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         Ok(())
     }
 
-    /// The PDF as a file in the plenum's room (once).
+    /// The PDF as a file in the plenum's room (once), without the tasks that came along from
+    /// minutes kept out of the chat (the wiki's PDF has them).
     async fn post_pdf(
         &self,
         st: &mut State,
@@ -1127,7 +1173,8 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     ) -> Result<()> {
         let txn = meeting(st, p, key).close.pdf_room.txn();
         self.save(st).await?;
-        let pdf = self.render_pdf(doc, title, now)?;
+        let text = protocol::without_withheld(&doc.text, &st.plenums[&p.key].withheld_tasks);
+        let pdf = self.render_pdf(&text, title, now)?;
         self.chat
             .send_file(&p.room, &format!("{title}.pdf"), pdf, &txn)
             .await?;
@@ -1219,6 +1266,13 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             Command::Close(key) => match self.pick(room, key.as_deref()) {
                 Ok(p) if !self.may_organize(p, &sender.id) => ORGANIZERS_ONLY.to_owned(),
                 Ok(p) => self.request_close(&mut st, p, &sender.id, now),
+                Err(e) => e,
+            },
+            Command::Publish { key, mode, when } => match self.pick(room, key.as_deref()) {
+                Ok(p) => {
+                    self.set_publication(&mut st, p, &sender.id, mode, when, now)
+                        .await
+                }
                 Err(e) => e,
             },
             Command::Invalid(why) => why,
@@ -1330,9 +1384,19 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                         "\nNext meeting: {}",
                         schedule::describe_meeting(start)
                     ));
-                    if let Some(m) = st.plenums[&p.key].meetings.get(&id).filter(|m| m.created) {
-                        line.push_str(&format!("\nMinutes: {}", self.link_of(m)));
+                    let m = st.plenums[&p.key].meetings.get(&id);
+                    let shared = m.map_or(p.publication, |m| publication(p, m));
+                    match m.filter(|m| m.created) {
+                        Some(_) if shared == Publication::Confidential => {
+                            line.push_str("\nMinutes: confidential, in the wiki")
+                        }
+                        Some(m) => line.push_str(&format!("\nMinutes: {}", self.link_of(m))),
+                        None => {}
                     }
+                    line.push_str(&format!(
+                        "\nIn the chat: {}",
+                        protocol::publication_text(shared)
+                    ));
                 }
                 None => line.push_str("\nNo meeting in the calendar."),
             }
@@ -1376,7 +1440,13 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 .meetings
                 .get(&id)
                 .filter(|m| m.created)
-                .map(|m| (id.clone(), m.doc_id.clone(), self.link_of(m)))
+                .map(|m| {
+                    let link = match publication(p, m) {
+                        Publication::Confidential => None,
+                        _ => Some(self.link_of(m)),
+                    };
+                    (id.clone(), m.doc_id.clone(), link)
+                })
         });
         let Some((key, doc_id, link)) = target else {
             st.plenums
@@ -1396,7 +1466,12 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         match self.add_lines(&doc_id, std::slice::from_ref(&line)).await {
             Ok(Some(())) => {
                 info!(plenum = %p.key, meeting = %key, "Agenda item added");
-                format!("✅ On the agenda: {link}")
+                match link {
+                    Some(link) => format!("✅ On the agenda: {link}"),
+                    None => "✅ On the agenda. The minutes are confidential: they are in the \
+                             wiki, not here."
+                        .to_owned(),
+                }
             }
             Ok(None) => "⚠️ The minutes were deleted. Please ask the admins.".to_owned(),
             Err(e) => {
@@ -1433,6 +1508,160 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             "👍 The minutes of {} are closed in a moment: the decisions into the list, the PDF, a summary.",
             start.map(schedule::describe_meeting).unwrap_or_default()
         )
+    }
+
+    /// The meetings not closed yet: the open protocols of meetings that began, and the
+    /// calendar's dates to come, by their start.
+    fn open_meetings(
+        &self,
+        st: &mut State,
+        p: &Plenum,
+        now: DateTime<Utc>,
+    ) -> Vec<(String, MeetingKey)> {
+        let mut list = self.upcoming(st, p, now, usize::MAX);
+        for (id, m) in &st.plenums[&p.key].meetings {
+            let open = m.created && !m.close.done && !m.skipped && !m.cancelled;
+            if let (true, Some(start)) = (open, m.start) {
+                if !list.iter().any(|(other, _)| other == id) {
+                    list.push((id.clone(), start));
+                }
+            }
+        }
+        list.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        list
+    }
+
+    /// `!minutes full|link|confidential [day]`: what of a meeting's minutes goes into the room
+    /// from now on. Without a day it is the meeting whose minutes are open (it began and is
+    /// not closed yet), else the next one. Everyone may share less; sharing more again is for
+    /// the organizers, the admins and who set it (a slip of theirs). Saved before the answer:
+    /// what the answer says holds after a restart too.
+    async fn set_publication(
+        &self,
+        st: &mut State,
+        p: &Plenum,
+        user: &UserId,
+        mode: Publication,
+        when: Option<When>,
+        now: DateTime<Utc>,
+    ) -> String {
+        let open = self.open_meetings(st, p, now);
+        let id = match when {
+            None => match self.current_meeting(st, p, now) {
+                Some(id) => id,
+                None => match open.first() {
+                    Some((id, _)) => id.clone(),
+                    None => return format!("{} has no meeting in the calendar.", p.name),
+                },
+            },
+            Some(when) => {
+                let mut on_day: Vec<&(String, MeetingKey)> =
+                    open.iter().filter(|(_, s)| when.matches(*s)).collect();
+                // a day without its year: the next one (the calendar is read a year ahead)
+                if let (None, Some((_, first))) = (when.year, on_day.first()) {
+                    let day = first.date();
+                    on_day.retain(|(_, s)| s.date() == day);
+                }
+                match on_day.as_slice() {
+                    [(id, _)] => id.clone(),
+                    [] => {
+                        let closed = st.plenums[&p.key]
+                            .meetings
+                            .values()
+                            .any(|m| m.close.done && m.start.is_some_and(|s| when.matches(s)));
+                        return if closed {
+                            format!(
+                                "The minutes of {} on {} are closed already; the chat got \
+                                 what it was set to then.",
+                                p.name,
+                                when.describe()
+                            )
+                        } else {
+                            format!("{} has no open meeting on {}.", p.name, when.describe())
+                        };
+                    }
+                    several => {
+                        let times: Vec<String> = several
+                            .iter()
+                            .map(|(_, s)| s.0.format("%H:%M").to_string())
+                            .collect();
+                        return format!(
+                            "{} has several meetings on {} ({}): please add the time, e.g. \
+                             `!minutes {} {}.{}. {}`.",
+                            p.name,
+                            when.describe(),
+                            times.join(", "),
+                            mode.word(),
+                            when.day,
+                            when.month,
+                            times[0]
+                        );
+                    }
+                }
+            }
+        };
+        // A date of the calendar not prepared yet gets its meeting now, to keep the setting.
+        let ps = st.plenums.get_mut(&p.key).expect("open_meetings made it");
+        if !ps.meetings.contains_key(&id) {
+            let Some(occ) = ps.occurrences.iter().find(|o| o.id == id) else {
+                return format!("{} has no meeting in the calendar.", p.name);
+            };
+            let m = Meeting {
+                doc_id: uuid::Uuid::new_v4().to_string(),
+                start: Some(occ.start),
+                end: occ.end,
+                ..Default::default()
+            };
+            ps.meetings.insert(id.clone(), m);
+        }
+        let m = meeting(st, p, &id);
+        let date = m.start.map(schedule::describe_meeting).unwrap_or_default();
+        let before = publication(p, m);
+        if mode == before {
+            return format!(
+                "{} on {date}: already so. In the chat: {}.",
+                p.name,
+                protocol::publication_text(mode)
+            );
+        }
+        let set_it = m.publication.is_some() && m.publication_by.as_deref() == Some(user.as_str());
+        if mode < before && !self.may_close_early(p, user) && !set_it {
+            return format!(
+                "⛔ Only the organizers or the admins share more of {} on {date} again (or who \
+                 set it to {}).",
+                p.name,
+                before.word()
+            );
+        }
+        let (old, old_by) = (m.publication, m.publication_by.clone());
+        m.publication = Some(mode);
+        m.publication_by = Some(user.to_string());
+        let posted = m.announce.done || m.remind.done;
+        if let Err(e) = self.save(st).await {
+            error!("{e:#}");
+            let m = meeting(st, p, &id);
+            m.publication = old;
+            m.publication_by = old_by;
+            return "⚠️ That could not be saved just now; nothing changed. Please try again in a \
+                    moment."
+                .to_owned();
+        }
+        info!(plenum = %p.key, meeting = %id, from = before.word(), to = mode.word(), by = %user, "Publication set");
+        let icon = match mode {
+            Publication::Full => "📋",
+            Publication::Link => "🔗",
+            Publication::Confidential => "🔒",
+        };
+        let mut answer = format!(
+            "{icon} {} on {date}, from now on in the chat: {}. The minutes are made and closed \
+             in the wiki as usual.",
+            p.name,
+            protocol::publication_text(mode)
+        );
+        if posted && mode == Publication::Confidential {
+            answer.push_str(" The link to them is in the chat already (the announcement).");
+        }
+        answer
     }
 }
 
@@ -1639,6 +1868,9 @@ pub fn help() -> String {
      `!plenum`: when is the next plenum, where are the minutes\n\
      `!top <topic>`: an item for the agenda\n\
      `!minutes done`: close the minutes now (decisions, PDF, summary)\n\
+     `!minutes confidential`, `!minutes link`, `!minutes full`: nothing from the minutes in \
+     the chat, only the link, or the summary (as usual), for the meeting that is on or comes \
+     next; for another add its day: `!minutes confidential 14.11.`\n\
      The meetings are in the plenum's Nextcloud calendar: add, move or cancel them there, or \
      make a series; the bot follows it.\n\n\
      A topic also works like this: reply to a message with `!top`.\n\
@@ -1980,6 +2212,7 @@ mod tests {
             group: None,
             require_group: None,
             access: Access::House,
+            publication: Publication::Full,
         }
     }
 
@@ -3577,6 +3810,371 @@ mod tests {
         assert!(
             a.contains("Finance plenum") && a.contains("House plenum"),
             "{a}"
+        );
+    }
+
+    // ── What of the minutes goes into the chat ───────────────────────────────────
+
+    fn person(id: &str, name: &str) -> Sender {
+        Sender {
+            id: id.try_into().unwrap(),
+            name: name.into(),
+        }
+    }
+
+    async fn say(
+        e: &Engine<FakeWiki, FakeChat>,
+        who: &Sender,
+        s: &str,
+        now: DateTime<Utc>,
+    ) -> String {
+        e.command(&room(), who, cmd(s), now).await
+    }
+
+    /// A restart: a new engine from the state file, with the same wiki and a new chat.
+    async fn restart(t: &mut T) {
+        let path = t._dir.path().join("state.json");
+        let state = State::load(&path).await.unwrap();
+        let old = &mut t.engine;
+        let wiki = std::mem::take(&mut old.wiki);
+        let (plenums, tz, pdf, admins) = (
+            old.plenums.clone(),
+            old.tz,
+            old.pdf.clone(),
+            old.admins.clone(),
+        );
+        t.engine = Engine::new(
+            plenums,
+            tz,
+            wiki,
+            FakeChat::default(),
+            pdf,
+            admins,
+            state,
+            path,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confidential_meeting_keeps_its_minutes_in_the_wiki_and_out_of_the_chat() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.set_people(&[mxbot_common::directory::Person {
+            username: "ben".into(),
+            name: "Ben Berg".into(),
+            accounts: vec!["@ben:house.org".try_into().unwrap()],
+            groups: Default::default(),
+        }]);
+        let now = at(2026, 10, 20, 12, 0);
+        let a = e
+            .command(&room(), &anna(), cmd("!minutes confidential"), now)
+            .await;
+        assert!(
+            a.starts_with("🔒 House plenum on Sunday, 1 November 2026 at 19:00"),
+            "the next meeting: {a}"
+        );
+        e.command(&room(), &anna(), cmd("!top Müll"), now).await;
+
+        e.tick(at(2026, 10, 29, 19, 0)).await; // prepared and announced
+        let doc = e.wiki.by_title("House plenum 2026-11-01").expect("made");
+        assert!(doc.text.contains("* Müll (Anna)"), "chat items still go in");
+        let a = e
+            .command(&room(), &anna(), cmd("!top Kaffee"), at(2026, 10, 30, 9, 0))
+            .await;
+        assert!(
+            a.contains("On the agenda") && !a.contains("wiki.test"),
+            "{a}"
+        );
+        let a = e
+            .command(&room(), &anna(), cmd("!plenum"), at(2026, 10, 30, 9, 0))
+            .await;
+        assert!(
+            a.contains("Minutes: confidential") && !a.contains("2026-11-01"),
+            "{a}"
+        );
+        e.tick(at(2026, 11, 1, 18, 30)).await; // the reminder
+        edit_doc(e, "House plenum 2026-11-01", |t| {
+            t.push_str(
+                "\nDecision: Kompost kommt.\n- [ ] @[Ben Berg](mention://m1/user/u1): Tonne kaufen\n",
+            )
+        });
+        e.tick(at(2026, 11, 2, 9, 0)).await; // closed
+
+        let texts = e.chat.texts();
+        assert_eq!(texts.len(), 3, "announcement, reminder, closed: {texts:?}");
+        for t in &texts {
+            for secret in ["wiki.test", "Kompost", "Tonne", "Ben", "Müll", "item"] {
+                assert!(!t.contains(secret), "{secret} in {t}");
+            }
+        }
+        assert!(texts[2].contains("are closed") && texts[2].contains("confidential"));
+        assert!(
+            e.chat.files.lock().unwrap().is_empty(),
+            "no PDF in the room"
+        );
+        assert!(e.chat.pinged.lock().unwrap().is_empty(), "nobody pinged");
+        // The wiki got everything as always.
+        let decisions = e.wiki.by_title("House plenum: Decisions").unwrap();
+        assert!(
+            decisions.text.contains("* Kompost kommt."),
+            "{}",
+            decisions.text
+        );
+        if e.pdf.enabled {
+            assert_eq!(e.wiki.attachments.lock().unwrap().len(), 1);
+        }
+
+        // The open task comes along to December's minutes, which are shared in full: its
+        // summary has December's own task, not the one from the confidential meeting.
+        e.tick(at(2026, 12, 3, 19, 0)).await;
+        let december = e.wiki.by_title("House plenum 2026-12-06").expect("made");
+        assert!(december.text.contains("Tonne kaufen"), "{}", december.text);
+        assert!(e.chat.texts()[3].contains("wiki.test/doc/house-plenum-2026-12-06"));
+        edit_doc(e, "House plenum 2026-12-06", |t| {
+            t.push_str("\n- [ ] Cara: Liste schreiben\n")
+        });
+        e.tick(at(2026, 12, 7, 9, 0)).await;
+        let summary = e.chat.texts().last().unwrap().clone();
+        assert!(summary.contains("- Cara: Liste schreiben"), "{summary}");
+        assert!(!summary.contains("Tonne"), "{summary}");
+        assert!(e.chat.pinged.lock().unwrap().is_empty());
+        if e.pdf.enabled {
+            // December's PDF in the room leaves the task out; the wiki's has it
+            let wiki = e.wiki.attachments.lock().unwrap()[1].2;
+            let room = e.chat.files.lock().unwrap()[0].2;
+            assert!(room < wiki, "room {room} bytes, wiki {wiki}");
+        }
+    }
+
+    #[tokio::test]
+    async fn link_only_shares_the_link_and_nothing_from_the_minutes() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 29, 19, 0)).await; // announced in full, as before
+        assert!(e.chat.texts()[0].contains("After the meeting a summary comes here"));
+        let a = e
+            .command(
+                &room(),
+                &anna(),
+                cmd("!minutes link"),
+                at(2026, 10, 30, 9, 0),
+            )
+            .await;
+        assert!(a.starts_with("🔗"), "{a}");
+        edit_doc(e, "House plenum 2026-11-01", |t| {
+            t.push_str("\nDecision: Kompost kommt.\n- [ ] Ben: Tonne kaufen\n")
+        });
+        e.tick(at(2026, 11, 1, 18, 30)).await;
+        e.tick(at(2026, 11, 2, 9, 0)).await;
+        let texts = e.chat.texts();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        let link = "https://wiki.test/doc/house-plenum-2026-11-01";
+        assert!(
+            texts[1].contains(link) && texts[2].contains(link),
+            "{texts:?}"
+        );
+        assert!(texts[2].contains("are closed"));
+        assert!(!texts[2].contains("Kompost") && !texts[2].contains("Tonne"));
+        assert!(
+            e.chat.files.lock().unwrap().is_empty(),
+            "no PDF in the room"
+        );
+        let st = e.state.lock().await;
+        assert!(
+            st.plenums["house"].meetings["house-series#2026-11-01"]
+                .close
+                .done
+        );
+        assert_eq!(st.plenums["house"].withheld_tasks, ["Ben: Tonne kaufen"]);
+    }
+
+    #[tokio::test]
+    async fn a_change_reaches_a_close_that_failed_and_holds_after_a_restart() {
+        let mut t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        edit_doc(e, "House plenum 2026-11-01", |t| {
+            t.push_str("\nDecision: Kompost kommt.\n")
+        });
+        // The close begins while Matrix is down: what is for the wiki is done, the chat fails.
+        *e.chat.fail.lock().unwrap() = true;
+        e.tick(at(2026, 11, 2, 9, 0)).await;
+        assert!(
+            !e.state.lock().await.plenums["house"].meetings["house-series#2026-11-01"]
+                .close
+                .done
+        );
+        // Before the next try someone makes it confidential: the meeting whose minutes are open.
+        let a = e
+            .command(
+                &room(),
+                &anna(),
+                cmd("!minutes confidential"),
+                at(2026, 11, 2, 9, 1),
+            )
+            .await;
+        assert!(a.contains("Sunday, 1 November 2026"), "{a}");
+        assert!(
+            a.contains("in the chat already"),
+            "the announcement had the link: {a}"
+        );
+
+        restart(&mut t).await;
+        let e = &t.engine;
+        e.tick(at(2026, 11, 2, 9, 2)).await;
+        let texts = e.chat.texts();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].contains("confidential") && !texts[0].contains("Kompost"));
+        assert!(e.chat.files.lock().unwrap().is_empty());
+        let decisions = e.wiki.by_title("House plenum: Decisions").unwrap();
+        assert_eq!(decisions.text.matches("Kompost kommt").count(), 1);
+        e.tick(at(2026, 11, 2, 9, 3)).await;
+        assert_eq!(e.chat.texts().len(), 1, "closed once");
+    }
+
+    #[tokio::test]
+    async fn everyone_shares_less_and_only_some_share_more_again() {
+        let mut p = plenum("house", "House plenum", "!house:x");
+        p.organizers = HashSet::from(["@orga:x".try_into().unwrap()]);
+        let t = setup(vec![p]);
+        let e = &t.engine;
+        let now = at(2026, 10, 20, 12, 0);
+        let (anna, ben) = (anna(), person("@ben:x", "Ben"));
+        let (orga, admin) = (person("@orga:x", "Orga"), person("@admin:x", "Admin"));
+        let say = |who, s| say(e, who, s, now);
+        assert!(say(&anna, "!minutes confidential").await.starts_with("🔒"));
+        assert!(say(&ben, "!minutes full").await.starts_with("⛔"));
+        assert!(
+            say(&ben, "!minutes link").await.starts_with("⛔"),
+            "link shares more"
+        );
+        assert!(say(&anna, "!minutes confidential")
+            .await
+            .contains("already so"));
+        // who set it takes it back
+        assert!(say(&anna, "!minutes link").await.starts_with("🔗"));
+        assert!(say(&ben, "!minutes confidential").await.starts_with("🔒"));
+        assert!(
+            say(&anna, "!minutes full").await.starts_with("⛔"),
+            "Ben set it now"
+        );
+        assert!(say(&orga, "!minutes link").await.starts_with("🔗"));
+        assert!(say(&admin, "!minutes full").await.starts_with("📋"));
+        let st = e.state.lock().await;
+        let m = &st.plenums["house"].meetings["house-series#2026-11-01"];
+        assert_eq!(m.publication, Some(Publication::Full));
+        assert_eq!(m.publication_by.as_deref(), Some("@admin:x"));
+        assert!(!m.created, "a setting makes no protocol early");
+    }
+
+    #[tokio::test]
+    async fn a_plenum_can_be_confidential_by_default() {
+        let mut p = plenum("finance", "Finance plenum", "!house:x");
+        p.publication = Publication::Confidential;
+        let t = setup(vec![p]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        let texts = e.chat.texts();
+        assert!(
+            texts[0].starts_with("🔒") && !texts[0].contains("wiki.test"),
+            "{texts:?}"
+        );
+        // sharing more than the config says is for the organizers and the admins
+        let a = e
+            .command(
+                &room(),
+                &anna(),
+                cmd("!minutes link"),
+                at(2026, 10, 30, 9, 0),
+            )
+            .await;
+        assert!(a.starts_with("⛔"), "{a}");
+        let admin = person("@admin:x", "Admin");
+        let a = e
+            .command(
+                &room(),
+                &admin,
+                cmd("!minutes link"),
+                at(2026, 10, 30, 9, 0),
+            )
+            .await;
+        assert!(a.starts_with("🔗"), "{a}");
+        e.tick(at(2026, 11, 1, 18, 30)).await;
+        assert!(e.chat.texts()[1].contains("wiki.test/doc/finance-plenum-2026-11-01"));
+    }
+
+    #[tokio::test]
+    async fn a_day_picks_the_meeting_and_the_setting_follows_it_through_the_calendar() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        let now = at(2026, 10, 20, 12, 0);
+        let anna = anna();
+        let say = |s, now| say(e, &anna, s, now);
+        calendar(
+            e,
+            "house",
+            |l| l.push(occ("next-year", "2027-12-06 19:00")),
+            now,
+        )
+        .await;
+        let a = say("!minutes confidential 6.12.", now).await;
+        assert!(
+            a.contains("Sunday, 6 December 2026"),
+            "the next 6 December: {a}"
+        );
+        let a = say("!minutes confidential 7.12.", now).await;
+        assert!(a.contains("no open meeting on 7 Dec"), "{a}");
+        calendar(
+            e,
+            "house",
+            |l| l.push(occ("extra", "2026-12-06 10:00")),
+            now,
+        )
+        .await;
+        let a = say("!minutes link 6.12.", now).await;
+        assert!(
+            a.contains("several meetings") && a.contains("10:00, 19:00"),
+            "{a}"
+        );
+        let a = say("!minutes link 6.12. 10:00", now).await;
+        assert!(a.starts_with("🔗") && a.contains("10:00"), "{a}");
+        let a = say("!plenum", now).await;
+        assert!(
+            a.contains("In the chat: the link, and after"),
+            "November in full: {a}"
+        );
+
+        // November is shared as always.
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        e.tick(at(2026, 11, 2, 9, 0)).await;
+        assert!(e.chat.texts()[0].contains("wiki.test"));
+        let a = say("!minutes confidential 1.11.", at(2026, 11, 2, 10, 0)).await;
+        assert!(a.contains("closed already"), "{a}");
+
+        // December's meeting moves a day in the calendar: it keeps its setting.
+        calendar(
+            e,
+            "house",
+            |l| {
+                for o in l.iter_mut().filter(|o| o.id == "house-series#2026-12-06") {
+                    *o = occ(&o.id.clone(), "2026-12-07 19:00");
+                }
+            },
+            at(2026, 11, 20, 12, 0),
+        )
+        .await;
+        e.tick(at(2026, 12, 4, 19, 0)).await;
+        let texts = e.chat.texts();
+        let december: Vec<&String> = texts
+            .iter()
+            .filter(|t| t.contains("7 December 2026"))
+            .collect();
+        assert_eq!(december.len(), 1, "{texts:?}");
+        assert!(december[0].starts_with("🔒") && !december[0].contains("wiki.test"));
+        let extra: Vec<&String> = texts.iter().filter(|t| t.contains("10:00")).collect();
+        assert!(
+            extra.iter().all(|t| t.contains("only the link")),
+            "{extra:?}"
         );
     }
 }

@@ -38,11 +38,38 @@ container's `TZ`.
 | `!plenum` | next date and the protocol's link |
 | `!top <topic>` | an item for the agenda (waits for the protocol if it does not exist yet) |
 | `!minutes done` | close the protocol now (decisions, PDF, summary). While the meeting is on only `organizers` and the admins; after its end everyone (or `organizers` only, if set) |
+| `!minutes confidential` | nothing from this meeting's minutes comes into the chat (see below) |
+| `!minutes link` | only the link to them |
+| `!minutes full` | the summary again, as usual |
 | `!top` as a reply | the message it answers is the topic (by its author) |
 | `!plenum help` | this list |
 
 Several plenums in one room: the key goes along, `!top kitchen-floor-1 dishwasher`. Commands
 older than 15 minutes (a fresh Matrix store syncs the rooms' history) are left alone.
+
+## What goes into the chat
+
+Per meeting, set in its room; for a plenum by `publication` in its `[[plenum]]` (default
+`[defaults] publication`, `full`). The minutes are made, filled from `!top`, closed, filed,
+attached as a PDF and their decisions listed in the wiki the same way in every mode; only
+what the room gets differs:
+
+| | `full` (default) | `link` | `confidential` |
+|---|---|---|---|
+| announcement, reminder, cancellation | with the link | with the link | when, no link, no item count |
+| answer to `!top`, `!plenum` | with the link | with the link | without it |
+| when closed | summary: decisions, open tasks, mentions; the PDF | that it is closed, the link | that it is closed |
+
+`!minutes confidential|link|full` is for the meeting whose minutes are open (it began and is not
+closed yet), else the next one; another one by its day, `!minutes confidential 14.11.` (also
+`14.11.2026`, `2026-11-14`, and `14.11. 19:00` when two are on one day). The answer names the
+meeting. Everyone in the room may share less; sharing more again is for the `organizers`, the
+admins and whoever set it. The setting is saved with the meeting before the answer, kept when
+it moves in the calendar, and read by every step when it sends: a close that failed, or a
+restart, sends what the meeting is set to now. What went out already stays (an announcement
+with the link, say); a closed meeting cannot be changed any more. Open tasks of a meeting that
+was not shared in full stay out of the summaries of later meetings they come along to (as long
+as their text is unchanged). The overview in the wiki marks such meetings.
 
 ## In Outline
 

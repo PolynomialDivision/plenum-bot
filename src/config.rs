@@ -12,7 +12,7 @@ use mxbot_common::{
     directory::DirectoryConfig,
     matrix_sdk::ruma::{OwnedRoomId, OwnedUserId},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Environment variable with the Outline API key (overrides `[outline] api_key`).
 pub const API_KEY_ENV: &str = "OUTLINE_API_KEY";
@@ -113,6 +113,44 @@ pub enum Access {
     Private,
 }
 
+/// What of a meeting's minutes goes into the plenum's room. The minutes are made, closed,
+/// filed and kept in the wiki the same way in every mode; only the chat differs. Ordered
+/// from the most to the least shared.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum Publication {
+    /// The link before the meeting, a summary after it (decisions, open tasks, who has a
+    /// task is mentioned) and the PDF: how it always was.
+    #[default]
+    Full,
+    /// Only the links: the announcement, the reminder and that the minutes are closed, with
+    /// the link to them; no decisions, tasks or PDF.
+    Link,
+    /// Nothing from the wiki: when the meeting is, that it is cancelled or closed, without a
+    /// link, an agenda count, a summary or the PDF.
+    Confidential,
+}
+
+impl Publication {
+    /// The word of the chat command (`!minutes confidential`).
+    pub fn from_word(word: &str) -> Option<Self> {
+        match word.to_lowercase().as_str() {
+            "full" | "summary" => Some(Self::Full),
+            "link" | "links" => Some(Self::Link),
+            "confidential" => Some(Self::Confidential),
+            _ => None,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Link => "link",
+            Self::Confidential => "confidential",
+        }
+    }
+}
+
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct OutlineConfig {
@@ -145,6 +183,9 @@ pub struct Defaults {
     /// The protocol is closed (decisions collected, PDF, summary) this many hours after the
     /// end, unless someone says `!minutes done` earlier.
     pub close_after_hours: u32,
+    /// What of a meeting's minutes goes into the chat, unless it is set for the meeting
+    /// (`!minutes link`, `!minutes confidential`).
+    pub publication: Publication,
 }
 
 impl Default for Defaults {
@@ -155,6 +196,7 @@ impl Default for Defaults {
             remind_minutes: 30,
             duration_minutes: 120,
             close_after_hours: 12,
+            publication: Publication::Full,
         }
     }
 }
@@ -220,6 +262,10 @@ pub struct PlenumConfig {
     pub require_group: Option<String>,
     #[serde(default)]
     pub access: Access,
+    /// What of its meetings' minutes goes into its room, unless set for a meeting in the chat
+    /// (`full`, `link`, `confidential`); default `[defaults] publication`.
+    #[serde(default)]
+    pub publication: Option<Publication>,
 }
 
 /// A plenum with every default applied and every ID parsed.
@@ -240,6 +286,8 @@ pub struct Plenum {
     /// Only the members of `group` who are in this group too count (None: all of them).
     pub require_group: Option<String>,
     pub access: Access,
+    /// For a meeting nobody set it for.
+    pub publication: Publication,
 }
 
 impl Plenum {
@@ -404,6 +452,7 @@ impl Config {
                 group,
                 require_group,
                 access: p.access,
+                publication: p.publication.unwrap_or(self.defaults.publication),
             });
         }
         Ok(out)
@@ -459,6 +508,34 @@ readers = ["calendar-bot"]
 
     fn parse(extra: &str) -> Config {
         toml::from_str(&format!("{BASE}{extra}")).unwrap()
+    }
+
+    #[test]
+    fn what_goes_into_the_chat_is_full_unless_the_config_says_otherwise() {
+        let plenum = |key: &str, extra: &str| {
+            format!(
+                "[[plenum]]\nkey = \"{key}\"\nname = \"{key}\"\nroom = \"!{key}:example.org\"\n\
+                 collection = \"{key}\"\n{extra}\n"
+            )
+        };
+        let c = parse(&format!(
+            "{}{}",
+            plenum("house", ""),
+            plenum("finance", "publication = \"confidential\"")
+        ));
+        let ps = c.plenums().unwrap();
+        assert_eq!(ps[0].publication, Publication::Full, "as before");
+        assert_eq!(ps[1].publication, Publication::Confidential);
+        let c = parse(&format!(
+            "[defaults]\npublication = \"link\"\n{}",
+            plenum("house", "")
+        ));
+        assert_eq!(c.plenums().unwrap()[0].publication, Publication::Link);
+        let wrong = format!("{BASE}{}", plenum("house", "publication = \"secret\""));
+        assert!(toml::from_str::<Config>(&wrong).is_err());
+        assert!(
+            Publication::Full < Publication::Link && Publication::Link < Publication::Confidential
+        );
     }
 
     #[test]

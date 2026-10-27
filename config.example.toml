@@ -31,6 +31,8 @@ prepare_days = 3        # protocol created and announced this many days before
 remind_minutes = 30     # 0 = no reminder
 duration_minutes = 120
 close_after_hours = 12  # closed this long after the end (or with !minutes done)
+publication = "full"    # what of a meeting's minutes goes into the chat: full | link | confidential
+                        # (a meeting's own, set with !minutes confidential, comes first)
 
 [pdf]
 enabled = true
@@ -68,3 +70,4 @@ access = "members"                # everyone reads, the group writes (house | me
 #                                 # and private: the house plenum's group; "" for none
 prepare_days = 1
 organizers = ["@anna:example.org"]
+# publication = "link"            # this plenum's meetings share only the link by default

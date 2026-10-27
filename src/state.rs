@@ -10,13 +10,18 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{calendar::Occurrence, members::RoomMembers, schedule::MeetingKey};
+use crate::{
+    calendar::Occurrence, config::Publication, members::RoomMembers, schedule::MeetingKey,
+};
 
 /// Meetings kept per plenum; older ones are dropped (their protocols stay in Outline).
 const KEEP_MEETINGS: usize = 60;
 
 /// Decisions the overview shows (the full list is the decision document).
 pub const KEEP_DECISIONS: usize = 10;
+
+/// Withheld tasks kept per plenum (the newest): far more than ever stay open at once.
+const KEEP_WITHHELD: usize = 200;
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct State {
@@ -66,6 +71,11 @@ pub struct PlenumState {
     /// The latest decisions (newest last), for the overview.
     #[serde(default)]
     pub decisions: Vec<Carried>,
+    /// The open tasks of closed meetings whose minutes did not go into the chat (link only,
+    /// confidential), as read from them. They come along to the next minutes like any task;
+    /// a later meeting's summary leaves out every task that contains one of them.
+    #[serde(default)]
+    pub withheld_tasks: Vec<String>,
     /// The calendar's occurrences as last read (kept while the calendar cannot be read).
     #[serde(default)]
     pub occurrences: Vec<Occurrence>,
@@ -140,6 +150,14 @@ pub struct Meeting {
     /// came back: announced again right away, not only `prepare_days` before.
     #[serde(default)]
     pub announce_again: bool,
+    /// What of its minutes goes into the room, as set in the chat (`!minutes confidential`);
+    /// None: the plenum's `publication`. Every step reads it when it sends, so a change
+    /// reaches the steps still to come, after a failed try or a restart too.
+    #[serde(default)]
+    pub publication: Option<Publication>,
+    /// Who set `publication`: they may take it back.
+    #[serde(default)]
+    pub publication_by: Option<String>,
 }
 
 /// A message that is sent once: its transaction ID, then whether it went out.
@@ -210,6 +228,10 @@ impl PlenumState {
             };
             self.meetings.remove(&oldest);
         }
+        if self.withheld_tasks.len() > KEEP_WITHHELD {
+            self.withheld_tasks
+                .drain(..self.withheld_tasks.len() - KEEP_WITHHELD);
+        }
         if self.decisions.len() > KEEP_DECISIONS {
             self.decisions
                 .drain(..self.decisions.len() - KEEP_DECISIONS);
@@ -256,6 +278,23 @@ mod tests {
             p.meetings[&key].start.unwrap().to_string(),
             "2026-11-01 19:00"
         );
+    }
+
+    #[test]
+    fn a_state_from_before_publication_settings_shares_as_before() {
+        let json = r#"{"plenums":{"house":{"meetings":{"m1":{"doc_id":"d1","created":true}}}}}"#;
+        let st: State = serde_json::from_str(json).unwrap();
+        let ps = &st.plenums["house"];
+        assert_eq!(ps.meetings["m1"].publication, None, "the plenum's default");
+        assert!(ps.withheld_tasks.is_empty());
+        let mut m = Meeting {
+            publication: Some(Publication::Confidential),
+            ..Default::default()
+        };
+        m.publication_by = Some("@anna:x".into());
+        let back: Meeting = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.publication, Some(Publication::Confidential));
+        assert_eq!(back.publication_by.as_deref(), Some("@anna:x"));
     }
 
     #[test]
