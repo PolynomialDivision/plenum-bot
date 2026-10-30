@@ -83,6 +83,12 @@ pub struct CalendarConfig {
     pub web_url: String,
 }
 
+impl CalendarConfig {
+    pub fn refresh(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.refresh_minutes.max(1) * 60)
+    }
+}
+
 fn default_caldav_password_env() -> String {
     "CALDAV_PASSWORD".to_owned()
 }

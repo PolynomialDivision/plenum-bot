@@ -43,6 +43,7 @@ use mxbot_common::{
         },
         Client, Room, RoomMemberships, RoomState,
     },
+    supervise::{supervise_ticking, Alive},
     Bot,
 };
 use tracing::{error, info, warn};
@@ -245,17 +246,33 @@ async fn main() -> Result<()> {
             warn!(plenum = %p.key, room = %p.room, "Not in the plenum's room: posts there fail until it is joined");
         }
     }
-    tokio::spawn(calendar_loop(
-        Arc::clone(&engine),
-        nextcloud,
-        config.calendar.clone(),
-    ));
-    tokio::spawn(ticker(Arc::clone(&engine)));
+    // A loop that ends ends the bot (restarted by Docker); one without a round for three
+    // pauses plus a slow round makes the container unhealthy.
+    supervise_ticking(
+        "plenum calendars",
+        3 * (config.calendar.refresh() + SLOW_ROUND),
+        |alive| {
+            calendar_loop(
+                Arc::clone(&engine),
+                nextcloud,
+                config.calendar.clone(),
+                alive,
+            )
+        },
+    );
+    // A tick may wait on Outline and Matrix many times (a close with its PDF).
+    supervise_ticking("plenum ticker", Duration::from_secs(15 * 60), |alive| {
+        ticker(Arc::clone(&engine), alive)
+    });
     match (&config.directory, config.members.enabled) {
         (Some(dir), true) if engine.plenums.iter().any(|p| p.group.is_some()) => {
             match Directory::new(dir, &bot.user_id) {
                 Ok(directory) => {
-                    tokio::spawn(members_loop(Arc::clone(&engine), directory));
+                    supervise_ticking(
+                        "room members",
+                        3 * (directory.config().refresh() + SLOW_ROUND),
+                        |alive| members_loop(Arc::clone(&engine), directory, alive),
+                    );
                 }
                 Err(e) => warn!("Rooms: {e:#}; no room is managed"),
             }
@@ -265,9 +282,13 @@ async fn main() -> Result<()> {
     bot.run().await
 }
 
+/// The longest a round of the calendar or members loop normally takes, for their health check.
+const SLOW_ROUND: Duration = Duration::from_secs(5 * 60);
+
 /// Every minute, on the minute.
-async fn ticker(engine: Arc<PlenumEngine>) {
+async fn ticker(engine: Arc<PlenumEngine>, alive: Alive) {
     loop {
+        alive.tick();
         engine.tick(chrono::Utc::now()).await;
         let secs = 60 - chrono::Utc::now().timestamp().rem_euclid(60) as u64;
         tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
@@ -282,10 +303,12 @@ async fn calendar_loop(
     engine: Arc<PlenumEngine>,
     nextcloud: calendar::Nextcloud,
     cfg: config::CalendarConfig,
+    alive: Alive,
 ) {
-    let every = Duration::from_secs(cfg.refresh_minutes.max(1) * 60);
+    let every = cfg.refresh();
     let mut managed_at: Option<std::time::Instant> = None;
     loop {
+        alive.tick();
         let manage =
             cfg.manage && managed_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(3600));
         for p in &engine.plenums {
@@ -351,9 +374,10 @@ async fn keep_calendar(
 /// The groups from the directory now and every `refresh_minutes`, the rooms after them.
 /// While the directory cannot be read (its people or which groups exist), the rooms stay as
 /// they are; a group that exists with nobody in it empties its room.
-async fn members_loop(engine: Arc<PlenumEngine>, directory: Directory) {
+async fn members_loop(engine: Arc<PlenumEngine>, directory: Directory, alive: Alive) {
     let wanted = config::directory_groups(&engine.plenums);
     loop {
+        alive.tick();
         let read = async {
             let people = directory.people().await?;
             // who the wiki's @ mentions are, for the summaries in the chat
