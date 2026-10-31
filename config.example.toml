@@ -49,16 +49,21 @@ matrix_ids_attribute = "matrix_ids"   # a person's other accounts, entered by an
 # verified_attribute = "matrix_verified"     # the accounts the person proved (link codes)
 # preferred_attribute = "matrix_preferred"   # the account the person chose: invited
 # stale_after_minutes = 60                   # an older last good read changes no room
+# link_request_attribute = "matrix_link_request"  # requests from the settings: the bot invites
+#                                                 # the account and sends the code (needs MATRIX_LINK_KEY)
 # token: DIRECTORY_TOKEN in the environment (token_env)
 
-# The rooms of plenums with a group follow it: each member's chosen account is invited, their
-# other accounts stay; never removed: these, and room admins.
+# The rooms of plenums with a group follow it: each member's chosen account is invited and
+# stays, their other accounts stay for a handover (all of them while they have not chosen);
+# never removed: these, and room admins.
 [members]
 enabled = true
 keep = ["@calendar-bot:example.org"]
 ask_to_choose = false   # write to members who have not chosen their account (needs choose_url)
 # where people choose their account and enter link codes (also named in the !link answer)
 choose_url = "https://login.example.org/if/flow/house-matrix-accounts/"
+handover_days = 7        # other accounts stay this long after the chosen one joined the room…
+handover_max_days = 30   # …and at most this long after the choice, joined or not (each 1–365)
 # link codes (!link <username>): MATRIX_LINK_KEY in the environment
 
 [[plenum]]

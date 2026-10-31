@@ -8,6 +8,12 @@
 //! a direct chat (the code would be read by others), more than [`PER_HOUR`] codes per account
 //! and hour, and old messages (history a fresh store brings back). Without the key
 //! (`MATRIX_LINK_KEY`) the bot says linking is not set up. The code is never logged.
+//!
+//! The same code also goes out without `!link`: a person who names the account in the
+//! provider's flow gets an invitation to that account and the code there
+//! ([`crate::link_delivery`]). Who may open a direct chat with the bot is mxbot-common's
+//! invite policy: the admins, members of `dm_rooms`, every account the directory knows as an
+//! active person's, and an account a person just asked to link.
 
 use std::{
     collections::HashMap,
@@ -55,6 +61,11 @@ impl LinkDesk {
 
     pub fn enabled(&self) -> bool {
         self.key.is_some()
+    }
+
+    /// The key (for the codes sent on link requests, [`crate::link_delivery`]).
+    pub fn key(&self) -> Option<&[u8]> {
+        self.key.as_deref()
     }
 
     /// The answer to `body` from `sender`, when it is `!link`. `direct`: the room is a direct

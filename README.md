@@ -15,12 +15,33 @@ directory:
 
 - **invited**: the account each member *chose* for the house (`matrix_preferred`: their house
   account or a link they verified), once; who leaves on their own is not invited again while
-  the account stays theirs, a failed invitation is tried again a day later. Nobody who has not
+  the account stays theirs, a failed invitation is tried again a day later. While another
+  account of the member is in the room (a handover is due) and the chosen one is not, it is
+  invited once more per handover, even if it was invited before (declined, or joined and
+  left: an older bot's invitation, say). Nobody who has not
   chosen is invited: with `ask_to_choose` the bot writes to them (house account and verified
   links, German, at most three times, two weeks apart) where to choose (`choose_url`);
-- **kept**: every account the directory knows as a member's (the house account, links an admin
-  entered, verified links, an older chosen account), the house's bots and `keep`, and the
-  room's admins (power level 100);
+- **kept**: one account per member, the one they chose; while they have not chosen (or their
+  choice cannot be used), every account the directory knows as theirs (the house account,
+  links an admin entered, verified links). The house's bots and `keep`, and the room's admins
+  (power level 100), always;
+- **handed over**: a member's other accounts in the room once they chose one (the house
+  account that joined on its own, an older choice, a link an admin entered) stay until
+  `handover_days` (7) after the bot first saw the chosen account *joined* there, at most
+  `handover_max_days` (30) after it first saw the choice there (each at most 365); then they
+  are removed like anyone else's (counted against the limit below, held the same way), with
+  the reason "Ersetzt durch dein gewähltes Konto @… (Einstellungen → Matrix-Konten)", but only
+  while the chosen account is in the room (joined, or invited): a handover never removes a
+  member's last account there. When the chosen account is neither (its invitation failed, or
+  it declined or left after the handover's own invitation) the other accounts stay, as the
+  member's recognised accounts they are, and `!members` says why. Once per choice the bot
+  writes to the chosen account (German: which account stays, which ones go by when, in which
+  rooms, whether an invitation waits for it or it is not in a room yet, where to change it;
+  whatever `ask_to_choose` says, since this follows the member's own choice); if that fails,
+  `!members` still lists it. A new choice starts a new
+  handover, and an account given up is invited again when it is chosen again. The first
+  round with this image starts every handover then, so nobody goes before the grace; who
+  already chose a link while the house account is still in a room hears of it then;
 - **removed**: everyone else (a kick; the bot never bans, deactivates or changes power levels);
 - **left alone**: an account two people claim, in a room where one of them belongs (neither
   invited nor removed); where none of them belongs it goes like anyone else's. The admins hear
@@ -55,8 +76,45 @@ chat with the bot answers with the link code for that house user and that accoun
 (mxbot-common `link`), to be entered in the identity provider's flow (`choose_url`) while
 logged in as that user. House accounts are refused, five codes per account and hour, old
 messages are ignored, and the code is never logged. The key is `MATRIX_LINK_KEY` in the
-environment; without it the bot answers that linking is not set up. Who may open a direct
-chat with the bot is `[security]` (`allowed_inviters`, `dm_rooms`).
+environment; without it the bot answers that linking is not set up.
+
+**Link requests from the settings.** A person who names an account in the flow without a code
+gets a link request (`[directory] link_request_attribute`, `matrix_link_request`: `{"id",
+"at"}`). With `[directory]` and `MATRIX_LINK_KEY` the bot reads the requests every 20 s
+(Authentik filtered to the users with one), and for each fresh one (younger than 30 minutes)
+opens a direct chat with that account (an existing private one, else a new encrypted one
+inviting it) saying which house login asked ("🔗 Die Haus-Anmeldung `<login>` möchte dieses
+Matrix-Konto `…` verknüpfen"), and once the account has joined sends the code of the current
+slot, the same as `!link` gives. The account may be anyone's, so the messages name only the
+login (as code, which the person cannot change), never the name they show (which they edit
+themselves). Only the people in the groups whose rooms the bot manages (the plenums' `group`
+and `require_group`) may ask: a guest's or a former resident's request is not read. Not
+served: an account on the house's server, one the person has proved already, one another
+active person claims (from the bot's own full read of the directory every `refresh_minutes`),
+a request withdrawn or replaced meanwhile. At most 5 deliveries per person a day, 3 a day to
+one account (whoever asks) and 30 an hour in all (more are skipped: logged, counted in the
+status file); an account that has not joined within 30 minutes, or Matrix failing 5 times, is
+given up, never retried (the person asks again). Every request taken up is in
+`store/state.json` (`link_requests`, a day long, saved before the invitation), so a restart
+sends nothing twice; refused and skipped requests are one record per person (the newest, with
+how many it stands for), so a script asking every minute does not grow the file. The code is
+in the message only. Status file: task `link requests` (the directory down, unreachable,
+timing out or answering 5xx/429, is `unavailable`, never unhealthy; a refused token or an
+answer the bot cannot read is `failed`, unhealthy after its time), queue `link_codes` (waiting
+for their account), gauges `link_codes_skipped`, `link_codes_gave_up` (the last day). The same
+holds for the task `room members`. When Authentik refuses the link-request filter (400), the
+bot reads every active user instead for the rest of its run (one warning).
+
+**Who may open a direct chat with the bot**: the admins, `[security] allowed_inviters` and
+members of `dm_rooms` as before, and with link requests served also every account the
+directory recognises as an active person's in the groups whose rooms the bot manages (house
+account and links, while the bot's last full read is fresh; not a guest's or a former
+resident's) and the account of a fresh link request (for 30 minutes). Such a chat is kept only
+while it is the bot and that account alone, encrypted; a non-admin can only use `!link` in it.
+Direct-chat invites that came while the bot was down wait for its first read of the directory
+instead of being rejected. The bot's own room (where `!plenum` shows every plenum) is known by
+its room ID, which the bot asks its own homeserver for (the alias `#<bot localpart>:<server>`),
+never by the alias a room names itself: anyone who makes a room can set that.
 
 The dates are the plenum's Nextcloud calendar (`[calendar]`; one per plenum, `plenum-<key>`,
 owned by the bot's own Nextcloud account, which makes it and shares it by `access`: the house
@@ -85,7 +143,7 @@ container's `TZ`.
 | `!plenum help` | this list |
 
 In an admin's direct chat with the bot: `!plenum` (every plenum), `!members` (the held
-removals and their digests), `!members confirm <plenum key|room> <digest>`. In a direct chat from an account on another
+removals and their digests, the running handovers and their end dates), `!members confirm <plenum key|room> <digest>`. In a direct chat from an account on another
 server: `!link <username>`.
 
 Several plenums in one room: the key goes along, `!top kitchen-floor-1 dishwasher`. Commands

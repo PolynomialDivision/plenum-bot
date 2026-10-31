@@ -27,13 +27,70 @@ const KEEP_WITHHELD: usize = 200;
 pub struct State {
     #[serde(default)]
     pub plenums: BTreeMap<String, PlenumState>,
-    /// Per room ID: whom the bot invited there and removals held (rooms of plenums with a
-    /// group).
+    /// Per room ID: whom the bot invited there, failed invitations, removals held and the
+    /// running handovers (a member's other accounts kept for a while after their choice;
+    /// rooms of plenums with a group).
     #[serde(default)]
     pub rooms: BTreeMap<String, Remembered>,
     /// Per person (the directory's id): asked to choose an account, admins told about them.
     #[serde(default)]
     pub people: Notices,
+    /// Link requests from the provider's flow the bot took up, by the request's key
+    /// ([`mxbot_common::directory::LinkRequest::key`]: person, account, time), for a day: a
+    /// restart sends no invitation or code twice, and the day's deliveries are counted.
+    #[serde(default)]
+    pub link_requests: BTreeMap<String, LinkDelivery>,
+}
+
+/// One link request the bot took up ([`crate::link_delivery`]). Holds no code: the code is
+/// made when it is sent.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LinkDelivery {
+    /// The person who asked (the directory's id) and their login (all the account is told of
+    /// them; the name they show is not kept).
+    pub person: String,
+    pub username: String,
+    /// The account to link.
+    pub account: String,
+    /// When the person asked, and when the bot took it up.
+    pub requested_at: DateTime<Utc>,
+    pub handled_at: DateTime<Utc>,
+    pub outcome: LinkOutcome,
+    /// The direct chat with the account (once opened).
+    #[serde(default)]
+    pub room: Option<String>,
+    /// The first message (who asked) is in it.
+    #[serde(default)]
+    pub introduced: bool,
+    /// Failed attempts at opening the chat or sending the code.
+    #[serde(default)]
+    pub attempts: u32,
+    /// Why it was refused, skipped or given up.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// A refused or skipped record stands for the person's earlier ones too (one per person,
+    /// [`crate::link_delivery`]): how many it replaced.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub repeats: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkOutcome {
+    /// The account is (being) invited; the code goes out once it has joined.
+    Pending,
+    /// The code went out.
+    Sent,
+    /// Not joined in time, the request withdrawn or replaced, or Matrix failed too often.
+    GaveUp,
+    /// Over a rate limit: nobody was invited.
+    Skipped,
+    /// Not to be served (linked already, someone else's account, the house's server).
+    Refused,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
@@ -299,6 +356,28 @@ mod tests {
         let back: Meeting = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back.publication, Some(Publication::Confidential));
         assert_eq!(back.publication_by.as_deref(), Some("@anna:x"));
+    }
+
+    #[test]
+    fn a_state_from_before_link_requests_has_none() {
+        let st: State = serde_json::from_str(r#"{"plenums":{}}"#).unwrap();
+        assert!(st.link_requests.is_empty());
+        let d = LinkDelivery {
+            person: "u-anna".into(),
+            username: "anna".into(),
+            account: "@anna:matrix.org".into(),
+            requested_at: "2026-10-31T10:00:00Z".parse().unwrap(),
+            handled_at: "2026-10-31T10:00:05Z".parse().unwrap(),
+            outcome: LinkOutcome::GaveUp,
+            room: Some("!dm:x".into()),
+            introduced: true,
+            attempts: 2,
+            reason: Some("not joined within 30 minutes".into()),
+            repeats: 0,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""outcome":"gave_up""#), "{json}");
+        assert_eq!(serde_json::from_str::<LinkDelivery>(&json).unwrap(), d);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use mxbot_common::{
     config::{MatrixConfig, SecurityConfig},
     directory::DirectoryConfig,
     matrix_sdk::ruma::{OwnedRoomId, OwnedUserId},
+    membership::Grace,
 };
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,9 @@ pub struct Config {
     pub plenums: Vec<PlenumConfig>,
 }
 
+/// The longest `[members] handover_days` and `handover_max_days`: a year.
+pub const HANDOVER_DAYS_MAX: u32 = 365;
+
 /// The rooms of plenums with a group follow it: the chosen account of each member is invited,
 /// accounts of nobody in it are removed (mxbot-common `membership`).
 #[derive(Deserialize, Clone, Debug)]
@@ -51,6 +55,11 @@ pub struct MembersConfig {
     /// Where people choose their account and link others (the identity provider's flow
     /// `house-matrix-accounts`), for that message and the answer to `!link`.
     pub choose_url: Option<String>,
+    /// After a member chose an account, their other accounts in a room stay this many days
+    /// after the chosen one joined it (mxbot-common `membership::Grace`)…
+    pub handover_days: u32,
+    /// …and this many days at most after the bot first saw the choice, joined or not.
+    pub handover_max_days: u32,
 }
 
 impl Default for MembersConfig {
@@ -60,6 +69,8 @@ impl Default for MembersConfig {
             keep: Vec::new(),
             ask_to_choose: false,
             choose_url: None,
+            handover_days: 7,
+            handover_max_days: 30,
         }
     }
 }
@@ -73,10 +84,39 @@ impl MembersConfig {
             .filter(|u| !u.is_empty())
     }
 
-    /// Asking people to choose needs the address where they do it.
+    /// The handover's lengths.
+    pub fn grace(&self) -> Grace {
+        Grace {
+            after_join: chrono::Duration::days(self.handover_days.into()),
+            max: chrono::Duration::days(self.handover_max_days.into()),
+        }
+    }
+
+    /// Asking people to choose needs the address where they do it; a handover lasts at least
+    /// a day and at most [`HANDOVER_DAYS_MAX`] (a typo of many digits would otherwise reach
+    /// past any date, and an old account would stay for good), and its longest is no shorter
+    /// than the one after joining.
     pub fn check(&self) -> Result<()> {
         if self.ask_to_choose && self.choose_url().is_none() {
             bail!("[members] ask_to_choose needs choose_url (where people choose their account)");
+        }
+        if self.handover_days == 0 || self.handover_max_days == 0 {
+            bail!("[members] handover_days and handover_max_days must be at least 1");
+        }
+        if self.handover_days > HANDOVER_DAYS_MAX || self.handover_max_days > HANDOVER_DAYS_MAX {
+            bail!(
+                "[members] handover_days ({}) and handover_max_days ({}) must be at most \
+                 {HANDOVER_DAYS_MAX}",
+                self.handover_days,
+                self.handover_max_days
+            );
+        }
+        if self.handover_days > self.handover_max_days {
+            bail!(
+                "[members] handover_days ({}) is more than handover_max_days ({})",
+                self.handover_days,
+                self.handover_max_days
+            );
         }
         Ok(())
     }
@@ -680,6 +720,26 @@ access = "members"
             m.choose_url(),
             Some("https://login.example.org/if/flow/house-matrix-accounts/")
         );
+        // the handover: a week after joining, a month at most, unless the config says else
+        assert_eq!(m.grace(), Grace::default());
+        let grace = |extra: &str| -> Result<Grace> {
+            let m: MembersConfig = toml::from_str(extra).unwrap();
+            m.check().map(|()| m.grace())
+        };
+        assert_eq!(
+            grace("handover_days = 3\nhandover_max_days = 3").unwrap(),
+            Grace {
+                after_join: chrono::Duration::days(3),
+                max: chrono::Duration::days(3)
+            }
+        );
+        assert!(grace("handover_days = 0").is_err());
+        assert!(grace("handover_max_days = 0").is_err());
+        assert!(grace("handover_days = 14\nhandover_max_days = 10").is_err());
+        // a year at most: more digits than meant would reach past any date
+        assert!(grace("handover_days = 365\nhandover_max_days = 365").is_ok());
+        assert!(grace("handover_max_days = 366").is_err());
+        assert!(grace("handover_days = 4294967295\nhandover_max_days = 4294967295").is_err());
     }
 
     const DIRECTORY: &str =

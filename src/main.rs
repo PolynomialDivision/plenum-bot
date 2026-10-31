@@ -9,12 +9,15 @@
 //! (made, moved, cancelled, repeated there); the bot reads it over CalDAV and follows it. A
 //! plenum with a directory group keeps its room's members and its wiki editors in line with
 //! the group (the person's chosen account is invited), and answers `!link` in a direct chat
-//! from an account on another server (the code that links it to a house user).
+//! from an account on another server (the code that links it to a house user); an account a
+//! person names in the identity provider's flow gets an invitation and that code without
+//! `!link` (`link_delivery`).
 
 mod calendar;
 mod commands;
 mod config;
 mod engine;
+mod link_delivery;
 mod linking;
 mod outline;
 mod pdf;
@@ -27,7 +30,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use mxbot_common::directory::Directory;
+use mxbot_common::directory::{self, Directory, Snapshot};
 
 use anyhow::{Context, Result};
 use mxbot_common::{
@@ -43,7 +46,8 @@ use mxbot_common::{
                 },
                 AnySyncMessageLikeEvent, AnySyncTimelineEvent, Mentions, SyncMessageLikeEvent,
             },
-            OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomAliasId, RoomId, UserId,
+            OwnedRoomAliasId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomAliasId, RoomId,
+            UserId,
         },
         Client, Room, RoomMemberships, RoomState,
     },
@@ -56,6 +60,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     engine::{Chat, Engine, Scope, Sender},
+    link_delivery::LinkChat,
     linking::LinkDesk,
     outline::Outline,
     state::State,
@@ -155,6 +160,8 @@ impl Chat for MatrixChat {
             .map(|m| Member {
                 id: m.user_id().to_owned(),
                 admin: is_admin(m),
+                joined: *m.membership()
+                    == mxbot_common::matrix_sdk::ruma::events::room::member::MembershipState::Join,
             })
             .collect())
     }
@@ -213,13 +220,51 @@ impl Chat for MatrixChat {
     }
 }
 
+impl LinkChat for MatrixChat {
+    async fn open(&self, account: &UserId) -> Result<OwnedRoomId> {
+        // an existing chat only when it is private now (the code goes into it)
+        let existing = match self.direct_room(account) {
+            Some(room)
+                if mxbot_common::private::is_private_dm(&self.client, room.room_id(), account)
+                    .await =>
+            {
+                Some(room)
+            }
+            _ => None,
+        };
+        let room = match existing {
+            Some(room) => room,
+            None => {
+                mxbot_common::private::create_private_dm(
+                    &self.client,
+                    account,
+                    &mxbot_common::private::PREFERRED_ROOM_VERSIONS,
+                )
+                .await?
+            }
+        };
+        Ok(room.room_id().to_owned())
+    }
+
+    async fn joined(&self, room: &RoomId, account: &UserId) -> Result<bool> {
+        Ok(mxbot_common::private::is_private_dm(&self.client, room, account).await)
+    }
+
+    async fn send(&self, room: &RoomId, markdown: &str, key: &str) -> Result<()> {
+        let room = self.room(room)?;
+        self.send_keyed(&room, markdown, key).await
+    }
+}
+
 const ADMIN_HELP: &str =
     "For everyone in the plenum rooms: !plenum · !top <topic> (also as a reply to a message) · \
 !minutes done · !minutes confidential|link|full [day] · !plenum help. The meetings are in the plenums' Nextcloud calendars. \
-Here in the admin chat !plenum shows every plenum, !members the rooms' held removals and \
+Here in the admin chat !plenum shows every plenum, !members the rooms' held removals and the \
+running handovers (a member's old account → the one they chose, until when it stays) and \
 !members confirm <plenum key|room> <digest> carries a room's held plan out once (the digest is \
 in the notice and in !members). \
-From an account on another server, !link <username> in a direct chat gives its link code.";
+From an account on another server, !link <username> in a direct chat gives its link code; an \
+account named in the settings (Matrix accounts) is invited and gets it there.";
 
 type PlenumEngine = Engine<Outline, MatrixChat>;
 
@@ -299,6 +344,7 @@ async fn main() -> Result<()> {
         engine.keep = keep;
         engine.ask_to_choose = config.members.ask_to_choose;
         engine.choose_url = config.members.choose_url().map(str::to_owned);
+        engine.grace = config.members.grace();
         if let Some(dir) = &config.directory {
             engine.stale_after = dir.stale_after();
         }
@@ -319,15 +365,51 @@ async fn main() -> Result<()> {
             linking::KEY_ENV
         );
     }
+    // Link requests from the provider's flow: the bot invites the account and sends the code.
+    // Direct chats from accounts the directory knows wait for its first read, so one that
+    // came while the bot was down is not rejected for want of it.
+    let link_requests = match (&config.directory, link_desk.key()) {
+        (Some(dir), Some(key)) => match Directory::new(dir, &bot.user_id) {
+            Ok(directory) => {
+                bot.dm_accounts().wait_for_first_read();
+                Some((
+                    directory,
+                    link_delivery::Desk {
+                        key: key.to_vec(),
+                        house_server: house_server.clone(),
+                        choose_url: config.members.choose_url().map(str::to_owned),
+                    },
+                ))
+            }
+            Err(e) => {
+                warn!("Link requests: {e:#}; none are served");
+                None
+            }
+        },
+        _ => {
+            info!(
+                "Link requests: no [directory] or no {}, none are served",
+                linking::KEY_ENV
+            );
+            None
+        }
+    };
     let engine: Arc<PlenumEngine> = Arc::new(engine);
     for p in &engine.plenums {
         info!(plenum = %p.key, name = %p.name, room = %p.room, collection = %p.collection,
               calendar = %p.calendar, group = ?p.group, access = ?p.access, "Plenum");
     }
 
-    install_handler(&bot, &engine, &link_desk);
+    let own_room = Arc::new(OwnRoom::of(&bot.user_id));
+    install_handler(&bot, &engine, &link_desk, &own_room);
     info!("Starting sync...");
     bot.initial_sync().await;
+    match own_room.id(&bot.client).await {
+        Some(room) => info!(alias = %own_room.alias, %room, "The bot's own room"),
+        None => {
+            warn!(alias = %own_room.alias, "The bot's own room is not known yet (asked again when needed): !plenum there is not answered until it is")
+        }
+    }
 
     match engine.wiki.check().await {
         Ok(user) => info!(%user, "Outline answers"),
@@ -379,7 +461,121 @@ async fn main() -> Result<()> {
         }
         _ => info!("Rooms: no plenum with a group, or [members] off: no room is managed"),
     }
+    if let Some((directory, desk)) = link_requests {
+        let chat = MatrixChat {
+            client: bot.client.clone(),
+            admins: bot.admin.admin_list().clone(),
+        };
+        let (bot, engine) = (bot.clone(), Arc::clone(&engine));
+        let state_path = store_path.join("state.json");
+        supervise_ticking(
+            "link requests",
+            3 * (link_delivery::ROUND + SLOW_ROUND),
+            |alive| link_loop(bot, engine, chat, directory, desk, state_path, alive),
+        );
+    }
     bot.run().await
+}
+
+/// Every [`link_delivery::ROUND`]: the link requests (and every `refresh_minutes` the whole
+/// directory, for the accounts that may open a direct chat and for who claims an account),
+/// then a [`link_delivery::round`]. Only the people of the groups whose rooms the bot manages
+/// (`config::directory_groups`) may ask for a code or write to the bot. The first good read
+/// takes up the direct-chat invites held for it. A directory that is down is another service's
+/// outage (`Alive::unavailable`; the deliveries under way go on); one that refuses the token or
+/// answers what the bot cannot read, and Matrix or the state failing, are this loop's failure.
+async fn link_loop(
+    bot: Bot,
+    engine: Arc<PlenumEngine>,
+    chat: MatrixChat,
+    directory: Directory,
+    desk: link_delivery::Desk,
+    state_path: std::path::PathBuf,
+    alive: Alive,
+) {
+    alive.expect_every(link_delivery::ROUND);
+    let pending = mxbot_common::status::queue("link_codes");
+    let skipped = mxbot_common::status::gauge("link_codes_skipped");
+    let gave_up = mxbot_common::status::gauge("link_codes_gave_up");
+    let groups = config::directory_groups(&engine.plenums);
+    if groups.is_empty() {
+        warn!("Link requests: no plenum has a group, so nobody may ask for a code or write to me");
+    }
+    let mut snapshot: Option<Snapshot> = None;
+    let mut next_read = std::time::Instant::now();
+    let mut first = true;
+    loop {
+        alive.tick();
+        // the directory down (another service's outage), or refusing or unreadable (ours)
+        let mut unavailable: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        let mut sort = |what: &str, e: anyhow::Error| {
+            let line = format!("{what}: {e:#}");
+            if directory::is_outage(&e) {
+                unavailable.push(line);
+            } else {
+                failed.push(line);
+            }
+        };
+        if std::time::Instant::now() >= next_read {
+            match directory.snapshot(&Default::default()).await {
+                Ok(read) => {
+                    bot.dm_accounts().follow(&read, directory.config(), &groups);
+                    snapshot = Some(read);
+                    next_read = std::time::Instant::now() + directory.config().refresh();
+                    if std::mem::take(&mut first) {
+                        let bot = bot.clone();
+                        tokio::spawn(async move { bot.process_pending_invites().await });
+                    }
+                }
+                Err(e) => {
+                    sort("the directory", e);
+                    next_read = std::time::Instant::now() + Duration::from_secs(60);
+                }
+            }
+        }
+        let now = SystemTime::now();
+        // a read too old says nothing about who claims an account
+        let people = snapshot
+            .as_ref()
+            .filter(|s| !s.is_stale(directory.config(), now))
+            .map(|s| &s.people);
+        let requests = match directory.link_requests(&groups).await {
+            Ok(requests) => {
+                bot.dm_accounts()
+                    .announce(&requests, directory.server_name(), now);
+                Some(requests)
+            }
+            Err(e) => {
+                sort("link requests", e);
+                None
+            }
+        };
+        let report = link_delivery::round(
+            &chat,
+            &desk,
+            &engine.state,
+            &state_path,
+            requests.as_deref(),
+            people,
+            chrono::Utc::now(),
+        )
+        .await;
+        pending.set_since(report.pending, report.oldest.map(SystemTime::from));
+        skipped.set(report.skipped_day as f64);
+        gave_up.set(report.gave_up_day as f64);
+        failed.extend(report.errors.iter().map(|e| format!("link requests: {e}")));
+        if !failed.is_empty() {
+            alive.failed(failed.join("; "));
+        } else if !unavailable.is_empty() {
+            alive.unavailable(unavailable.join("; "));
+        } else if report.did_something() || report.pending > 0 {
+            alive.ok();
+        } else {
+            alive.idle();
+        }
+        tokio::time::sleep(link_delivery::ROUND).await;
+    }
 }
 
 /// The longest a round of the calendar or members loop normally takes, for their health check.
@@ -486,8 +682,12 @@ async fn keep_calendar(
 
 /// The directory now and every `refresh_minutes` (one snapshot: its people and which groups
 /// exist), the rooms after it. While it cannot be read, or a guard stops the round (a stale
-/// read, a house group with nobody in it), the rooms stay as they are and the loop counts as
-/// failing: unreadable for longer than its time makes the container unhealthy.
+/// read, a house group with nobody in it), the rooms stay as they are. A directory that is down
+/// (unreachable, timing out, 5xx, 429: `directory::is_outage`) is another service's outage
+/// (`Alive::unavailable`: in the status file and its alerts, never unhealthy, no restart); one
+/// that refuses the token or answers what the bot cannot read, and a guard that stops the
+/// round, count as failing (unhealthy after their time: someone has to fix the config or the
+/// bot).
 async fn members_loop(
     engine: Arc<PlenumEngine>,
     directory: Directory,
@@ -503,8 +703,10 @@ async fn members_loop(
         if let (Ok(snapshot), false) = (&read, admin_groups.is_empty()) {
             admins.follow(snapshot, directory.config(), &admin_groups);
         }
+        let outage = read.as_ref().err().is_some_and(directory::is_outage);
         match engine.sync_members_after(read, chrono::Utc::now()).await {
             Ok(()) => alive.ok(),
+            Err(why) if outage => alive.unavailable(format!("room members: {why}")),
             Err(why) => alive.failed(format!("room members: {why}")),
         }
         tokio::time::sleep(directory.config().refresh()).await;
@@ -563,16 +765,23 @@ async fn replied_topic(
     Some((command, author))
 }
 
-fn install_handler(bot: &Bot, engine: &Arc<PlenumEngine>, link_desk: &Arc<LinkDesk>) {
+fn install_handler(
+    bot: &Bot,
+    engine: &Arc<PlenumEngine>,
+    link_desk: &Arc<LinkDesk>,
+    own_room: &Arc<OwnRoom>,
+) {
     let bot = bot.clone();
     let engine = Arc::clone(engine);
     let link_desk = Arc::clone(link_desk);
+    let own_room = Arc::clone(own_room);
     let rooms = engine.rooms();
     bot.client.clone().add_event_handler(
         move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
             let bot = bot.clone();
             let engine = Arc::clone(&engine);
             let link_desk = Arc::clone(&link_desk);
+            let own_room = Arc::clone(&own_room);
             let rooms = rooms.clone();
             async move {
                 if room.state() != RoomState::Joined || ev.sender == bot.user_id {
@@ -612,9 +821,18 @@ fn install_handler(bot: &Bot, engine: &Arc<PlenumEngine>, link_desk: &Arc<LinkDe
                     }
                     return;
                 }
-                // Plenum rooms, the admin DM, and the bot's own room (the overview).
-                if !in_plenum_room && dispatch != Dispatch::AdminDm && !own_room(&room, &bot) {
-                    return;
+                // Plenum rooms, the admin DM, and the bot's own room (the overview); in any other
+                // room (a direct chat from an account the directory knows) only `!link` above.
+                if !in_plenum_room {
+                    let admin_dm = dispatch == Dispatch::AdminDm;
+                    let own = if admin_dm {
+                        None
+                    } else {
+                        own_room.id(&bot.client).await
+                    };
+                    if !takes_commands(room.room_id(), admin_dm, own.as_deref()) {
+                        return;
+                    }
                 }
                 let keys: Vec<&str> = engine
                     .plenums
@@ -663,8 +881,102 @@ fn install_handler(bot: &Bot, engine: &Arc<PlenumEngine>, link_desk: &Arc<LinkDe
     );
 }
 
-/// The bot's own room: its alias is the bot's localpart (`make matrix-rooms` creates it so).
-fn own_room(room: &Room, bot: &Bot) -> bool {
-    room.canonical_alias()
-        .is_some_and(|a| a.alias() == bot.user_id.localpart())
+/// The bot's own room, known by its room ID: the alias `#<bot localpart>:<bot server>` (`make
+/// matrix-rooms` creates the room so) resolved on the bot's own homeserver, which alone says
+/// where an alias on its server points. Never by a room's `m.room.canonical_alias`: that is
+/// state whoever made the room sets, and a server other than the house's does not check it, so
+/// a direct chat a stranger made (an account a link request names, say) could call itself the
+/// bot's room and get `!plenum`'s overview.
+///
+/// Resolved once and kept; while it cannot be (the homeserver busy, the room not made yet) it
+/// is asked again at most once a minute, and no room is the own room meanwhile.
+struct OwnRoom {
+    alias: OwnedRoomAliasId,
+    id: std::sync::Mutex<Option<OwnedRoomId>>,
+    tried: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl OwnRoom {
+    fn of(bot: &UserId) -> Self {
+        let alias = format!("#{}:{}", bot.localpart(), bot.server_name());
+        Self {
+            alias: RoomAliasId::parse(alias).expect("a user ID's parts make an alias"),
+            id: std::sync::Mutex::new(None),
+            tried: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The room's ID, asked of the homeserver the first time (and after a failure, once a
+    /// minute at most).
+    async fn id(&self, client: &Client) -> Option<OwnedRoomId> {
+        if let Some(id) = self.id.lock().unwrap().clone() {
+            return Some(id);
+        }
+        {
+            let mut tried = self.tried.lock().unwrap();
+            if tried.is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
+                return None;
+            }
+            *tried = Some(std::time::Instant::now());
+        }
+        match client.resolve_room_alias(&self.alias).await {
+            Ok(answer) => {
+                *self.id.lock().unwrap() = Some(answer.room_id.clone());
+                Some(answer.room_id)
+            }
+            Err(e) => {
+                warn!(alias = %self.alias, "The bot's own room could not be resolved: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// Whether a message in `room`, which is no plenum's room, may be a command (`!plenum`, …):
+/// in an admin's direct chat, and in the bot's own room, `own` (its ID, [`OwnRoom`]; `None`
+/// while unknown). Anywhere else, a direct chat of an account the directory knows or one a
+/// link request names, only `!link` is answered (before this is asked).
+fn takes_commands(room: &RoomId, admin_dm: bool, own: Option<&RoomId>) -> bool {
+    admin_dm || own == Some(room)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_own_room_is_known_by_its_id_and_nothing_else() {
+        let own = <&RoomId>::try_from("!own:house.org").unwrap();
+        // a direct chat a stranger made, whatever alias it gives itself: not the own room
+        let forged = <&RoomId>::try_from("!forged:evil.example").unwrap();
+        assert!(takes_commands(own, false, Some(own)));
+        assert!(!takes_commands(forged, false, Some(own)));
+        // while the own room is unknown, no room is it
+        assert!(!takes_commands(own, false, None));
+        // an admin's direct chat always
+        assert!(takes_commands(forged, true, None));
+        // the alias the ID is asked for: the bot's localpart on the bot's server
+        let me = <&UserId>::try_from("@plenum-bot:house.org").unwrap();
+        assert_eq!(OwnRoom::of(me).alias.as_str(), "#plenum-bot:house.org");
+    }
+
+    #[test]
+    fn a_direct_chat_from_a_known_account_answers_only_link() {
+        let desk = LinkDesk::new(Some(b"test-key".to_vec()), "house.org", None);
+        let stranger = <&UserId>::try_from("@anna:matrix.org").unwrap();
+        let dm = <&RoomId>::try_from("!dm:matrix.org").unwrap();
+        let own = <&RoomId>::try_from("!own:house.org").unwrap();
+        let now = SystemTime::now();
+        // `!link` is answered there (with the code)
+        let answer = desk.answer(stranger, "!link anna", true, now, now).unwrap();
+        assert!(answer.contains("anna"), "{answer}");
+        // anything else is no `!link`, and the room takes no commands: `!plenum` goes unanswered
+        for body in ["!plenum", "!members", "!top x", "!plenum help"] {
+            assert!(
+                desk.answer(stranger, body, true, now, now).is_none(),
+                "{body}"
+            );
+            assert!(!takes_commands(dm, false, Some(own)), "{body}");
+        }
+    }
 }
