@@ -23,7 +23,7 @@
 //! protocols are filed under, and an overview the bot writes anew whenever it changes (the
 //! next dates, open tasks, the latest decisions). Open tasks of a closed protocol go into the
 //! next one as a checklist. A plenum with a group also keeps its room's members in line with
-//! it (`sync_members`).
+//! it (`sync_members`, mxbot-common `membership`).
 //!
 //! The bot never rewrites a protocol people write in: chat items go in with Outline's
 //! `patch` (only the marker line is replaced), everything else is appended. A full rewrite
@@ -31,16 +31,19 @@
 //! comes back as a checkbox).
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use chrono_tz::Tz;
 use mxbot_common::{
-    directory::Groups,
+    admin::Admins,
+    directory::{Choice, Contact, Invalid, People, Snapshot},
     matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId},
+    membership::{self, Confirm, Gate, Member, Rule},
 };
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -48,8 +51,7 @@ use tracing::{error, info, warn};
 use crate::{
     calendar::Occurrence,
     commands::{Command, When},
-    config::{Access, PdfConfig, Plenum, Publication},
-    members::{self, Member},
+    config::{self, Access, PdfConfig, Plenum, Publication},
     protocol::{self, PdfNote},
     schedule::{self, MeetingKey},
     state::{Carried, Meeting, State, Top},
@@ -134,6 +136,14 @@ pub trait Chat {
     async fn invite(&self, room: &RoomId, user: &UserId) -> Result<()>;
     /// Remove someone (also an open invitation), with the reason they see.
     async fn remove(&self, room: &RoomId, user: &UserId, reason: &str) -> Result<()>;
+    /// Tell the admins, in their direct chats with the bot. `key` is the same for the same
+    /// notice: a resend (after a restart) is dropped.
+    async fn tell_admins(&self, markdown: &str, key: &str) -> Result<()>;
+    /// Write to `user` in a direct chat with the bot (made when there is none); `key` as for
+    /// [`Self::tell_admins`].
+    async fn message_person(&self, user: &UserId, markdown: &str, key: &str) -> Result<()>;
+    /// The room an alias (`#name:server`) points to.
+    async fn resolve_alias(&self, alias: &str) -> Result<OwnedRoomId>;
 }
 
 /// Where a command comes from: what the overview may show there.
@@ -161,15 +171,29 @@ pub struct Engine<W, C> {
     pub wiki: W,
     pub chat: C,
     pub pdf: PdfConfig,
-    pub admins: HashSet<OwnedUserId>,
+    /// The configured admins and those of `[security] admin_groups` (the members loop keeps
+    /// them in line with the directory).
+    pub admins: Admins,
     /// The bot's own account (never removed from a room); None: rooms are not managed.
     pub me: Option<OwnedUserId>,
     /// `[members] keep`: never removed from a room.
     pub keep: HashSet<OwnedUserId>,
+    /// `[members] ask_to_choose`: write to members who have not chosen their account.
+    pub ask_to_choose: bool,
+    /// `[members] choose_url`: where they choose it.
+    pub choose_url: Option<String>,
+    /// How old the directory's last good read may be before no room changes
+    /// (`[directory] stale_after_minutes`).
+    pub stale_after: std::time::Duration,
+    /// The directory's last good read (for an admin's `!members confirm`).
+    snapshot: std::sync::Mutex<Option<Arc<Snapshot>>>,
+    /// One round of the rooms at a time: the directory loop's and an admin's confirmation.
+    members_round: Mutex<()>,
     /// Where people open the calendars (Nextcloud's calendar app), for the links.
     pub calendar_url: Option<String>,
-    /// The house account of each person by the name the wiki shows for them (and by their
-    /// login), from the last read of the directory; None for a name two people share.
+    /// The account of each person by the name the wiki shows for them (and by their login),
+    /// from the last read of the directory: their chosen one, else the house account; None
+    /// for a name two people share.
     accounts_by_name: std::sync::Mutex<HashMap<String, Option<OwnedUserId>>>,
     pub(crate) state: Mutex<State>,
     state_path: PathBuf,
@@ -205,7 +229,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         wiki: W,
         chat: C,
         pdf: PdfConfig,
-        admins: HashSet<OwnedUserId>,
+        admins: impl Into<Admins>,
         state: State,
         state_path: PathBuf,
     ) -> Self {
@@ -215,9 +239,14 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             wiki,
             chat,
             pdf,
-            admins,
+            admins: admins.into(),
             me: None,
             keep: HashSet::new(),
+            ask_to_choose: false,
+            choose_url: None,
+            stale_after: std::time::Duration::from_secs(3600),
+            snapshot: std::sync::Mutex::new(None),
+            members_round: Mutex::new(()),
             calendar_url: None,
             accounts_by_name: std::sync::Mutex::new(HashMap::new()),
             state: Mutex::new(state),
@@ -1255,6 +1284,17 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         scope: Scope,
     ) -> String {
         const ORGANIZERS_ONLY: &str = "⛔ Only the organizers may do that here.";
+        // the rooms' held removals: an admin in their direct chat with the bot only
+        match (&cmd, scope) {
+            (Command::Members | Command::ConfirmRemovals { .. }, Scope::Room) => {
+                return "⛔ `!members` works in an admin's direct chat with me only.".to_owned()
+            }
+            (Command::Members, Scope::AdminDm) => return self.held_removals(now).await,
+            (Command::ConfirmRemovals { room, digest }, Scope::AdminDm) => {
+                return self.confirm_removals(room, digest, now).await
+            }
+            _ => {}
+        }
         let mut st = self.state.lock().await;
         let answer = match cmd {
             Command::Help => help(),
@@ -1276,6 +1316,9 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 Err(e) => e,
             },
             Command::Invalid(why) => why,
+            Command::Members | Command::ConfirmRemovals { .. } => {
+                unreachable!("answered above")
+            }
         };
         self.save_or_log(&st).await;
         drop(st);
@@ -1674,13 +1717,15 @@ fn name_key(name: &str) -> String {
 }
 
 impl<W: Wiki, C: Chat> Engine<W, C> {
-    /// Who the wiki's mentions are: the house account of every person of a fresh read of the
-    /// directory, by their shown name and by their login (a mention carries the name the wiki
-    /// shows, which it takes from the house login). A name two people share names nobody.
-    pub fn set_people(&self, people: &[mxbot_common::directory::Person]) {
+    /// Who the wiki's mentions are: every active person of a fresh read of the directory, by
+    /// their shown name and by their login (a mention carries the name the wiki shows, which it
+    /// takes from the house login), with their chosen account, else their house account
+    /// ([`membership::address`]: a mention is no invitation, so an unchosen house account may
+    /// be pinged). A name two people share names nobody.
+    pub fn set_people(&self, people: &People) {
         let mut index: HashMap<String, Option<OwnedUserId>> = HashMap::new();
-        for person in people {
-            let Some(account) = person.accounts.first() else {
+        for person in people.active() {
+            let Some(account) = membership::address(people, person) else {
                 continue;
             };
             let mut keys = vec![name_key(&person.username)];
@@ -1692,7 +1737,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 index
                     .entry(key)
                     .and_modify(|known| {
-                        if known.as_ref() != Some(account) {
+                        if known.as_ref() != Some(&account) {
                             *known = None;
                         }
                     })
@@ -1702,7 +1747,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         *self.accounts_by_name.lock().unwrap() = index;
     }
 
-    /// The house account of the person the wiki shows as `name`, if exactly one.
+    /// The account of the person the wiki shows as `name`, if exactly one.
     fn account_of(&self, name: &str) -> Option<OwnedUserId> {
         self.accounts_by_name
             .lock()
@@ -1712,107 +1757,183 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             .flatten()
     }
 
-    /// [`Self::sync_members`] after a read of the directory: when it failed (its people or
-    /// which groups exist), every room stays as it is.
-    pub async fn sync_members_after(&self, read: Result<Groups>, now: DateTime<Utc>) {
+    /// [`Self::sync_members`] after a read of the directory: when it failed, every room stays
+    /// as it is. Err: why nothing changed (the read, or a guard), for the loop's health.
+    pub async fn sync_members_after(
+        &self,
+        read: Result<Snapshot>,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
         match read {
-            Ok(groups) => self.sync_members(&groups, now).await,
-            Err(e) => warn!("Members: the directory could not be read ({e:#}); nothing changed"),
+            Ok(snapshot) => {
+                let snapshot = Arc::new(snapshot);
+                // who the wiki's @ mentions are, for the summaries in the chat
+                self.set_people(&snapshot.people);
+                *self.snapshot.lock().unwrap() = Some(Arc::clone(&snapshot));
+                self.sync_members(&snapshot, now).await
+            }
+            Err(e) => {
+                warn!("Members: the directory could not be read ({e:#}); nothing changed");
+                Err(format!("the directory could not be read: {e:#}"))
+            }
         }
     }
 
-    /// The rooms of plenums with a group follow it (see [`members`]). A room shared by
-    /// plenums follows all their groups; a room with a plenum without a group (the house
-    /// chat) is left alone, and so is one whose group (or required group) the directory
-    /// does not know: `groups` has an entry for every group that exists, empty when nobody
-    /// is in it ([`mxbot_common::directory::groups_with_empty`]). A group that exists with
-    /// nobody in it empties its room, but for the kept accounts and the room's admins. Only
-    /// who is in a plenum's `require_group` too counts as its group's member.
-    pub async fn sync_members(&self, groups: &Groups, now: DateTime<Utc>) {
-        let Some(me) = self.me.clone() else {
-            return;
-        };
-        // The house's own group (the house plenum's) with nobody in it is a broken directory,
-        // not a house where nobody lives: it would empty every room. Nothing changes then.
-        if let Some(empty) = self
-            .plenums
-            .iter()
-            .filter(|p| p.access == Access::House)
-            .filter_map(|p| p.group.as_deref())
-            .find(|g| groups.get(*g).is_some_and(|members| members.is_empty()))
-        {
-            error!(group = %empty, "Members: the house's group has nobody in it; no room is changed");
-            return;
-        }
+    /// The rooms the members' sync manages, each with its plenums: every plenum in the room
+    /// has a group (a room with a plenum without one, the house chat, is left alone).
+    fn managed_rooms(&self) -> Vec<(OwnedRoomId, Vec<&Plenum>)> {
         let mut rooms: Vec<OwnedRoomId> = self.plenums.iter().map(|p| p.room.clone()).collect();
         rooms.sort();
         rooms.dedup();
-        for room in rooms {
-            let here: Vec<&Plenum> = self.plenums_in(&room);
-            if here.iter().any(|p| p.group.is_none()) {
-                continue;
-            }
-            let names: BTreeSet<&str> = here.iter().filter_map(|p| p.group.as_deref()).collect();
-            let required: BTreeSet<&str> = here
-                .iter()
-                .filter_map(|p| p.require_group.as_deref())
-                .collect();
-            if let Some(missing) = names
-                .iter()
-                .chain(&required)
-                .find(|g| !groups.contains_key(**g))
-            {
-                warn!(%room, group = %missing, "Members: the directory does not know the group; the room is left as it is");
-                continue;
-            }
-            let wanted: BTreeSet<OwnedUserId> = here
-                .iter()
-                .filter_map(|p| p.group.as_deref().map(|g| (g, p.require_group.as_deref())))
-                .flat_map(|(g, require)| {
-                    groups[g]
-                        .iter()
-                        .filter(move |id| require.is_none_or(|r| groups[r].contains(*id)))
-                        .cloned()
-                })
-                .collect();
-            if let Err(e) = self
-                .sync_room(&room, &wanted, &names, &required, &me, now)
-                .await
-            {
-                warn!(%room, "Members: {e:#}");
-            }
-        }
+        rooms
+            .into_iter()
+            .map(|room| {
+                let here = self.plenums_in(&room);
+                (room, here)
+            })
+            .filter(|(_, here)| here.iter().all(|p| p.group.is_some()))
+            .collect()
     }
 
+    /// The rooms of plenums with a group follow it (mxbot-common `membership`): the chosen
+    /// account of everyone in a plenum's group (and its `require_group`) is invited once,
+    /// every account of theirs may stay, the accounts of nobody in it are removed, but for
+    /// the kept accounts and the room's admins. A room shared by plenums follows all their
+    /// groups. Nothing changes while the snapshot is stale or the house's group has nobody
+    /// in it (Err: why), a room whose group the directory does not know is left as it is,
+    /// and too many removals in one room wait for an admin (`!members confirm`).
+    pub async fn sync_members(
+        &self,
+        snapshot: &Snapshot,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let Some(me) = self.me.clone() else {
+            return Ok(());
+        };
+        let _round = self.members_round.lock().await;
+        let house = config::house_groups(&self.plenums);
+        if let Some(halt) = membership::halt(
+            snapshot,
+            house.iter().map(String::as_str),
+            self.stale_after,
+            now.into(),
+        ) {
+            error!("Members: {halt}; no room is changed");
+            return Err(halt.to_string());
+        }
+        // per person: the plenums they are wanted in without a usable account, and the rooms
+        // a deactivated one is removed from
+        let mut unreachable: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut deactivated: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (room, here) in self.managed_rooms() {
+            let rules: Vec<Rule> = here
+                .iter()
+                .filter_map(|p| {
+                    p.group.as_ref().map(|g| Rule {
+                        group: g.clone(),
+                        require: p.require_group.clone(),
+                    })
+                })
+                .collect();
+            match self
+                .sync_room(snapshot, &room, &here, &rules, &me, now)
+                .await
+            {
+                Ok(Some(plan)) => {
+                    let label = room_label(&here);
+                    for id in plan.unreachable {
+                        unreachable.entry(id).or_default().insert(label.clone());
+                    }
+                    for person in plan.remove.into_iter().filter_map(|r| r.deactivated) {
+                        deactivated.entry(person).or_default().insert(label.clone());
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warn!(%room, "Members: {e:#}"),
+            }
+        }
+        self.tell_about_people(snapshot, &unreachable, &deactivated, now)
+            .await;
+        Ok(())
+    }
+
+    /// One room's round; None when it is left alone (an unknown group).
     async fn sync_room(
         &self,
+        snapshot: &Snapshot,
         room: &RoomId,
-        wanted: &BTreeSet<OwnedUserId>,
-        groups: &BTreeSet<&str>,
-        required: &BTreeSet<&str>,
+        here: &[&Plenum],
+        rules: &[Rule],
         me: &UserId,
         now: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<Option<membership::Plan>> {
         let current = self.chat.members(room).await?;
         let mut st = self.state.lock().await;
         let remembered = st.rooms.entry(room.to_string()).or_default();
-        members::forget_others(remembered, wanted);
-        let plan = members::plan(wanted, &current, &self.keep, me, remembered, now);
-        let groups: Vec<&str> = groups.iter().copied().collect();
-        let required: Vec<&str> = required.iter().copied().collect();
+        let plan =
+            match membership::plan(snapshot, rules, &current, &self.keep, me, remembered, now) {
+                Ok(plan) => plan,
+                Err(skip) => {
+                    warn!(%room, "Members: {skip}; the room is left as it is");
+                    return Ok(None);
+                }
+            };
+        remembered.forget_others(&plan.tolerated);
+        for account in &plan.frozen {
+            warn!(%room, %account, "Members: two people claim the account; neither invited nor removed");
+        }
+        let gate = membership::gate(remembered, &plan.remove, plan.humans, now);
+        let groups: Vec<&str> = rules.iter().map(|r| r.group.as_str()).collect();
+        let required: BTreeSet<&str> = rules.iter().filter_map(|r| r.require.as_deref()).collect();
         let reason = if required.is_empty() {
-            format!("not in the group {} (house account)", groups.join(", "))
+            format!("not in the group {}", groups.join(", "))
         } else {
             format!(
-                "not in the group {} or not in {} (house account)",
+                "not in the group {} or not in {}",
                 groups.join(", "),
-                required.join(", ")
+                required.into_iter().collect::<Vec<_>>().join(", ")
             )
         };
-        for user in &plan.remove {
-            match self.chat.remove(room, user, &reason).await {
-                Ok(()) => info!(%room, %user, "Members: removed (not in the group)"),
-                Err(e) => warn!(%room, %user, "Members: removing failed: {e:#}"),
+        match gate {
+            Gate::Go => {
+                for r in &plan.remove {
+                    let user = &r.account;
+                    match self.chat.remove(room, user, &reason).await {
+                        Ok(()) => info!(%room, %user, "Members: removed (not in the group)"),
+                        Err(e) => warn!(%room, %user, "Members: removing failed: {e:#}"),
+                    }
+                }
+            }
+            Gate::Held { limit, tell } => {
+                warn!(%room, removals = plan.remove.len(), limit, "Members: too many removals at once; held until an admin confirms");
+                if tell {
+                    // the hold's episode (digest, since when): the same plan held again later
+                    // is a new message, not a resend the homeserver drops
+                    let episode = remembered
+                        .hold
+                        .as_ref()
+                        .map(membership::Hold::episode)
+                        .unwrap_or_default();
+                    let digest = remembered
+                        .hold
+                        .as_ref()
+                        .map(membership::Hold::digest)
+                        .unwrap_or_default();
+                    let text = hold_notice(room, here, &plan, limit, &digest);
+                    let key = format!("members-hold:{room}:{episode}");
+                    match self.chat.tell_admins(&text, &key).await {
+                        Ok(()) => {
+                            if let Some(hold) = st
+                                .rooms
+                                .get_mut(room.as_str())
+                                .and_then(|r| r.hold.as_mut())
+                            {
+                                hold.told = true;
+                            }
+                        }
+                        Err(e) => warn!(%room, "Members: telling the admins failed: {e:#}"),
+                    }
+                }
             }
         }
         for user in &plan.invite {
@@ -1820,26 +1941,461 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             match self.chat.invite(room, user).await {
                 Ok(()) => {
                     info!(%room, %user, "Members: invited (in the group)");
-                    remembered.failed.remove(user.as_str());
-                    remembered.invited.insert(user.to_string());
+                    remembered.record_invited(user);
                 }
                 Err(e) => {
                     // an account that does not exist (yet): tried again a day later
                     info!(%room, %user, "Members: invitation failed, again in a day: {e:#}");
-                    remembered.failed.insert(user.to_string(), now);
+                    remembered.record_failed(user, now);
                 }
             }
         }
-        // who is in the room already counts as invited (leaving later is their choice)
-        let remembered = st.rooms.entry(room.to_string()).or_default();
-        for m in &current {
-            if wanted.contains(&m.id) {
-                remembered.invited.insert(m.id.to_string());
+        st.rooms
+            .entry(room.to_string())
+            .or_default()
+            .record_present(&current, &plan.tolerated);
+        self.save(&st).await?;
+        Ok(Some(plan))
+    }
+
+    /// After the rooms: ask who has no usable account to choose one (`ask_to_choose`), and
+    /// tell the admins once about a choice that cannot be used, an account two people claim,
+    /// who cannot be invited (the list, again when someone is added to it) and deactivated
+    /// people still in a room. Every notice's key names its episode (the day it was found,
+    /// what it is about), since the homeserver drops a key it has seen before.
+    async fn tell_about_people(
+        &self,
+        snapshot: &Snapshot,
+        unreachable: &BTreeMap<String, BTreeSet<String>>,
+        deactivated: &BTreeMap<String, BTreeSet<String>>,
+        now: DateTime<Utc>,
+    ) {
+        let people = &snapshot.people;
+        let day = now.date_naive();
+        let mut st = self.state.lock().await;
+        st.people.tidy(people);
+        for (account, names) in st.people.untold_conflicts(people) {
+            warn!(%account, claimants = %names.join(", "), "Members: two people claim the account");
+            let key = format!(
+                "members-conflict:{account}:{}:{day}",
+                membership::digest(&names)
+            );
+            match self
+                .chat
+                .tell_admins(&conflict_notice(&account, &names), &key)
+                .await
+            {
+                Ok(()) => st.people.record_conflict(&account, &names),
+                Err(e) => warn!(%account, "Members: telling the admins failed: {e:#}"),
             }
         }
-        self.save(&st).await?;
-        Ok(())
+        let lines: BTreeSet<String> = unreachable
+            .iter()
+            .filter_map(|(id, rooms)| {
+                let person = people.by_id(id)?;
+                Some(unreachable_line(person, people.contact(person), rooms))
+            })
+            .collect();
+        if st.people.unreachable_is_news(&lines) {
+            let text = unreachable_notice(&lines, self.ask_to_choose && self.choose_url.is_some());
+            let key = format!("members-unreachable:{}:{day}", membership::digest(&lines));
+            match self.chat.tell_admins(&text, &key).await {
+                Ok(()) => st.people.record_unreachable(lines),
+                Err(e) => warn!("Members: telling the admins failed: {e:#}"),
+            }
+        } else {
+            // shrunk or the same: remembered, so who comes back is news again
+            st.people.record_unreachable(lines);
+        }
+        for (id, rooms) in unreachable {
+            let Some(person) = people.by_id(id) else {
+                continue;
+            };
+            if let Contact::Invalid(why) = people.contact(person) {
+                if !st.people.invalid.contains(id) {
+                    let text = invalid_notice(person, why, self.choose_url.as_deref());
+                    let chosen = match &person.choice {
+                        Choice::Account(a) => a.to_string(),
+                        _ => "malformed".to_owned(),
+                    };
+                    match self
+                        .chat
+                        .tell_admins(&text, &format!("members-invalid:{id}:{chosen}:{day}"))
+                        .await
+                    {
+                        Ok(()) => {
+                            st.people.invalid.insert(id.clone());
+                        }
+                        Err(e) => {
+                            warn!(person = %person.username, "Members: telling the admins failed: {e:#}")
+                        }
+                    }
+                }
+            }
+            let Some(url) = self.choose_url.as_deref().filter(|_| self.ask_to_choose) else {
+                continue;
+            };
+            if !st.people.may_ask(id, now) {
+                continue;
+            }
+            // the house account and the links they proved: where they read for sure
+            let to: Vec<&UserId> = people
+                .accounts(person)
+                .filter(|a| {
+                    person.house.as_deref() == Some(*a)
+                        || person.links.iter().any(|l| l.verified && l.id == *a)
+                })
+                .collect();
+            let times = st.people.asked.get(id).map_or(0, |a| a.times);
+            let text = choose_message(person, rooms, url, self.me.as_deref());
+            for account in &to {
+                let key = format!("members-ask:{id}:{times}:{day}:{account}");
+                match self.chat.message_person(account, &text, &key).await {
+                    Ok(()) => {
+                        info!(person = %person.username, %account, "Members: asked to choose an account")
+                    }
+                    Err(e) => {
+                        info!(person = %person.username, %account, "Members: asking to choose failed: {e:#}")
+                    }
+                }
+            }
+            // counted when tried: an account that does not exist yet is not asked every round
+            st.people.record_asked(id, now);
+        }
+        for (id, rooms) in deactivated {
+            if st.people.deactivated.contains(id) {
+                continue;
+            }
+            let Some(person) = people.by_id(id) else {
+                continue;
+            };
+            let text = deactivated_notice(person, rooms);
+            let key = format!(
+                "members-deactivated:{id}:{}:{day}",
+                membership::digest(rooms)
+            );
+            match self.chat.tell_admins(&text, &key).await {
+                Ok(()) => {
+                    st.people.deactivated.insert(id.clone());
+                }
+                Err(e) => {
+                    warn!(person = %person.username, "Members: telling the admins failed: {e:#}")
+                }
+            }
+        }
+        self.save_or_log(&st).await;
     }
+
+    /// The managed room an admin means: a plenum key, a room ID or an alias.
+    async fn managed_room(&self, target: &str) -> Option<OwnedRoomId> {
+        let managed = self.managed_rooms();
+        let room = if let Some(p) = self.plenums.iter().find(|p| p.key == target) {
+            p.room.clone()
+        } else if target.starts_with('#') {
+            match self.chat.resolve_alias(target).await {
+                Ok(room) => room,
+                Err(e) => {
+                    warn!(alias = %target, "Members: the alias could not be resolved: {e:#}");
+                    return None;
+                }
+            }
+        } else {
+            OwnedRoomId::try_from(target).ok()?
+        };
+        managed
+            .into_iter()
+            .find(|(r, _)| *r == room)
+            .map(|(r, _)| r)
+    }
+
+    /// `!members`: the held removals.
+    async fn held_removals(&self, now: DateTime<Utc>) -> String {
+        let st = self.state.lock().await;
+        let mut lines = Vec::new();
+        for (room, here) in self.managed_rooms() {
+            let Some(hold) = st.rooms.get(room.as_str()).and_then(|r| r.hold.as_ref()) else {
+                continue;
+            };
+            let accounts: Vec<&str> = hold.accounts.iter().map(String::as_str).collect();
+            lines.push(format!(
+                "- {} (`{}`): {} removals held as `{}`{}: {}",
+                room_label(&here),
+                here[0].key,
+                accounts.len(),
+                hold.digest(),
+                if hold.confirmed { ", confirmed" } else { "" },
+                accounts.join(", ")
+            ));
+        }
+        let read = match &*self.snapshot.lock().unwrap() {
+            Some(s) => format!(
+                "The directory was last read {} min ago.",
+                s.age(now.into()).as_secs() / 60
+            ),
+            None => "The directory has not been read since the start.".to_owned(),
+        };
+        if lines.is_empty() {
+            format!("No removals are held. {read}")
+        } else {
+            format!(
+                "Held removals (`!members confirm <key> <digest>` carries out that plan once):\n{}\n\n{read}",
+                lines.join("\n")
+            )
+        }
+    }
+
+    /// `!members confirm <room> <digest>`: the room's held removals go once, at once if the
+    /// directory's last read is fresh, and only if the plan held is the one whose digest the
+    /// admin names (from the notice or `!members`) and is still the same then. Another digest:
+    /// nothing is confirmed, the answer shows the plan held.
+    async fn confirm_removals(&self, target: &str, digest: &str, now: DateTime<Utc>) -> String {
+        let Some(room) = self.managed_room(target).await else {
+            return format!(
+                "⛔ No room whose members I keep matches “{target}” (a plenum key, room ID or alias)."
+            );
+        };
+        let key = self
+            .plenums_in(&room)
+            .first()
+            .map_or_else(|| room.to_string(), |p| p.key.clone());
+        let held: BTreeSet<String> = {
+            let mut st = self.state.lock().await;
+            let Some(remembered) = st.rooms.get_mut(room.as_str()) else {
+                return format!("Nothing is held in {room}.");
+            };
+            match remembered.confirm(digest) {
+                Confirm::Nothing => return format!("Nothing is held in {room}."),
+                Confirm::Other {
+                    digest: held,
+                    accounts,
+                } => {
+                    let named = if digest.is_empty() {
+                        "no digest was given".to_owned()
+                    } else {
+                        format!("not “{digest}”")
+                    };
+                    return format!(
+                        "⛔ The plan held in {room} is `{held}` ({named}): nothing was confirmed. \
+                         It removes {n}: {list}.\n\nIf that is right: `!members confirm {key} {held}`.",
+                        n = accounts.len(),
+                        list = accounts.join(", "),
+                    );
+                }
+                Confirm::Confirmed => remembered
+                    .hold
+                    .as_ref()
+                    .map(|h| h.accounts.clone())
+                    .unwrap_or_default(),
+            }
+        };
+        {
+            let st = self.state.lock().await;
+            if let Err(e) = self.save(&st).await {
+                error!("{e:#}");
+                return "⚠️ The confirmation could not be saved; nothing changed.".to_owned();
+            }
+        }
+        let snapshot = self.snapshot.lock().unwrap().clone();
+        if let Some(snapshot) = snapshot {
+            if let Err(why) = self.sync_members(&snapshot, now).await {
+                return format!(
+                    "Confirmed, but nothing changes now ({why}): the removals go at the next \
+                     good read of the directory if the plan is still the same."
+                );
+            }
+        }
+        let hold = self
+            .state
+            .lock()
+            .await
+            .rooms
+            .get(room.as_str())
+            .and_then(|r| r.hold.clone());
+        match hold {
+            None => {
+                // who of the plan is gone now (a kick that failed is in the log)
+                let here: BTreeSet<String> = match self.chat.members(&room).await {
+                    Ok(current) => current.iter().map(|m| m.id.to_string()).collect(),
+                    Err(e) => {
+                        warn!(%room, "Members: reading the room after the removals: {e:#}");
+                        BTreeSet::new()
+                    }
+                };
+                let (still, gone): (Vec<&String>, Vec<&String>) =
+                    held.iter().partition(|a| here.contains(*a));
+                let list =
+                    |v: &[&String]| v.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", ");
+                let mut answer = format!(
+                    "✅ The held removals in {room} were carried out: removed {}.",
+                    if gone.is_empty() {
+                        "nobody".to_owned()
+                    } else {
+                        list(&gone)
+                    }
+                );
+                if !still.is_empty() {
+                    answer.push_str(&format!(
+                        " Still there (removing failed, see the log): {}.",
+                        list(&still)
+                    ));
+                }
+                answer
+            }
+            Some(hold) if hold.confirmed => format!(
+                "Confirmed: the removals in {room} go at the next good read of the directory, \
+                 if the plan is still the same."
+            ),
+            Some(_) => format!(
+                "The plan for {room} changed since it was held: nothing was removed. The admins \
+                 hear of the new one."
+            ),
+        }
+    }
+}
+
+/// A room by its plenums' names.
+fn room_label(here: &[&Plenum]) -> String {
+    here.iter()
+        .map(|p| p.name.as_str())
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+fn hold_notice(
+    room: &RoomId,
+    here: &[&Plenum],
+    plan: &membership::Plan,
+    limit: usize,
+    digest: &str,
+) -> String {
+    let accounts: Vec<&str> = plan.remove.iter().map(|r| r.account.as_str()).collect();
+    format!(
+        "⏸️ **Members: {n} removals held** in {label} ({room}): more than {limit} at once \
+         ({humans} people in the room), so nobody is removed there until an admin confirms. \
+         They would be: {list}.\n\n\
+         Invitations still go out. If this is right: `!members confirm {key} {digest}` here \
+         (this plan only: a changed one is held anew). If the directory is wrong, fix it \
+         there: the hold ends by itself when the plan shrinks.",
+        n = accounts.len(),
+        label = room_label(here),
+        humans = plan.humans,
+        list = accounts.join(", "),
+        key = here[0].key,
+    )
+}
+
+/// An account two or more active people claim: it counts for nobody.
+fn conflict_notice(account: &UserId, names: &[&str]) -> String {
+    format!(
+        "⚠️ **Members:** {account} is a Matrix account of {names} in the directory. It counts \
+         for none of them: it is not invited, and stays only in rooms one of them belongs in. \
+         Take it off the person whose account it is not (the link, or their chosen account).",
+        names = names.join(" and "),
+    )
+}
+
+/// One person who cannot be invited, as the admins' list shows them.
+fn unreachable_line(
+    person: &mxbot_common::directory::Person,
+    contact: Contact,
+    rooms: &BTreeSet<String>,
+) -> String {
+    let why = match contact {
+        Contact::Invalid(_) => "their choice cannot be used",
+        _ => "has not chosen",
+    };
+    format!(
+        "{} ({why}): {}",
+        person.username,
+        rooms.iter().cloned().collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// Who is wanted in a room but cannot be invited, for the admins.
+fn unreachable_notice(lines: &BTreeSet<String>, asking: bool) -> String {
+    let asked = if asking {
+        "I ask each of them to choose (`ask_to_choose`)."
+    } else {
+        "Nobody asks them: `[members] ask_to_choose` is off (house-infra matrix.yml, plenum-bot's \
+         `members`), so tell them, or switch it on."
+    };
+    format!(
+        "📭 **Members: {n} {people} cannot be invited** to the rooms they belong in until \
+         they choose their Matrix account (where they are already, they stay). {asked}\n{list}",
+        n = lines.len(),
+        people = if lines.len() == 1 { "person" } else { "people" },
+        list = lines
+            .iter()
+            .map(|l| format!("- {l}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn invalid_notice(
+    person: &mxbot_common::directory::Person,
+    why: Invalid,
+    url: Option<&str>,
+) -> String {
+    let chosen = match &person.choice {
+        Choice::Account(id) => id.to_string(),
+        _ => "something that is no Matrix ID".to_owned(),
+    };
+    let why = match why {
+        Invalid::Malformed => "it is no Matrix ID",
+        Invalid::NotTheirs => "it is neither their house account nor a link they verified",
+        Invalid::Conflict => "another active person claims it too",
+    };
+    let fix = url.map_or(String::new(), |u| format!(" ({u})"));
+    format!(
+        "⚠️ **Members:** {user} chose {chosen} as their Matrix account, which cannot be used: \
+         {why}. Nobody new is invited for them until they choose again{fix}.",
+        user = person.username,
+    )
+}
+
+fn deactivated_notice(
+    person: &mxbot_common::directory::Person,
+    rooms: &BTreeSet<String>,
+) -> String {
+    let accounts: Vec<&str> = person.accounts.iter().map(|a| a.as_str()).collect();
+    format!(
+        "🚪 **Members:** {user} is deactivated in the directory and goes out of {rooms} (held \
+         removals once confirmed). Their Matrix account ({accounts}) is still active: logging \
+         it out or suspending it is a human step (house-infra docs/OPERATIONS.md, offboarding).",
+        user = person.username,
+        rooms = rooms.iter().cloned().collect::<Vec<_>>().join(", "),
+        accounts = accounts.join(", "),
+    )
+}
+
+/// The request to choose an account (German: what the house speaks).
+fn choose_message(
+    person: &mxbot_common::directory::Person,
+    rooms: &BTreeSet<String>,
+    url: &str,
+    me: Option<&UserId>,
+) -> String {
+    let name = if person.name.trim().is_empty() {
+        person.username.as_str()
+    } else {
+        person.name.trim()
+    };
+    let house = person
+        .house
+        .as_ref()
+        .map_or(String::new(), |h| format!(" ({h})"));
+    let bot = me.map_or("mich".to_owned(), |m| format!("mich ({m})"));
+    format!(
+        "👋 Hallo {name}! Damit dich die Bots des Hauses in deine Räume einladen können \
+         ({rooms}), wähle bitte einmal dein Matrix-Konto fürs Haus:\n\n{url}\n\n\
+         Dort nimmst du dein Hauskonto{house} oder ein anderes Konto, das du vorher verknüpfst: \
+         schreib dazu von diesem anderen Konto aus `!link {username}` an {bot} und gib den Code \
+         dort ein.\n\n\
+         Bis du gewählt hast, lade ich dich in keinen Raum neu ein; wo du schon bist, bleibst du.",
+        rooms = rooms.iter().cloned().collect::<Vec<_>>().join(", "),
+        username = person.username,
+    )
 }
 
 /// Agenda lines in a protocol: list items between the agenda heading and the next heading.
@@ -2090,6 +2646,12 @@ pub(crate) mod fakes {
         /// accounts an invitation fails for (they do not exist)
         pub unknown: StdMutex<Vec<String>>,
         pub removed: StdMutex<Vec<(String, String, String)>>, // (room, user, reason)
+        /// (key, text) of every notice to the admins
+        pub admin_notes: StdMutex<Vec<(String, String)>>,
+        /// (account, text, key) of every message to a person
+        pub dms: StdMutex<Vec<(String, String, String)>>,
+        /// (alias, room)
+        pub aliases: StdMutex<Vec<(String, String)>>,
     }
 
     impl FakeChat {
@@ -2188,6 +2750,42 @@ pub(crate) mod fakes {
             ));
             Ok(())
         }
+        async fn tell_admins(&self, markdown: &str, key: &str) -> Result<()> {
+            if *self.fail.lock().unwrap() {
+                anyhow::bail!("matrix down");
+            }
+            let mut notes = self.admin_notes.lock().unwrap();
+            // like a homeserver: a resend with the same transaction ID is dropped
+            if !notes.iter().any(|(k, _)| k == key) {
+                notes.push((key.to_owned(), markdown.to_owned()));
+            }
+            Ok(())
+        }
+        async fn message_person(&self, user: &UserId, markdown: &str, key: &str) -> Result<()> {
+            if *self.fail.lock().unwrap()
+                || self
+                    .unknown
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|u| u == user.as_str())
+            {
+                anyhow::bail!("M_NOT_FOUND");
+            }
+            let mut dms = self.dms.lock().unwrap();
+            if !dms.iter().any(|(_, _, k)| k == key) {
+                dms.push((user.to_string(), markdown.to_owned(), key.to_owned()));
+            }
+            Ok(())
+        }
+        async fn resolve_alias(&self, alias: &str) -> Result<OwnedRoomId> {
+            let aliases = self.aliases.lock().unwrap();
+            let (_, room) = aliases
+                .iter()
+                .find(|(a, _)| a == alias)
+                .context("M_NOT_FOUND")?;
+            Ok(room.as_str().try_into()?)
+        }
     }
 }
 
@@ -2196,6 +2794,7 @@ mod tests {
     use super::fakes::*;
     use super::*;
     use chrono::{Datelike, TimeZone};
+    use mxbot_common::directory::{Link, Person as DirPerson};
 
     fn plenum(key: &str, name: &str, room: &str) -> Plenum {
         Plenum {
@@ -3299,17 +3898,25 @@ mod tests {
     async fn people_mentioned_in_the_minutes_are_mentioned_in_the_chat() {
         let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
-        let person = |username: &str, name: &str, account: &str| mxbot_common::directory::Person {
-            username: username.into(),
-            name: name.into(),
-            accounts: vec![account.try_into().unwrap()],
-            groups: Default::default(),
+        let person = |username: &str, name: &str, account: &str| {
+            let house: OwnedUserId = account.try_into().unwrap();
+            DirPerson {
+                id: format!("u-{username}"),
+                username: username.into(),
+                name: name.into(),
+                active: true,
+                accounts: vec![house.clone()],
+                groups: Default::default(),
+                house: Some(house),
+                links: Vec::new(),
+                choice: Choice::None,
+            }
         };
-        e.set_people(&[
+        e.set_people(&People::new(vec![
             person("ben", "Ben Berg", "@ben:house.org"),
             person("anna", "Anna", "@anna:house.org"),
             person("anna2", "Anna", "@anna2:house.org"), // two Annas: neither is pinged
-        ]);
+        ]));
         e.tick(at(2026, 10, 29, 19, 0)).await;
         {
             let mut docs = e.wiki.docs.lock().unwrap();
@@ -3457,6 +4064,78 @@ mod tests {
         );
     }
 
+    // ── The rooms' members (mxbot-common `membership`) ───────────────────────────
+
+    /// Someone in the directory who has not chosen an account: house account `@<name>:x`.
+    fn unchosen(name: &str, groups: &[&str]) -> DirPerson {
+        let house: OwnedUserId = format!("@{name}:x").as_str().try_into().unwrap();
+        DirPerson {
+            id: format!("u-{name}"),
+            username: name.into(),
+            name: String::new(),
+            active: true,
+            accounts: vec![house.clone()],
+            groups: groups.iter().map(|g| (*g).to_owned()).collect(),
+            house: Some(house),
+            links: Vec::new(),
+            choice: Choice::None,
+        }
+    }
+
+    /// Someone who chose their house account.
+    fn resident(name: &str, groups: &[&str]) -> DirPerson {
+        let mut p = unchosen(name, groups);
+        p.choice = Choice::Account(p.accounts[0].clone());
+        p
+    }
+
+    /// `p` with a verified link, chosen or not.
+    fn linked(mut p: DirPerson, account: &str, chosen: bool) -> DirPerson {
+        let id: OwnedUserId = account.try_into().unwrap();
+        p.accounts.push(id.clone());
+        p.links.push(Link {
+            id: id.clone(),
+            by_admin: false,
+            verified: true,
+        });
+        if chosen {
+            p.choice = Choice::Account(id);
+        }
+        p
+    }
+
+    /// A read of the directory at `at` in which `groups` exist.
+    fn read(people: Vec<DirPerson>, groups: &[&str], at: DateTime<Utc>) -> Snapshot {
+        Snapshot {
+            people: People::new(people),
+            groups: groups.iter().map(|g| (*g).to_owned()).collect(),
+            read_at: at.into(),
+        }
+    }
+
+    const GROUPS: [&str; 5] = [
+        "residents",
+        "former-residents",
+        "kitchen-floor-1",
+        "kitchen-floor-3",
+        "finance",
+    ];
+
+    /// A read in which every group of the house exists.
+    fn house_read(people: Vec<DirPerson>, at: DateTime<Utc>) -> Snapshot {
+        read(people, &GROUPS, at)
+    }
+
+    async fn sync(e: &Engine<FakeWiki, FakeChat>, s: Snapshot, now: DateTime<Utc>) {
+        e.sync_members_after(Ok(s), now).await.unwrap();
+    }
+
+    fn managing(plenums: Vec<Plenum>) -> Engine<FakeWiki, FakeChat> {
+        let mut e = setup(plenums).engine;
+        e.me = Some("@plenum-bot:x".try_into().unwrap());
+        e
+    }
+
     #[tokio::test]
     async fn a_groups_room_follows_the_group() {
         let t = setup(vec![kitchen()]);
@@ -3480,15 +4159,19 @@ mod tests {
             m("@eve:x", false),
         ]);
         e.chat.unknown.lock().unwrap().push("@ghost:x".into());
-        let groups: Groups = [(
-            "kitchen-floor-1".to_owned(),
-            ["@anna:x", "@ben:x", "@ghost:x"]
-                .iter()
-                .map(|s| (*s).try_into().unwrap())
-                .collect(),
-        )]
-        .into();
-        e.sync_members(&groups, at(2026, 10, 22, 10, 0)).await;
+        let people = || {
+            vec![
+                resident("anna", &["kitchen-floor-1"]),
+                resident("ben", &["kitchen-floor-1"]),
+                resident("ghost", &["kitchen-floor-1"]),
+            ]
+        };
+        sync(
+            &e,
+            house_read(people(), at(2026, 10, 22, 10, 0)),
+            at(2026, 10, 22, 10, 0),
+        )
+        .await;
         let here: Vec<String> = e
             .chat
             .members
@@ -3511,35 +4194,25 @@ mod tests {
             .lock()
             .unwrap()
             .retain(|(_, m)| m.id != "@ben:x");
-        e.sync_members(&groups, at(2026, 10, 22, 10, 15)).await;
-        assert!(!e
-            .chat
-            .members
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(_, m)| m.id == "@ben:x"));
+        let now = at(2026, 10, 22, 10, 15);
+        sync(&e, house_read(people(), now), now).await;
+        assert!(!members_of(&e, "!k1:x").contains("@ben:x"));
         e.chat.unknown.lock().unwrap().clear();
-        e.sync_members(&groups, at(2026, 10, 22, 12, 0)).await;
-        assert!(!e
-            .chat
-            .members
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(_, m)| m.id == "@ghost:x"));
-        e.sync_members(&groups, at(2026, 10, 23, 11, 0)).await;
-        assert!(e
-            .chat
-            .members
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(_, m)| m.id == "@ghost:x"));
+        let now = at(2026, 10, 22, 12, 0);
+        sync(&e, house_read(people(), now), now).await;
+        assert!(!members_of(&e, "!k1:x").contains("@ghost:x"));
+        let now = at(2026, 10, 23, 11, 0);
+        sync(&e, house_read(people(), now), now).await;
+        assert!(members_of(&e, "!k1:x").contains("@ghost:x"));
         // a group the directory does not know: the room is left alone
         let before = e.chat.members.lock().unwrap().len();
-        e.sync_members(&Groups::new(), at(2026, 10, 23, 12, 0))
-            .await;
+        let now = at(2026, 10, 23, 12, 0);
+        sync(
+            &e,
+            read(vec![resident("x", &["residents"])], &["residents"], now),
+            now,
+        )
+        .await;
         assert_eq!(e.chat.members.lock().unwrap().len(), before);
     }
 
@@ -3550,13 +4223,6 @@ mod tests {
                 id: id.try_into().unwrap(),
                 admin,
             },
-        )
-    }
-
-    fn group(name: &str, ids: &[&str]) -> (String, BTreeSet<OwnedUserId>) {
-        (
-            name.to_owned(),
-            ids.iter().map(|s| (*s).try_into().unwrap()).collect(),
         )
     }
 
@@ -3573,6 +4239,27 @@ mod tests {
 
     fn set_of(ids: &[&str]) -> BTreeSet<String> {
         ids.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn removed_from(e: &Engine<FakeWiki, FakeChat>, room: &str) -> Vec<String> {
+        e.chat
+            .removed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(r, _, _)| r == room)
+            .map(|(_, u, _)| u.clone())
+            .collect()
+    }
+
+    fn admin_notes(e: &Engine<FakeWiki, FakeChat>) -> Vec<String> {
+        e.chat
+            .admin_notes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, t)| t.clone())
+            .collect()
     }
 
     #[tokio::test]
@@ -3595,8 +4282,13 @@ mod tests {
             in_room("!fin:x", "@ben:x", false),
         ]);
         // the last members left the kitchen's group: it exists, with nobody in it
-        let groups: Groups = [group("kitchen-floor-1", &[]), group("finance", &["@ben:x"])].into();
-        e.sync_members(&groups, at(2026, 10, 22, 10, 0)).await;
+        let now = at(2026, 10, 22, 10, 0);
+        sync(
+            &e,
+            house_read(vec![resident("ben", &["finance"])], now),
+            now,
+        )
+        .await;
         assert_eq!(
             members_of(&e, "!k1:x"),
             set_of(&[
@@ -3616,12 +4308,12 @@ mod tests {
         assert!(removed.iter().all(|(r, _, _)| r == "!k1:x"));
         assert!(e.state.lock().await.rooms["!k1:x"].invited.is_empty());
         // someone joins the group again: invited again
-        let groups: Groups = [
-            group("kitchen-floor-1", &["@anna:x"]),
-            group("finance", &["@ben:x"]),
-        ]
-        .into();
-        e.sync_members(&groups, at(2026, 10, 22, 10, 15)).await;
+        let now = at(2026, 10, 22, 10, 15);
+        let people = vec![
+            resident("anna", &["kitchen-floor-1"]),
+            resident("ben", &["finance"]),
+        ];
+        sync(&e, house_read(people, now), now).await;
         assert!(members_of(&e, "!k1:x").contains("@anna:x"));
     }
 
@@ -3629,9 +4321,7 @@ mod tests {
     async fn an_empty_house_group_changes_no_room() {
         let mut house = plenum("house", "House plenum", "!house:x");
         house.group = Some("residents".into());
-        let t = setup(vec![kitchen(), house]);
-        let mut e = t.engine;
-        e.me = Some("@plenum-bot:x".try_into().unwrap());
+        let e = managing(vec![kitchen(), house]);
         e.chat.members.lock().unwrap().extend([
             in_room("!house:x", "@plenum-bot:x", true),
             in_room("!house:x", "@anna:x", false),
@@ -3640,14 +4330,747 @@ mod tests {
         ]);
         let before = e.chat.members.lock().unwrap().clone();
         // a broken directory: residents exists with nobody in it
-        let groups: Groups = [
-            group("residents", &[]),
-            group("kitchen-floor-1", &["@anna:x"]),
-        ]
-        .into();
-        e.sync_members(&groups, at(2026, 10, 22, 10, 0)).await;
+        let now = at(2026, 10, 22, 10, 0);
+        let why = e
+            .sync_members_after(
+                Ok(house_read(
+                    vec![resident("cara", &["kitchen-floor-1"])],
+                    now,
+                )),
+                now,
+            )
+            .await
+            .unwrap_err();
+        assert!(why.contains("residents"), "{why}");
         assert_eq!(*e.chat.members.lock().unwrap(), before);
         assert!(e.chat.removed.lock().unwrap().is_empty());
+        assert!(e.state.lock().await.rooms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_stale_directory_read_changes_nothing() {
+        let e = managing(vec![kitchen(), plenum("house", "House plenum", "!house:x")]);
+        e.chat.members.lock().unwrap().extend([
+            in_room("!k1:x", "@plenum-bot:x", true),
+            in_room("!k1:x", "@anna:x", false),
+            in_room("!k1:x", "@eve:x", false),
+        ]);
+        let before = e.chat.members.lock().unwrap().clone();
+        let now = at(2026, 10, 22, 10, 0);
+        let why = e
+            .sync_members_after(Err(anyhow::anyhow!("reading the directory: 403")), now)
+            .await
+            .unwrap_err();
+        assert!(why.contains("403"), "{why}");
+        // a read older than stale_after (60 min): nothing either
+        let people = || {
+            vec![
+                resident("anna", &["kitchen-floor-1"]),
+                resident("ben", &["kitchen-floor-1"]),
+            ]
+        };
+        let old = house_read(people(), now - Duration::minutes(61));
+        assert!(e
+            .sync_members(&old, now)
+            .await
+            .unwrap_err()
+            .contains("61 min"));
+        assert_eq!(*e.chat.members.lock().unwrap(), before);
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+        assert!(e.state.lock().await.rooms.is_empty());
+        // a read that worked: the same path changes the room
+        let now = at(2026, 10, 22, 10, 15);
+        sync(&e, house_read(people(), now), now).await;
+        assert_eq!(
+            members_of(&e, "!k1:x"),
+            set_of(&["@plenum-bot:x", "@anna:x", "@ben:x"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_teams_group_counts_only_for_residents() {
+        let mut house = plenum("house", "House plenum", "!house:x");
+        house.group = Some("residents".into());
+        let mut k = kitchen();
+        k.require_group = Some("residents".into());
+        let e = managing(vec![house, k]);
+        e.chat.members.lock().unwrap().extend([
+            in_room("!k1:x", "@plenum-bot:x", true),
+            in_room("!k1:x", "@nick:x", true),
+            in_room("!k1:x", "@anna:x", false),
+            in_room("!k1:x", "@olaf:x", false), // moved out, still in the kitchen's group
+            in_room("!house:x", "@plenum-bot:x", true),
+            in_room("!house:x", "@anna:x", false),
+            in_room("!house:x", "@olaf:x", false),
+        ]);
+        let people = vec![
+            resident("anna", &["residents", "kitchen-floor-1"]),
+            resident("cara", &["residents", "kitchen-floor-1"]),
+            resident("olaf", &["former-residents", "kitchen-floor-1"]),
+            resident("ben", &["kitchen-floor-1"]),
+        ];
+        // without the house group in the read, the kitchen and the house are left alone
+        let now = at(2026, 10, 22, 9, 0);
+        let partial = read(
+            vec![resident("anna", &["kitchen-floor-1"])],
+            &["kitchen-floor-1"],
+            now,
+        );
+        sync(&e, partial, now).await;
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+        let now = at(2026, 10, 22, 10, 0);
+        sync(&e, house_read(people, now), now).await;
+        // olaf (person E) is removed, ben (not living here) is not invited, cara (lives here) is
+        assert_eq!(
+            members_of(&e, "!k1:x"),
+            set_of(&["@plenum-bot:x", "@nick:x", "@anna:x", "@cara:x"])
+        );
+        assert_eq!(
+            members_of(&e, "!house:x"),
+            set_of(&["@plenum-bot:x", "@anna:x", "@cara:x"])
+        );
+        let removed = e.chat.removed.lock().unwrap().clone();
+        let kitchen_removal = removed.iter().find(|(r, _, _)| r == "!k1:x").unwrap();
+        assert_eq!(kitchen_removal.1, "@olaf:x");
+        assert!(
+            kitchen_removal.2.contains("kitchen-floor-1")
+                && kitchen_removal.2.contains("residents"),
+            "{}",
+            kitchen_removal.2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_room_with_a_plenum_without_group_is_never_managed() {
+        let e = managing(vec![plenum("house", "House plenum", "!house:x")]);
+        e.chat
+            .members
+            .lock()
+            .unwrap()
+            .push(in_room("!house:x", "@eve:x", false));
+        let now = at(2026, 10, 22, 10, 0);
+        sync(
+            &e,
+            house_read(vec![resident("anna", &["residents"])], now),
+            now,
+        )
+        .await;
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+    }
+
+    fn kitchen3() -> Plenum {
+        Plenum {
+            group: Some("kitchen-floor-3".into()),
+            require_group: Some("residents".into()),
+            access: Access::Members,
+            ..plenum("kitchen-floor-3", "Kitchen plenum 3rd floor", "!k3:x")
+        }
+    }
+
+    fn house_with_group() -> Plenum {
+        Plenum {
+            group: Some("residents".into()),
+            ..plenum("house", "House plenum", "!house:x")
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_chosen_account_is_invited_and_the_others_stay() {
+        let mut e = managing(vec![house_with_group()]);
+        e.ask_to_choose = true;
+        e.choose_url = Some("https://login.x/flow/".into());
+        // B joined with the house account on their own before choosing a link
+        e.chat.members.lock().unwrap().extend([
+            in_room("!house:x", "@plenum-bot:x", true),
+            in_room("!house:x", "@b:x", false),
+        ]);
+        let people = || {
+            vec![
+                resident("z", &["residents"]),
+                // A: only the house account, nothing chosen
+                unchosen("a", &["residents"]),
+                // B: chose a verified link
+                linked(unchosen("b", &["residents"]), "@b:matrix.org", true),
+                // C: two links and the house account, chose one
+                linked(
+                    linked(unchosen("c", &["residents"]), "@c:matrix.org", false),
+                    "@c:example.org",
+                    true,
+                ),
+            ]
+        };
+        let now = at(2026, 10, 22, 10, 0);
+        sync(&e, house_read(people(), now), now).await;
+        assert_eq!(
+            members_of(&e, "!house:x"),
+            set_of(&[
+                "@plenum-bot:x",
+                "@z:x",
+                "@b:x",
+                "@b:matrix.org",
+                "@c:example.org"
+            ])
+        );
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+        // A is asked once, in German, at the house account, with the flow's address
+        let dms = e.chat.dms.lock().unwrap().clone();
+        assert_eq!(dms.len(), 1, "{dms:?}");
+        assert_eq!(dms[0].0, "@a:x");
+        assert!(
+            dms[0].1.contains("https://login.x/flow/") && dms[0].1.contains("!link a"),
+            "{}",
+            dms[0].1
+        );
+        assert!(dms[0].1.contains("House plenum"), "{}", dms[0].1);
+        // C's other accounts joining on their own are tolerated, never removed
+        e.chat.members.lock().unwrap().extend([
+            in_room("!house:x", "@c:matrix.org", false),
+            in_room("!house:x", "@c:x", false),
+        ]);
+        let now = at(2026, 10, 22, 10, 15);
+        sync(&e, house_read(people(), now), now).await;
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+        // nobody is invited twice, nor asked again within two weeks
+        let invited = e.chat.members.lock().unwrap().len();
+        let now = at(2026, 11, 4, 10, 0);
+        sync(&e, house_read(people(), now), now).await;
+        assert_eq!(e.chat.members.lock().unwrap().len(), invited);
+        assert_eq!(e.chat.dms.lock().unwrap().len(), 1);
+        // two weeks later: asked again, three times at most
+        for now in [
+            at(2026, 11, 5, 10, 0),
+            at(2026, 11, 19, 10, 0),
+            at(2026, 12, 3, 10, 0),
+        ] {
+            sync(&e, house_read(people(), now), now).await;
+        }
+        let asked = e.chat.dms.lock().unwrap().len();
+        assert_eq!(asked, 3);
+        assert_eq!(e.state.lock().await.people.asked["u-a"].times, 3);
+    }
+
+    #[tokio::test]
+    async fn without_ask_to_choose_nobody_is_written_to() {
+        let e = managing(vec![house_with_group()]);
+        let now = at(2026, 10, 22, 10, 0);
+        sync(
+            &e,
+            house_read(vec![unchosen("a", &["residents"])], now),
+            now,
+        )
+        .await;
+        assert!(e.chat.dms.lock().unwrap().is_empty());
+        assert!(members_of(&e, "!house:x").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_new_chosen_account_is_invited_and_the_old_one_stays() {
+        let e = managing(vec![house_with_group()]);
+        e.chat
+            .members
+            .lock()
+            .unwrap()
+            .push(in_room("!house:x", "@h:x", false));
+        let before = linked(resident("h", &["residents"]), "@h:matrix.org", false);
+        let after = linked(unchosen("h", &["residents"]), "@h:matrix.org", true);
+        let now = at(2026, 10, 22, 10, 0);
+        sync(&e, house_read(vec![before], now), now).await;
+        assert_eq!(members_of(&e, "!house:x"), set_of(&["@h:x"]));
+        let now = at(2026, 10, 22, 10, 15);
+        sync(&e, house_read(vec![after.clone()], now), now).await;
+        assert_eq!(
+            members_of(&e, "!house:x"),
+            set_of(&["@h:x", "@h:matrix.org"])
+        );
+        // they leave with both: neither is invited again (no loop)
+        e.chat.members.lock().unwrap().clear();
+        for minutes in [30, 45] {
+            let now = at(2026, 10, 22, 10, minutes);
+            sync(&e, house_read(vec![after.clone()], now), now).await;
+        }
+        assert!(members_of(&e, "!house:x").is_empty());
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_kitchen_change_moves_the_rooms() {
+        let mut k1 = kitchen();
+        k1.require_group = Some("residents".into());
+        let e = managing(vec![house_with_group(), k1, kitchen3()]);
+        e.chat.members.lock().unwrap().extend([
+            in_room("!k1:x", "@d:x", false),
+            in_room("!house:x", "@d:x", false),
+        ]);
+        let now = at(2026, 10, 22, 10, 0);
+        sync(
+            &e,
+            house_read(vec![resident("d", &["residents", "kitchen-floor-3"])], now),
+            now,
+        )
+        .await;
+        assert_eq!(removed_from(&e, "!k1:x"), ["@d:x"]);
+        assert!(removed_from(&e, "!house:x").is_empty());
+        assert!(members_of(&e, "!k3:x").contains("@d:x"));
+    }
+
+    #[tokio::test]
+    async fn a_deactivated_person_is_removed_and_the_admins_told_once() {
+        let e = managing(vec![house_with_group(), kitchen()]);
+        e.chat.members.lock().unwrap().extend([
+            in_room("!house:x", "@f:x", false),
+            in_room("!house:x", "@g:x", false),
+            in_room("!k1:x", "@f:x", false),
+        ]);
+        let mut f = resident("f", &[]);
+        f.active = false;
+        let people = || vec![f.clone(), resident("g", &["residents"])];
+        let now = at(2026, 10, 22, 10, 0);
+        sync(&e, house_read(people(), now), now).await;
+        assert_eq!(removed_from(&e, "!house:x"), ["@f:x"]);
+        assert_eq!(removed_from(&e, "!k1:x"), ["@f:x"]);
+        let notes = admin_notes(&e);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("f is deactivated")
+                && notes[0].contains("still active")
+                && notes[0].contains("OPERATIONS.md"),
+            "{}",
+            notes[0]
+        );
+        // back in a room (re-joined by hand): removed again, the admins not told again
+        e.chat
+            .members
+            .lock()
+            .unwrap()
+            .push(in_room("!house:x", "@f:x", false));
+        let now = at(2026, 10, 22, 10, 15);
+        sync(&e, house_read(people(), now), now).await;
+        assert_eq!(removed_from(&e, "!house:x"), ["@f:x", "@f:x"]);
+        assert_eq!(admin_notes(&e).len(), 1);
+        assert!(e.state.lock().await.people.deactivated.contains("u-f"));
+    }
+
+    #[tokio::test]
+    async fn an_unusable_choice_and_a_claimed_account_change_nothing_and_the_admins_hear_once() {
+        let e = managing(vec![house_with_group()]);
+        // the shared account: two people claim it, it stays where it is
+        e.chat.members.lock().unwrap().extend([
+            in_room("!house:x", "@shared:matrix.org", false),
+            in_room("!house:x", "@i:x", false),
+        ]);
+        let mut i = unchosen("i", &["residents"]);
+        i.choice = Choice::Account("@i:matrix.org".try_into().unwrap()); // not verified
+        let people = || {
+            vec![
+                i.clone(),
+                linked(resident("j", &["residents"]), "@shared:matrix.org", false),
+                linked(unchosen("k", &[]), "@shared:matrix.org", false),
+            ]
+        };
+        for minutes in [0, 15] {
+            let now = at(2026, 10, 22, 10, minutes);
+            sync(&e, house_read(people(), now), now).await;
+        }
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+        assert_eq!(
+            members_of(&e, "!house:x"),
+            set_of(&["@shared:matrix.org", "@i:x", "@j:x"])
+        );
+        // once each: the account two claim, who cannot be invited, the unusable choice
+        let notes = admin_notes(&e);
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert!(
+            notes[0].contains("@shared:matrix.org is a Matrix account of j and k"),
+            "{}",
+            notes[0]
+        );
+        assert!(
+            notes[1].contains("1 person cannot be invited")
+                && notes[1].contains("- i (their choice cannot be used): House plenum"),
+            "{}",
+            notes[1]
+        );
+        assert!(
+            notes[2].contains("i chose @i:matrix.org") && notes[2].contains("verified"),
+            "{}",
+            notes[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claimed_account_nobody_here_belongs_to_goes() {
+        // olaf moved out; the link he and ben (not in the kitchen) both claim is in the kitchen
+        let mut k = kitchen();
+        k.require_group = Some("residents".into());
+        let e = managing(vec![house_with_group(), k]);
+        e.chat.members.lock().unwrap().extend([
+            in_room("!k1:x", "@shared:matrix.org", false),
+            in_room("!k1:x", "@anna:x", false),
+            in_room("!house:x", "@shared:matrix.org", false),
+        ]);
+        let people = || {
+            vec![
+                resident("anna", &["residents", "kitchen-floor-1"]),
+                linked(
+                    resident("olaf", &["former-residents", "kitchen-floor-1"]),
+                    "@shared:matrix.org",
+                    false,
+                ),
+                linked(resident("ben", &["residents"]), "@shared:matrix.org", false),
+            ]
+        };
+        for minutes in [0, 15] {
+            let now = at(2026, 10, 22, 10, minutes);
+            sync(&e, house_read(people(), now), now).await;
+        }
+        assert_eq!(removed_from(&e, "!k1:x"), ["@shared:matrix.org"]);
+        // ben belongs in the house's room: there it stays
+        assert!(removed_from(&e, "!house:x").is_empty());
+        let notes = admin_notes(&e);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("of ben and olaf"), "{}", notes[0]);
+    }
+
+    #[tokio::test]
+    async fn the_admins_hear_who_cannot_be_invited_when_the_list_grows() {
+        let e = managing(vec![house_with_group(), kitchen()]);
+        let mut people = vec![
+            unchosen("a", &["residents", "kitchen-floor-1"]),
+            unchosen("b", &["residents"]),
+        ];
+        let now = at(2026, 10, 22, 10, 0);
+        sync(&e, house_read(people.clone(), now), now).await;
+        let notes = admin_notes(&e);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("2 people cannot be invited")
+                && notes[0]
+                    .contains("- a (has not chosen): House plenum, Kitchen plenum 1st floor")
+                && notes[0].contains("- b (has not chosen): House plenum")
+                && notes[0].contains("ask_to_choose` is off"),
+            "{}",
+            notes[0]
+        );
+        // the same list: nothing new; b chose: no news either
+        let now = at(2026, 10, 22, 10, 15);
+        sync(&e, house_read(people.clone(), now), now).await;
+        people[1] = resident("b", &["residents"]);
+        let now = at(2026, 10, 22, 10, 30);
+        sync(&e, house_read(people.clone(), now), now).await;
+        assert_eq!(admin_notes(&e).len(), 1);
+        // c is new: the whole list again
+        people.push(unchosen("c", &["residents"]));
+        let now = at(2026, 10, 22, 10, 45);
+        sync(&e, house_read(people.clone(), now), now).await;
+        let notes = admin_notes(&e);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(
+            notes[1].contains("2 people cannot be invited") && notes[1].contains("- c ("),
+            "{}",
+            notes[1]
+        );
+        // everyone chose: nothing; a falling back later is news again, with a new key
+        let chose: Vec<DirPerson> = ["a", "b", "c"]
+            .iter()
+            .map(|n| resident(n, &["residents"]))
+            .collect();
+        let now = at(2026, 10, 22, 11, 0);
+        sync(&e, house_read(chose, now), now).await;
+        assert_eq!(admin_notes(&e).len(), 2);
+        let now = at(2026, 10, 23, 11, 0);
+        sync(
+            &e,
+            house_read(vec![unchosen("a", &["residents"])], now),
+            now,
+        )
+        .await;
+        assert_eq!(admin_notes(&e).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_recurring_notice_gets_a_new_key() {
+        // like the homeserver, the fake chat drops a key it has seen: each episode is told
+        let e = managing(vec![house_with_group()]);
+        let mut f = resident("f", &[]);
+        f.active = false;
+        let g = resident("g", &["residents"]);
+        e.chat.members.lock().unwrap().extend([
+            in_room("!house:x", "@f:x", false),
+            in_room("!house:x", "@g:x", false),
+        ]);
+        let now = at(2026, 10, 22, 10, 0);
+        sync(&e, house_read(vec![f.clone(), g.clone()], now), now).await;
+        assert_eq!(admin_notes(&e).len(), 1);
+        // active again, then deactivated again another day: told again
+        let now = at(2026, 10, 23, 10, 0);
+        sync(
+            &e,
+            house_read(vec![resident("f", &["residents"]), g.clone()], now),
+            now,
+        )
+        .await;
+        e.chat
+            .members
+            .lock()
+            .unwrap()
+            .push(in_room("!house:x", "@f:x", false));
+        let now = at(2026, 10, 24, 10, 0);
+        sync(&e, house_read(vec![f, g], now), now).await;
+        let notes = admin_notes(&e);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[1].contains("f is deactivated"), "{}", notes[1]);
+
+        // the same hold again after it ended: a new notice
+        let e = managing(vec![house_with_group()]);
+        let everyone = ["@a:x", "@b:x", "@c:x", "@d:x", "@e:x"];
+        let fill = |e: &Engine<FakeWiki, FakeChat>| {
+            let mut m = e.chat.members.lock().unwrap();
+            m.clear();
+            m.extend(everyone.iter().map(|w| in_room("!house:x", w, false)));
+        };
+        let few = || vec![resident("a", &["residents"])];
+        let all = || {
+            ["a", "b", "c", "d", "e"]
+                .iter()
+                .map(|n| resident(n, &["residents"]))
+                .collect::<Vec<_>>()
+        };
+        fill(&e);
+        let now = at(2026, 10, 22, 10, 0);
+        sync(&e, house_read(few(), now), now).await;
+        assert_eq!(admin_notes(&e).len(), 1);
+        let now = at(2026, 10, 22, 10, 15);
+        sync(&e, house_read(all(), now), now).await;
+        assert!(e.state.lock().await.rooms["!house:x"].hold.is_none());
+        let now = at(2026, 10, 23, 10, 0);
+        sync(&e, house_read(few(), now), now).await;
+        let notes = admin_notes(&e);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[1].contains("4 removals held"), "{}", notes[1]);
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn many_removals_wait_for_an_admin() {
+        let e = managing(vec![house_with_group()]);
+        e.chat
+            .aliases
+            .lock()
+            .unwrap()
+            .push(("#house-plenum:x".into(), "!house:x".into()));
+        for who in ["@a:x", "@b:x", "@c:x", "@d:x", "@e:x", "@f:x"] {
+            e.chat
+                .members
+                .lock()
+                .unwrap()
+                .push(in_room("!house:x", who, false));
+        }
+        // a wrong read: only a, b and a newcomer live here; four would go at once
+        let people = || {
+            vec![
+                resident("a", &["residents"]),
+                resident("b", &["residents"]),
+                resident("new", &["residents"]),
+            ]
+        };
+        for minutes in [0, 15] {
+            let now = at(2026, 10, 22, 10, minutes);
+            sync(&e, house_read(people(), now), now).await;
+        }
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+        // invitations still go out
+        assert!(members_of(&e, "!house:x").contains("@new:x"));
+        let notes = admin_notes(&e);
+        assert_eq!(notes.len(), 1, "told once: {notes:?}");
+        let digest = e.state.lock().await.rooms["!house:x"]
+            .hold
+            .as_ref()
+            .unwrap()
+            .digest();
+        assert!(
+            notes[0].contains("4 removals held")
+                && notes[0].contains(&format!("!members confirm house {digest}")),
+            "{}",
+            notes[0]
+        );
+        let admin = Sender {
+            id: "@admin:x".try_into().unwrap(),
+            name: "Admin".into(),
+        };
+        let now = at(2026, 10, 22, 10, 20);
+        let dm: OwnedRoomId = "!admin-dm:x".try_into().unwrap();
+        // not in a room, not for an unknown room
+        let a = e
+            .command(&room(), &admin, cmd("!members confirm house"), now)
+            .await;
+        assert!(a.contains("direct chat"), "{a}");
+        let a = e
+            .command_in(
+                &dm,
+                &admin,
+                cmd("!members confirm nowhere"),
+                now,
+                Scope::AdminDm,
+            )
+            .await;
+        assert!(a.contains("No room"), "{a}");
+        let a = e
+            .command_in(&dm, &admin, cmd("!members"), now, Scope::AdminDm)
+            .await;
+        assert!(
+            a.contains("4 removals held") && a.contains(&format!("`{digest}`")),
+            "{a}"
+        );
+        // without the digest, or another one: nothing is confirmed, the plan is shown
+        for wrong in ["!members confirm house", "!members confirm house 00000000"] {
+            let a = e
+                .command_in(&dm, &admin, cmd(wrong), now, Scope::AdminDm)
+                .await;
+            assert!(
+                a.contains("nothing was confirmed")
+                    && a.contains(&digest)
+                    && a.contains("@c:x, @d:x, @e:x, @f:x"),
+                "{a}"
+            );
+            assert!(
+                !e.state.lock().await.rooms["!house:x"]
+                    .hold
+                    .as_ref()
+                    .unwrap()
+                    .confirmed
+            );
+        }
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+        // confirmed by its alias and digest: carried out at once with the last read
+        let a = e
+            .command_in(
+                &dm,
+                &admin,
+                cmd(&format!("!members confirm #house-plenum:x {digest}")),
+                now,
+                Scope::AdminDm,
+            )
+            .await;
+        assert!(
+            a.contains("carried out: removed @c:x, @d:x, @e:x, @f:x."),
+            "{a}"
+        );
+        assert_eq!(
+            removed_from(&e, "!house:x"),
+            ["@c:x", "@d:x", "@e:x", "@f:x"]
+        );
+        assert!(e.state.lock().await.rooms["!house:x"].hold.is_none());
+        let a = e
+            .command_in(
+                &dm,
+                &admin,
+                cmd(&format!("!members confirm house {digest}")),
+                now,
+                Scope::AdminDm,
+            )
+            .await;
+        assert!(a.contains("Nothing is held"), "{a}");
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_is_for_the_plan_it_saw() {
+        let e = managing(vec![house_with_group()]);
+        for who in ["@a:x", "@b:x", "@c:x", "@d:x", "@e:x"] {
+            e.chat
+                .members
+                .lock()
+                .unwrap()
+                .push(in_room("!house:x", who, false));
+        }
+        let now = at(2026, 10, 22, 10, 0);
+        sync(
+            &e,
+            house_read(vec![resident("a", &["residents"])], now),
+            now,
+        )
+        .await;
+        assert_eq!(admin_notes(&e).len(), 1);
+        {
+            let mut st = e.state.lock().await;
+            let room = st.rooms.get_mut("!house:x").unwrap();
+            let digest = room.hold.as_ref().unwrap().digest();
+            assert_eq!(room.confirm(&digest), Confirm::Confirmed);
+        }
+        // the next read is different (b came back): a new plan, held and told anew
+        let people = vec![resident("a", &["residents"]), resident("b", &["residents"])];
+        let now = at(2026, 10, 22, 10, 15);
+        // c, d, e: three of five is still more than two
+        sync(&e, house_read(people.clone(), now), now).await;
+        assert!(e.chat.removed.lock().unwrap().is_empty());
+        assert_eq!(admin_notes(&e).len(), 2);
+        // the plan shrinks within the limit: the hold ends by itself
+        let mut more = people;
+        more.push(resident("c", &["residents"]));
+        let now = at(2026, 10, 22, 10, 30);
+        sync(&e, house_read(more, now), now).await;
+        assert_eq!(removed_from(&e, "!house:x"), ["@d:x", "@e:x"]);
+        assert!(e.state.lock().await.rooms["!house:x"].hold.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_restart_between_rounds_repeats_nothing() {
+        let mut t = setup(vec![house_with_group(), kitchen()]);
+        t.engine.me = Some("@plenum-bot:x".try_into().unwrap());
+        t.engine.ask_to_choose = true;
+        t.engine.choose_url = Some("https://login.x/flow/".into());
+        t.engine.chat.members.lock().unwrap().extend([
+            in_room("!house:x", "@old:x", false),
+            in_room("!k1:x", "@a:x", false),
+        ]);
+        let people = || {
+            vec![
+                resident("a", &["residents", "kitchen-floor-1"]),
+                resident("b", &["residents", "kitchen-floor-1"]),
+                unchosen("u", &["residents"]),
+            ]
+        };
+        let now = at(2026, 10, 22, 10, 0);
+        sync(&t.engine, house_read(people(), now), now).await;
+        assert_eq!(removed_from(&t.engine, "!house:x"), ["@old:x"]);
+        let members = t.engine.chat.members.lock().unwrap().clone();
+        assert_eq!(t.engine.chat.dms.lock().unwrap().len(), 1);
+        // each room's state was saved on its own
+        let saved = State::load(&t._dir.path().join("state.json"))
+            .await
+            .unwrap();
+        assert!(saved.rooms.contains_key("!house:x") && saved.rooms.contains_key("!k1:x"));
+        restart(&mut t).await;
+        t.engine.me = Some("@plenum-bot:x".try_into().unwrap());
+        t.engine.ask_to_choose = true;
+        t.engine.choose_url = Some("https://login.x/flow/".into());
+        *t.engine.chat.members.lock().unwrap() = members.clone();
+        let now = at(2026, 10, 22, 10, 15);
+        sync(&t.engine, house_read(people(), now), now).await;
+        assert_eq!(*t.engine.chat.members.lock().unwrap(), members);
+        assert!(t.engine.chat.removed.lock().unwrap().is_empty());
+        assert!(t.engine.chat.dms.lock().unwrap().is_empty());
+        assert!(t.engine.chat.admin_notes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mentions_go_to_the_chosen_account_else_the_house_account() {
+        let e = managing(vec![house_with_group()]);
+        let mut gone = resident("gone", &[]);
+        gone.active = false;
+        e.set_people(&People::new(vec![
+            linked(unchosen("ben", &[]), "@ben:matrix.org", true),
+            linked(unchosen("anna", &[]), "@anna:matrix.org", false),
+            gone,
+        ]));
+        assert_eq!(
+            e.account_of("ben").map(|a| a.to_string()).as_deref(),
+            Some("@ben:matrix.org")
+        );
+        assert_eq!(
+            e.account_of("Anna").map(|a| a.to_string()).as_deref(),
+            Some("@anna:x")
+        );
+        assert_eq!(e.account_of("gone"), None);
     }
 
     #[tokio::test]
@@ -3689,105 +5112,6 @@ mod tests {
             .unwrap()
             .text
             .ends_with("Our rule."));
-    }
-
-    #[tokio::test]
-    async fn a_failed_directory_read_changes_nothing() {
-        let t = setup(vec![kitchen(), plenum("house", "House plenum", "!house:x")]);
-        let mut e = t.engine;
-        e.me = Some("@plenum-bot:x".try_into().unwrap());
-        e.chat.members.lock().unwrap().extend([
-            in_room("!k1:x", "@plenum-bot:x", true),
-            in_room("!k1:x", "@anna:x", false),
-            in_room("!k1:x", "@eve:x", false),
-        ]);
-        let before = e.chat.members.lock().unwrap().clone();
-        e.sync_members_after(
-            Err(anyhow::anyhow!("reading the directory: 403")),
-            at(2026, 10, 22, 10, 0),
-        )
-        .await;
-        assert_eq!(*e.chat.members.lock().unwrap(), before);
-        assert!(e.chat.removed.lock().unwrap().is_empty());
-        assert!(e.state.lock().await.rooms.is_empty());
-        // a read that worked: the same path changes the room
-        e.sync_members_after(
-            Ok([group("kitchen-floor-1", &["@anna:x"])].into()),
-            at(2026, 10, 22, 10, 15),
-        )
-        .await;
-        assert_eq!(
-            members_of(&e, "!k1:x"),
-            set_of(&["@plenum-bot:x", "@anna:x"])
-        );
-    }
-
-    #[tokio::test]
-    async fn a_teams_group_counts_only_for_residents() {
-        let mut house = plenum("house", "House plenum", "!house:x");
-        house.group = Some("residents".into());
-        let mut k = kitchen();
-        k.require_group = Some("residents".into());
-        let t = setup(vec![house, k]);
-        let mut e = t.engine;
-        e.me = Some("@plenum-bot:x".try_into().unwrap());
-        e.chat.members.lock().unwrap().extend([
-            in_room("!k1:x", "@plenum-bot:x", true),
-            in_room("!k1:x", "@nick:x", true),
-            in_room("!k1:x", "@anna:x", false),
-            in_room("!k1:x", "@olaf:x", false), // moved out, still in the kitchen's group
-            in_room("!house:x", "@plenum-bot:x", true),
-            in_room("!house:x", "@anna:x", false),
-            in_room("!house:x", "@olaf:x", false),
-        ]);
-        let groups: Groups = [
-            group("residents", &["@anna:x", "@cara:x"]),
-            group(
-                "kitchen-floor-1",
-                &["@anna:x", "@olaf:x", "@ben:x", "@cara:x"],
-            ),
-        ]
-        .into();
-        // without the house group in the answer, the kitchen is left alone
-        let partial: Groups = [group("kitchen-floor-1", &["@anna:x"])].into();
-        e.sync_members(&partial, at(2026, 10, 22, 9, 0)).await;
-        assert!(e.chat.removed.lock().unwrap().is_empty());
-        e.sync_members(&groups, at(2026, 10, 22, 10, 0)).await;
-        // olaf is removed, ben (not living here) is not invited, cara (lives here) is
-        assert_eq!(
-            members_of(&e, "!k1:x"),
-            set_of(&["@plenum-bot:x", "@nick:x", "@anna:x", "@cara:x"])
-        );
-        assert_eq!(
-            members_of(&e, "!house:x"),
-            set_of(&["@plenum-bot:x", "@anna:x", "@cara:x"])
-        );
-        let removed = e.chat.removed.lock().unwrap().clone();
-        let kitchen_removal = removed.iter().find(|(r, _, _)| r == "!k1:x").unwrap();
-        assert_eq!(kitchen_removal.1, "@olaf:x");
-        assert!(
-            kitchen_removal.2.contains("kitchen-floor-1")
-                && kitchen_removal.2.contains("residents"),
-            "{}",
-            kitchen_removal.2
-        );
-    }
-
-    #[tokio::test]
-    async fn a_room_with_a_plenum_without_group_is_never_managed() {
-        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
-        let mut e = t.engine;
-        e.me = Some("@plenum-bot:x".try_into().unwrap());
-        e.chat.members.lock().unwrap().push((
-            "!house:x".into(),
-            Member {
-                id: "@eve:x".try_into().unwrap(),
-                admin: false,
-            },
-        ));
-        e.sync_members(&Groups::new(), at(2026, 10, 22, 10, 0))
-            .await;
-        assert!(e.chat.removed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3859,12 +5183,18 @@ mod tests {
     async fn a_confidential_meeting_keeps_its_minutes_in_the_wiki_and_out_of_the_chat() {
         let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
-        e.set_people(&[mxbot_common::directory::Person {
+        let house: OwnedUserId = "@ben:house.org".try_into().unwrap();
+        e.set_people(&People::new(vec![DirPerson {
+            id: "u-ben".into(),
             username: "ben".into(),
             name: "Ben Berg".into(),
-            accounts: vec!["@ben:house.org".try_into().unwrap()],
+            active: true,
+            accounts: vec![house.clone()],
             groups: Default::default(),
-        }]);
+            house: Some(house),
+            links: Vec::new(),
+            choice: Choice::None,
+        }]));
         let now = at(2026, 10, 20, 12, 0);
         let a = e
             .command(&room(), &anna(), cmd("!minutes confidential"), now)

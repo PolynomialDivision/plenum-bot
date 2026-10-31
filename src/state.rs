@@ -10,9 +10,9 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    calendar::Occurrence, config::Publication, members::RoomMembers, schedule::MeetingKey,
-};
+use mxbot_common::membership::{Notices, Remembered};
+
+use crate::{calendar::Occurrence, config::Publication, schedule::MeetingKey};
 
 /// Meetings kept per plenum; older ones are dropped (their protocols stay in Outline).
 const KEEP_MEETINGS: usize = 60;
@@ -27,9 +27,13 @@ const KEEP_WITHHELD: usize = 200;
 pub struct State {
     #[serde(default)]
     pub plenums: BTreeMap<String, PlenumState>,
-    /// Per room ID: whom the bot invited there (rooms of plenums with a group).
+    /// Per room ID: whom the bot invited there and removals held (rooms of plenums with a
+    /// group).
     #[serde(default)]
-    pub rooms: BTreeMap<String, RoomMembers>,
+    pub rooms: BTreeMap<String, Remembered>,
+    /// Per person (the directory's id): asked to choose an account, admins told about them.
+    #[serde(default)]
+    pub people: Notices,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]

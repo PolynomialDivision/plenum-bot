@@ -1,5 +1,6 @@
-//! Chat commands. Only `!plenum`, `!top` and `!minutes` are the bot's; everything else in
-//! the room is left alone (other bots may share the room).
+//! Chat commands. Only `!plenum`, `!top` and `!minutes` are the bot's (and `!members` in the
+//! admin chat, `!link` in a direct chat: main.rs); everything else in the room is left alone
+//! (other bots may share the room).
 
 use chrono::{Datelike, NaiveDate, NaiveTime};
 
@@ -22,6 +23,16 @@ pub enum Command {
         key: Option<String>,
         mode: Publication,
         when: Option<When>,
+    },
+    /// `!members`: the rooms' held removals (admin chat only).
+    Members,
+    /// `!members confirm <room> <digest>`: carry out a room's held removals once (admin chat
+    /// only), if the plan held is the one with that digest (the notice and `!members` show
+    /// it); the room by a plenum key, its ID or its alias. Without a digest (empty) the answer
+    /// shows the plan held and its digest.
+    ConfirmRemovals {
+        room: String,
+        digest: String,
     },
     /// A command of the bot with a mistake in it; the text says what is wrong.
     Invalid(String),
@@ -192,6 +203,26 @@ pub fn parse_for(body: &str, keys: &[&str]) -> Option<Command> {
                 )),
             }
         }
+        "!members" => match words.as_slice() {
+            [] => Some(Command::Members),
+            [confirm, room] if confirm.eq_ignore_ascii_case("confirm") => {
+                Some(Command::ConfirmRemovals {
+                    room: (*room).to_owned(),
+                    digest: String::new(),
+                })
+            }
+            [confirm, room, digest] if confirm.eq_ignore_ascii_case("confirm") => {
+                Some(Command::ConfirmRemovals {
+                    room: (*room).to_owned(),
+                    digest: (*digest).to_owned(),
+                })
+            }
+            _ => Some(Command::Invalid(
+                "`!members` shows the held removals, `!members confirm <room> <digest>` carries \
+                 out the plan with that digest (the room by its plenum key, ID or alias)."
+                    .to_owned(),
+            )),
+        },
         _ => None,
     }
 }
@@ -324,6 +355,41 @@ mod tests {
         assert!(!at_seven.matches("2026-11-14 10:00".parse().unwrap()));
         assert!(nov14.matches("2027-11-14 10:00".parse().unwrap()));
         assert_eq!(at_seven.describe(), "14 Nov 2026 19:00");
+    }
+
+    #[test]
+    fn held_removals_in_the_admin_chat() {
+        assert_eq!(p("!members"), Some(Command::Members));
+        assert_eq!(
+            p("!Members CONFIRM kitchen-floor-1 1a2b3c4d"),
+            Some(Command::ConfirmRemovals {
+                room: "kitchen-floor-1".into(),
+                digest: "1a2b3c4d".into()
+            })
+        );
+        assert_eq!(
+            p("!members confirm #kitchen-floor-1:house.org 1a2b3c4d"),
+            Some(Command::ConfirmRemovals {
+                room: "#kitchen-floor-1:house.org".into(),
+                digest: "1a2b3c4d".into()
+            })
+        );
+        // without the digest: the answer shows the plan held and its digest
+        assert_eq!(
+            p("!members confirm house"),
+            Some(Command::ConfirmRemovals {
+                room: "house".into(),
+                digest: String::new()
+            })
+        );
+        for wrong in [
+            "!members confirm",
+            "!members yes k1",
+            "!members confirm a b c",
+        ] {
+            assert!(matches!(p(wrong), Some(Command::Invalid(_))), "{wrong}");
+        }
+        assert_eq!(p("!link anna"), None);
     }
 
     #[test]

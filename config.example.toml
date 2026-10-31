@@ -45,13 +45,21 @@ provider = "authentik"
 api_url = "https://login.example.org/api/v3"
 # server_name = "example.org"         # house accounts: @<login>:<server>; default: the bot's own
 localpart_attribute = "matrix_localpart"
-matrix_ids_attribute = "matrix_ids"   # a person's other accounts
+matrix_ids_attribute = "matrix_ids"   # a person's other accounts, entered by an admin
+# verified_attribute = "matrix_verified"     # the accounts the person proved (link codes)
+# preferred_attribute = "matrix_preferred"   # the account the person chose: invited
+# stale_after_minutes = 60                   # an older last good read changes no room
 # token: DIRECTORY_TOKEN in the environment (token_env)
 
-# The rooms of plenums with a group follow it; never removed: these, and room admins.
+# The rooms of plenums with a group follow it: each member's chosen account is invited, their
+# other accounts stay; never removed: these, and room admins.
 [members]
 enabled = true
 keep = ["@calendar-bot:example.org"]
+ask_to_choose = false   # write to members who have not chosen their account (needs choose_url)
+# where people choose their account and enter link codes (also named in the !link answer)
+choose_url = "https://login.example.org/if/flow/house-matrix-accounts/"
+# link codes (!link <username>): MATRIX_LINK_KEY in the environment
 
 [[plenum]]
 key = "house"

@@ -8,26 +8,30 @@
 //! own room, area in the wiki and Nextcloud calendar. The calendar is where the dates are
 //! (made, moved, cancelled, repeated there); the bot reads it over CalDAV and follows it. A
 //! plenum with a directory group keeps its room's members and its wiki editors in line with
-//! the group.
+//! the group (the person's chosen account is invited), and answers `!link` in a direct chat
+//! from an account on another server (the code that links it to a house user).
 
 mod calendar;
 mod commands;
 mod config;
 mod engine;
-mod members;
+mod linking;
 mod outline;
 mod pdf;
 mod protocol;
 mod schedule;
 mod state;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
-use mxbot_common::directory::{self, Directory};
+use mxbot_common::directory::Directory;
 
 use anyhow::{Context, Result};
 use mxbot_common::{
-    admin::Dispatch,
+    admin::{Admins, Dispatch},
     matrix_sdk::{
         attachment::AttachmentConfig,
         deserialized_responses::EncryptionInfo,
@@ -39,10 +43,12 @@ use mxbot_common::{
                 },
                 AnySyncMessageLikeEvent, AnySyncTimelineEvent, Mentions, SyncMessageLikeEvent,
             },
-            OwnedTransactionId, OwnedUserId, RoomId, UserId,
+            OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomAliasId, RoomId, UserId,
         },
         Client, Room, RoomMemberships, RoomState,
     },
+    membership::Member,
+    rooms::admin_dm_partner,
     supervise::{supervise_ticking, Alive},
     Bot,
 };
@@ -50,7 +56,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     engine::{Chat, Engine, Scope, Sender},
-    members::Member,
+    linking::LinkDesk,
     outline::Outline,
     state::State,
 };
@@ -65,6 +71,9 @@ fn message(markdown: &str, users: &[OwnedUserId]) -> RoomMessageEventContent {
 /// Matrix behind [`Chat`].
 struct MatrixChat {
     client: Client,
+    /// The bot's admins (configured and from `admin_groups`): whose direct chats get the admin
+    /// notices.
+    admins: Admins,
 }
 
 impl MatrixChat {
@@ -73,6 +82,23 @@ impl MatrixChat {
             .get_room(room)
             .filter(|r| r.state() == RoomState::Joined)
             .with_context(|| format!("not in room {room} (make matrix-rooms joins it)"))
+    }
+
+    /// A direct chat of the bot with `user` that they are in (joined or invited), nobody else.
+    fn direct_room(&self, user: &UserId) -> Option<Room> {
+        self.client.joined_rooms().into_iter().find(|r| {
+            r.active_members_count() == 2
+                && r.direct_targets()
+                    .iter()
+                    .any(|t| t.as_user_id() == Some(user))
+        })
+    }
+
+    /// Send with a transaction ID made from `key` and the room (stable across restarts).
+    async fn send_keyed(&self, room: &Room, markdown: &str, key: &str) -> Result<()> {
+        let txn = mxbot_common::send::txn_for(&format!("{key}:{}", room.room_id()));
+        mxbot_common::send::send_with_retry_txn(room, message(markdown, &[]), &txn).await?;
+        Ok(())
     }
 }
 
@@ -142,18 +168,65 @@ impl Chat for MatrixChat {
         self.room(room)?.kick_user(user, Some(reason)).await?;
         Ok(())
     }
+
+    async fn tell_admins(&self, markdown: &str, key: &str) -> Result<()> {
+        let rooms: Vec<Room> = self
+            .client
+            .joined_rooms()
+            .into_iter()
+            .filter(|r| admin_dm_partner(r, &self.admins.current()).is_some())
+            .collect();
+        if rooms.is_empty() {
+            anyhow::bail!("no admin has a direct chat with me");
+        }
+        let mut sent = false;
+        for room in &rooms {
+            match self.send_keyed(room, markdown, key).await {
+                Ok(()) => sent = true,
+                Err(e) => warn!(room = %room.room_id(), "A notice to an admin failed: {e:#}"),
+            }
+        }
+        if !sent {
+            anyhow::bail!("no admin's direct chat took the notice");
+        }
+        Ok(())
+    }
+
+    async fn message_person(&self, user: &UserId, markdown: &str, key: &str) -> Result<()> {
+        let room = match self.direct_room(user) {
+            Some(room) => room,
+            None => {
+                mxbot_common::private::create_private_dm(
+                    &self.client,
+                    user,
+                    &mxbot_common::private::PREFERRED_ROOM_VERSIONS,
+                )
+                .await?
+            }
+        };
+        self.send_keyed(&room, markdown, key).await
+    }
+
+    async fn resolve_alias(&self, alias: &str) -> Result<OwnedRoomId> {
+        let alias = RoomAliasId::parse(alias).with_context(|| format!("{alias:?} is no alias"))?;
+        Ok(self.client.resolve_room_alias(&alias).await?.room_id)
+    }
 }
 
 const ADMIN_HELP: &str =
     "For everyone in the plenum rooms: !plenum · !top <topic> (also as a reply to a message) · \
 !minutes done · !minutes confidential|link|full [day] · !plenum help. The meetings are in the plenums' Nextcloud calendars. \
-Here in the admin chat !plenum shows every plenum.";
+Here in the admin chat !plenum shows every plenum, !members the rooms' held removals and \
+!members confirm <plenum key|room> <digest> carries a room's held plan out once (the digest is \
+in the notice and in !members). \
+From an account on another server, !link <username> in a direct chat gives its link code.";
 
 type PlenumEngine = Engine<Outline, MatrixChat>;
 
 /// Commands older than this (by the server's clock) are history, not orders: long enough for
 /// those sent while the bot restarted, short of what a fresh store brings back.
-const COMMAND_MAX_AGE_MS: i64 = 15 * 60 * 1000;
+pub(crate) const COMMAND_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+const COMMAND_MAX_AGE_MS: i64 = COMMAND_MAX_AGE.as_millis() as i64;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -189,6 +262,7 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("[members] keep: {u:?} is no Matrix ID"))
         })
         .collect::<Result<_>>()?;
+    config.members.check()?;
     let nextcloud = calendar::connect(
         &config.calendar.url,
         &config.calendar.username,
@@ -210,9 +284,10 @@ async fn main() -> Result<()> {
         outline,
         MatrixChat {
             client: bot.client.clone(),
+            admins: bot.admin.admin_list().clone(),
         },
         config.pdf.clone(),
-        bot.admins().clone(),
+        bot.admin.admin_list().clone(),
         state,
         state_path,
     );
@@ -222,6 +297,27 @@ async fn main() -> Result<()> {
     if config.members.enabled {
         engine.me = Some(bot.user_id.clone());
         engine.keep = keep;
+        engine.ask_to_choose = config.members.ask_to_choose;
+        engine.choose_url = config.members.choose_url().map(str::to_owned);
+        if let Some(dir) = &config.directory {
+            engine.stale_after = dir.stale_after();
+        }
+    }
+    // `!link`: the codes for linking an account on another server to a house user
+    let house_server = config
+        .directory
+        .as_ref()
+        .and_then(|d| d.server_name.clone())
+        .unwrap_or_else(|| bot.user_id.server_name().to_string());
+    let link_desk = Arc::new(LinkDesk::from_env(
+        &house_server,
+        config.members.choose_url(),
+    ));
+    if !link_desk.enabled() {
+        info!(
+            "!link: no {} set, linking answers that it is not set up",
+            linking::KEY_ENV
+        );
     }
     let engine: Arc<PlenumEngine> = Arc::new(engine);
     for p in &engine.plenums {
@@ -229,7 +325,7 @@ async fn main() -> Result<()> {
               calendar = %p.calendar, group = ?p.group, access = ?p.access, "Plenum");
     }
 
-    install_handler(&bot, &engine);
+    install_handler(&bot, &engine, &link_desk);
     info!("Starting sync...");
     bot.initial_sync().await;
 
@@ -268,10 +364,14 @@ async fn main() -> Result<()> {
         (Some(dir), true) if engine.plenums.iter().any(|p| p.group.is_some()) => {
             match Directory::new(dir, &bot.user_id) {
                 Ok(directory) => {
+                    let admins = (
+                        bot.admin.admin_list().clone(),
+                        config.security.admin_groups.clone(),
+                    );
                     supervise_ticking(
                         "room members",
                         3 * (directory.config().refresh() + SLOW_ROUND),
-                        |alive| members_loop(Arc::clone(&engine), directory, alive),
+                        |alive| members_loop(Arc::clone(&engine), directory, admins, alive),
                     );
                 }
                 Err(e) => warn!("Rooms: {e:#}; no room is managed"),
@@ -287,6 +387,7 @@ const SLOW_ROUND: Duration = Duration::from_secs(5 * 60);
 
 /// Every minute, on the minute.
 async fn ticker(engine: Arc<PlenumEngine>, alive: Alive) {
+    alive.expect_every(Duration::from_secs(60));
     loop {
         alive.tick();
         engine.tick(chrono::Utc::now()).await;
@@ -306,9 +407,11 @@ async fn calendar_loop(
     alive: Alive,
 ) {
     let every = cfg.refresh();
+    alive.expect_every(every);
     let mut managed_at: Option<std::time::Instant> = None;
     loop {
         alive.tick();
+        let mut unread: Vec<&str> = Vec::new();
         let manage =
             cfg.manage && managed_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(3600));
         for p in &engine.plenums {
@@ -322,7 +425,10 @@ async fn calendar_loop(
                         continue;
                     }
                     Ok(false) => {}
-                    Err(e) => warn!(plenum = %p.key, calendar = %p.calendar, "Calendar: {e:#}"),
+                    Err(e) => {
+                        warn!(plenum = %p.key, calendar = %p.calendar, "Calendar: {e:#}");
+                        unread.push(&p.key);
+                    }
                 }
             }
             let today = chrono::Utc::now().with_timezone(&engine.tz).date_naive();
@@ -338,9 +444,16 @@ async fn calendar_loop(
                         .await;
                 }
                 Err(e) => {
-                    warn!(plenum = %p.key, "Calendar not read ({e:#}); the dates stay as they were")
+                    warn!(plenum = %p.key, "Calendar not read ({e:#}); the dates stay as they were");
+                    unread.push(&p.key);
                 }
             }
+        }
+        if unread.is_empty() {
+            alive.ok();
+        } else {
+            unread.dedup();
+            alive.failed(format!("calendar not read: {}", unread.join(", ")));
         }
         if manage {
             managed_at = Some(std::time::Instant::now());
@@ -371,23 +484,29 @@ async fn keep_calendar(
     Ok(made)
 }
 
-/// The groups from the directory now and every `refresh_minutes`, the rooms after them.
-/// While the directory cannot be read (its people or which groups exist), the rooms stay as
-/// they are; a group that exists with nobody in it empties its room.
-async fn members_loop(engine: Arc<PlenumEngine>, directory: Directory, alive: Alive) {
+/// The directory now and every `refresh_minutes` (one snapshot: its people and which groups
+/// exist), the rooms after it. While it cannot be read, or a guard stops the round (a stale
+/// read, a house group with nobody in it), the rooms stay as they are and the loop counts as
+/// failing: unreadable for longer than its time makes the container unhealthy.
+async fn members_loop(
+    engine: Arc<PlenumEngine>,
+    directory: Directory,
+    (admins, admin_groups): (Admins, Vec<String>),
+    alive: Alive,
+) {
+    alive.expect_every(directory.config().refresh());
     let wanted = config::directory_groups(&engine.plenums);
     loop {
-        alive.tick();
-        let read = async {
-            let people = directory.people().await?;
-            // who the wiki's @ mentions are, for the summaries in the chat
-            engine.set_people(&people);
-            let existing = directory.existing_groups(&wanted).await?;
-            anyhow::Ok(directory::groups_with_empty(&people, &wanted, &existing))
-        };
-        engine
-            .sync_members_after(read.await, chrono::Utc::now())
-            .await;
+        let read = directory.snapshot(&wanted).await;
+        // `[security] admin_groups`: their members' house accounts are admins while this read
+        // may be used (a linked account never is).
+        if let (Ok(snapshot), false) = (&read, admin_groups.is_empty()) {
+            admins.follow(snapshot, directory.config(), &admin_groups);
+        }
+        match engine.sync_members_after(read, chrono::Utc::now()).await {
+            Ok(()) => alive.ok(),
+            Err(why) => alive.failed(format!("room members: {why}")),
+        }
         tokio::time::sleep(directory.config().refresh()).await;
     }
 }
@@ -444,14 +563,16 @@ async fn replied_topic(
     Some((command, author))
 }
 
-fn install_handler(bot: &Bot, engine: &Arc<PlenumEngine>) {
+fn install_handler(bot: &Bot, engine: &Arc<PlenumEngine>, link_desk: &Arc<LinkDesk>) {
     let bot = bot.clone();
     let engine = Arc::clone(engine);
+    let link_desk = Arc::clone(link_desk);
     let rooms = engine.rooms();
     bot.client.clone().add_event_handler(
         move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
             let bot = bot.clone();
             let engine = Arc::clone(&engine);
+            let link_desk = Arc::clone(&link_desk);
             let rooms = rooms.clone();
             async move {
                 if room.state() != RoomState::Joined || ev.sender == bot.user_id {
@@ -471,8 +592,27 @@ fn install_handler(bot: &Bot, engine: &Arc<PlenumEngine>) {
                     info!(event = %ev.event_id, "An old message from the history, left alone");
                     return;
                 }
-                // Plenum rooms, the admin DM, and the bot's own room (the overview).
+                // `!link` from an account on another server, in a direct chat (anywhere else it
+                // only says where). The code is in the answer only, never in the log.
                 let in_plenum_room = rooms.contains(room.room_id());
+                let direct = !in_plenum_room && room.active_members_count() == 2;
+                let sent = ev
+                    .origin_server_ts
+                    .to_system_time()
+                    .unwrap_or_else(SystemTime::now);
+                let body = mxbot_common::format::strip_reply_fallback(&text.body);
+                if let Some(answer) =
+                    link_desk.answer(&ev.sender, body, direct, sent, SystemTime::now())
+                {
+                    info!(user = %ev.sender, room = %room.room_id(), direct, "!link answered");
+                    if let Err(e) =
+                        mxbot_common::send::send_with_retry(&room, message(&answer, &[])).await
+                    {
+                        error!("Answering in {} failed: {e}", room.room_id());
+                    }
+                    return;
+                }
+                // Plenum rooms, the admin DM, and the bot's own room (the overview).
                 if !in_plenum_room && dispatch != Dispatch::AdminDm && !own_room(&room, &bot) {
                     return;
                 }
@@ -482,7 +622,6 @@ fn install_handler(bot: &Bot, engine: &Arc<PlenumEngine>) {
                     .filter(|p| !in_plenum_room || p.room == room.room_id())
                     .map(|p| p.key.as_str())
                     .collect();
-                let body = mxbot_common::format::strip_reply_fallback(&text.body);
                 // `!top` as the answer to a message: that message is the topic, by its author.
                 let replied = if in_plenum_room {
                     replied_topic(&room, &ev, body, &keys).await

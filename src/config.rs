@@ -36,7 +36,8 @@ pub struct Config {
     pub plenums: Vec<PlenumConfig>,
 }
 
-/// The rooms of plenums with a group follow it: its members are invited, others removed.
+/// The rooms of plenums with a group follow it: the chosen account of each member is invited,
+/// accounts of nobody in it are removed (mxbot-common `membership`).
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields, default)]
 pub struct MembersConfig {
@@ -44,6 +45,12 @@ pub struct MembersConfig {
     /// Never removed (the house's bots, the room admins of the provisioner); people with
     /// power level 100 in a room are never removed either.
     pub keep: Vec<String>,
+    /// Write to a member who has not chosen their Matrix account (nobody new is invited for
+    /// them until they do): at most three times, two weeks apart.
+    pub ask_to_choose: bool,
+    /// Where people choose their account and link others (the identity provider's flow
+    /// `house-matrix-accounts`), for that message and the answer to `!link`.
+    pub choose_url: Option<String>,
 }
 
 impl Default for MembersConfig {
@@ -51,7 +58,27 @@ impl Default for MembersConfig {
         Self {
             enabled: true,
             keep: Vec::new(),
+            ask_to_choose: false,
+            choose_url: None,
         }
+    }
+}
+
+impl MembersConfig {
+    /// `choose_url`, trimmed; None when unset or empty.
+    pub fn choose_url(&self) -> Option<&str> {
+        self.choose_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+    }
+
+    /// Asking people to choose needs the address where they do it.
+    pub fn check(&self) -> Result<()> {
+        if self.ask_to_choose && self.choose_url().is_none() {
+            bail!("[members] ask_to_choose needs choose_url (where people choose their account)");
+        }
+        Ok(())
     }
 }
 
@@ -474,6 +501,16 @@ impl Config {
     }
 }
 
+/// The groups of the house plenums (access `house`): who lives here. One of them existing
+/// with nobody in it is a broken directory: no room changes then.
+pub fn house_groups(plenums: &[Plenum]) -> BTreeSet<String> {
+    plenums
+        .iter()
+        .filter(|p| p.access == Access::House)
+        .filter_map(|p| p.group.clone())
+        .collect()
+}
+
 /// Every directory group the plenums read: their own and the ones these require.
 pub fn directory_groups(plenums: &[Plenum]) -> BTreeSet<String> {
     plenums
@@ -549,6 +586,7 @@ readers = ["calendar-bot"]
         let c: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
         assert_eq!(c.plenums().unwrap().len(), 2);
         c.timezone().unwrap();
+        c.members.check().unwrap();
     }
 
     #[test]
@@ -628,6 +666,20 @@ access = "members"
             ("DIRECTORY_TOKEN", 15, None)
         );
         assert_eq!(c.members.keep.len(), 1);
+        // nobody is asked to choose unless the config says so, and where
+        assert!(!c.members.ask_to_choose && c.members.choose_url().is_none());
+        c.members.check().unwrap();
+        let ask = |extra: &str| -> MembersConfig {
+            toml::from_str(&format!("ask_to_choose = true\n{extra}")).unwrap()
+        };
+        assert!(ask("").check().is_err());
+        assert!(ask("choose_url = ' '").check().is_err());
+        let m = ask("choose_url = ' https://login.example.org/if/flow/house-matrix-accounts/ '");
+        m.check().unwrap();
+        assert_eq!(
+            m.choose_url(),
+            Some("https://login.example.org/if/flow/house-matrix-accounts/")
+        );
     }
 
     const DIRECTORY: &str =
@@ -661,6 +713,7 @@ access = "members"
                 .map(String::from)
                 .into()
         );
+        assert_eq!(house_groups(&ps), ["residents".to_owned()].into());
 
         // explicit: another group, or "" for no such rule
         let c = parse(&format!(

@@ -8,15 +8,55 @@ summary. Searching happens in Outline. Several plenums (house, kitchens, a worki
 each with its own room, collection and Nextcloud calendar.
 
 A plenum may belong to a directory group (`group`): its room's members follow the group
-(`[directory]`, `[members]`: who is in it is invited once, who is not is removed; the house's
-bots and the room's admins never), and the group writes in its collection (`access`: `house`
-everyone writes, `members` everyone reads and the group writes, `private` only the group).
-A group that exists with nobody in it empties its room (but for those never removed); a group
-the directory does not know, or a directory that cannot be read, leaves the room as it is.
-Only who lives here counts in a team's group: a plenum with access `members` or `private`
-requires the house plenum's group (access `house`, e.g. `residents`) by default
-(`require_group`, `""` for none), so a former resident still in a kitchen's group is neither
-kept nor invited. The directory token needs to view users and groups.
+(`[directory]`, `[members]`; mxbot-common `membership`, house-infra docs/HOUSE-DIRECTORY.md),
+and the group writes in its collection (`access`: `house` everyone writes, `members` everyone
+reads and the group writes, `private` only the group). Per room, from one read of the
+directory:
+
+- **invited**: the account each member *chose* for the house (`matrix_preferred`: their house
+  account or a link they verified), once; who leaves on their own is not invited again while
+  the account stays theirs, a failed invitation is tried again a day later. Nobody who has not
+  chosen is invited: with `ask_to_choose` the bot writes to them (house account and verified
+  links, German, at most three times, two weeks apart) where to choose (`choose_url`);
+- **kept**: every account the directory knows as a member's (the house account, links an admin
+  entered, verified links, an older chosen account), the house's bots and `keep`, and the
+  room's admins (power level 100);
+- **removed**: everyone else (a kick; the bot never bans, deactivates or changes power levels);
+- **left alone**: an account two people claim, in a room where one of them belongs (neither
+  invited nor removed); where none of them belongs it goes like anyone else's. The admins hear
+  of each such account once (who claims it).
+
+Nothing changes while the directory cannot be read or its last good read is older than
+`[directory] stale_after_minutes` (60), nor when the house plenum's group (access `house`, e.g.
+`residents`) exists with nobody in it; a room whose group the directory does not know is left
+as it is. More removals in one room than 20 % of its people (at least 2) are held: invitations
+still go out, the admins hear of it once per plan in their direct chats with the bot, with the
+plan's digest (8 hex digits over its accounts), and `!members confirm <plenum key|room ID|alias>
+<digest>` there carries that very plan out once and answers with the accounts it removed;
+another digest (or none) confirms nothing and shows the plan held and its digest (a changed plan
+is held anew; a plan that shrinks within the limit goes by itself). The admins also hear once
+about a member whose choice cannot be used (not theirs, unverified, claimed twice), about an
+account two people claim, and about a deactivated person removed from a room (their Matrix
+account is still active: offboarding is a human step). They get one list of everyone who cannot
+be invited (not chosen, or an unusable choice: their username and the rooms they would be
+invited to) and again whenever someone is added to it; with `ask_to_choose` off nobody else
+tells those people, so switch it on together with this image. Every notice's transaction key
+names its episode (the hold's digest and since when, or the day it was found): the homeserver
+drops a key it has seen before, so a recurring notice would otherwise be lost. Only who lives here counts in a team's group: a plenum with access `members` or
+`private` requires the house plenum's group by default (`require_group`, `""` for none), so a
+former resident still in a kitchen's group is neither kept nor invited. The directory token
+needs to view users and groups.
+
+Mentions in the summaries (`@Name` in the wiki) ping the person's chosen account, else their
+house account: a mention is no invitation.
+
+**Linking another account.** From an account on another server, `!link <username>` in a direct
+chat with the bot answers with the link code for that house user and that account
+(mxbot-common `link`), to be entered in the identity provider's flow (`choose_url`) while
+logged in as that user. House accounts are refused, five codes per account and hour, old
+messages are ignored, and the code is never logged. The key is `MATRIX_LINK_KEY` in the
+environment; without it the bot answers that linking is not set up. Who may open a direct
+chat with the bot is `[security]` (`allowed_inviters`, `dm_rooms`).
 
 The dates are the plenum's Nextcloud calendar (`[calendar]`; one per plenum, `plenum-<key>`,
 owned by the bot's own Nextcloud account, which makes it and shares it by `access`: the house
@@ -43,6 +83,10 @@ container's `TZ`.
 | `!minutes full` | the summary again, as usual |
 | `!top` as a reply | the message it answers is the topic (by its author) |
 | `!plenum help` | this list |
+
+In an admin's direct chat with the bot: `!plenum` (every plenum), `!members` (the held
+removals and their digests), `!members confirm <plenum key|room> <digest>`. In a direct chat from an account on another
+server: `!link <username>`.
 
 Several plenums in one room: the key goes along, `!top kitchen-floor-1 dishwasher`. Commands
 older than 15 minutes (a fresh Matrix store syncs the rooms' history) are left alone.
