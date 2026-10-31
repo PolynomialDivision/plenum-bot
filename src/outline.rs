@@ -3,6 +3,16 @@
 //! created with an ID of our own, `documents.update` with `lastRevision` answers 409 when
 //! someone changed the document meanwhile, a deleted document still answers `documents.info`
 //! (with `deletedAt`), and an attachment is a `attachments.create` plus a multipart upload.
+//!
+//! The house group (2026-10-31, subtenants): with [`Outline::with_house_group`], nothing the bot
+//! makes is open to the whole workspace. Outline 1.12.0 self-hosted has no guest role (its
+//! Community plan refuses it), so a subtenant is a workspace member, and a member reads every
+//! collection that is open to everyone. Instead of "everyone reads/writes", the house plenum's
+//! group (who lives here, an Outline group kept by house-infra's outline-roles) gets that
+//! permission and the collection is private: who lives here reads and writes what they did, a
+//! subtenant only what their own groups (their kitchen) are given. A house group Outline does
+//! not have is never a reason to open anything: the collections stay as they are, a new one is
+//! private until the group exists ([`ensure_collection`]).
 
 use std::time::Duration;
 
@@ -20,6 +30,9 @@ pub struct Outline {
     base: String,
     key: String,
     public: String,
+    /// The Outline group that stands for the whole house (module docs); None: "everyone in the
+    /// workspace", as before 2026-10-31.
+    house_group: Option<String>,
 }
 
 /// An answer that is not 200.
@@ -110,7 +123,22 @@ struct GroupList {
     groups: Vec<ApiGroup>,
 }
 
-/// The collection permission for everyone in the workspace.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiGroupMembership {
+    group_id: String,
+    permission: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupMemberships {
+    #[serde(default)]
+    group_memberships: Vec<ApiGroupMembership>,
+}
+
+/// What the whole house may do in a plenum's collection: as the permission for everyone in the
+/// workspace, or (with a house group) as that group's permission on a private collection.
 fn permission(access: Access) -> Option<&'static str> {
     match access {
         Access::House => Some("read_write"),
@@ -146,10 +174,31 @@ impl Outline {
             base: base.trim_end_matches('/').to_owned(),
             key: key.to_owned(),
             public: public.trim_end_matches('/').to_owned(),
+            house_group: None,
         })
     }
 
+    /// The house plenum's group (config [`crate::config::wiki_house_group`]): the collections
+    /// are private and this group gets what everyone in the workspace got before (module docs).
+    pub fn with_house_group(mut self, group: Option<String>) -> Self {
+        self.house_group = group.filter(|g| !g.trim().is_empty());
+        self
+    }
+
     async fn call<T: for<'de> Deserialize<'de>>(&self, method: &str, body: Value) -> Result<T> {
+        let bytes = self.send(method, body).await?;
+        let env: Envelope<T> = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Outline {method}: unexpected answer"))?;
+        Ok(env.data)
+    }
+
+    /// A call whose answer has no `data` (`collections.remove_group`: `{"success": true}`).
+    async fn call_ok(&self, method: &str, body: Value) -> Result<()> {
+        self.send(method, body).await.map(|_| ())
+    }
+
+    /// The answer's body of a call that went through (200), or the [`ApiError`].
+    async fn send(&self, method: &str, body: Value) -> Result<Vec<u8>> {
         let resp = self
             .http
             .post(format!("{}/api/{method}", self.base))
@@ -172,9 +221,7 @@ impl Outline {
             }
             .into());
         }
-        let env: Envelope<T> = serde_json::from_slice(&bytes)
-            .with_context(|| format!("Outline {method}: unexpected answer"))?;
-        Ok(env.data)
+        Ok(bytes.to_vec())
     }
 
     /// Whether the API answers with the key at all (startup check).
@@ -188,81 +235,254 @@ fn status_of(e: &anyhow::Error) -> Option<u16> {
     e.downcast_ref::<ApiError>().map(|a| a.status)
 }
 
+/// The collection calls [`ensure_collection`] and [`grant_group`] make: Outline's API, a fake in
+/// the tests (`collection_rules`).
+#[allow(async_fn_in_trait)]
+trait Collections {
+    /// The id of the group with exactly this name, if there is one.
+    async fn group_id(&self, name: &str) -> Result<Option<String>>;
+    /// The collection (an [`ApiError`] for one that is gone or not the bot's).
+    async fn info(&self, id: &str) -> Result<ApiCollection>;
+    /// The collections whose name matches `name` (Outline's search).
+    async fn list(&self, name: &str) -> Result<Vec<ApiCollection>>;
+    async fn create(&self, name: &str, permission: Option<&str>) -> Result<ApiCollection>;
+    /// Sets `fields` (`permission`, `name`) of the collection `id`.
+    async fn update(&self, id: &str, fields: serde_json::Map<String, Value>) -> Result<()>;
+    /// The group's permission on the collection; None: it has none.
+    async fn group_permission(&self, collection_id: &str, group_id: &str)
+        -> Result<Option<String>>;
+    /// Gives the group `permission` (Outline keeps one membership per group and collection:
+    /// adding again only sets the permission).
+    async fn add_group(&self, collection_id: &str, group_id: &str, permission: &str) -> Result<()>;
+    async fn remove_group(&self, collection_id: &str, group_id: &str) -> Result<()>;
+}
+
+impl Collections for Outline {
+    async fn group_id(&self, name: &str) -> Result<Option<String>> {
+        // Outline 1.11 answers {groups, groupMemberships} here, not a list (checked 2026-10-22).
+        let found: GroupList = self
+            .call("groups.list", json!({"query": name, "limit": 100}))
+            .await?;
+        Ok(found
+            .groups
+            .into_iter()
+            .find(|g| g.name == name)
+            .map(|g| g.id))
+    }
+
+    async fn info(&self, id: &str) -> Result<ApiCollection> {
+        self.call("collections.info", json!({"id": id})).await
+    }
+
+    async fn list(&self, name: &str) -> Result<Vec<ApiCollection>> {
+        self.call("collections.list", json!({"query": name, "limit": 100}))
+            .await
+    }
+
+    async fn create(&self, name: &str, permission: Option<&str>) -> Result<ApiCollection> {
+        self.call(
+            "collections.create",
+            json!({"name": name, "permission": permission, "sharing": false}),
+        )
+        .await
+    }
+
+    async fn update(&self, id: &str, mut fields: serde_json::Map<String, Value>) -> Result<()> {
+        fields.insert("id".into(), json!(id));
+        let _: ApiCollection = self
+            .call("collections.update", Value::Object(fields))
+            .await?;
+        Ok(())
+    }
+
+    async fn group_permission(
+        &self,
+        collection_id: &str,
+        group_id: &str,
+    ) -> Result<Option<String>> {
+        let now: GroupMemberships = self
+            .call(
+                "collections.group_memberships",
+                json!({"id": collection_id, "limit": 100}),
+            )
+            .await?;
+        Ok(now
+            .group_memberships
+            .into_iter()
+            .find(|m| m.group_id == group_id)
+            .map(|m| m.permission))
+    }
+
+    async fn add_group(&self, collection_id: &str, group_id: &str, permission: &str) -> Result<()> {
+        self.call_ok(
+            "collections.add_group",
+            json!({"id": collection_id, "groupId": group_id, "permission": permission}),
+        )
+        .await
+    }
+
+    async fn remove_group(&self, collection_id: &str, group_id: &str) -> Result<()> {
+        self.call_ok(
+            "collections.remove_group",
+            json!({"id": collection_id, "groupId": group_id}),
+        )
+        .await
+    }
+}
+
+/// The house group as one collection call finds it.
+enum House {
+    /// None configured: the workspace's permission, as before 2026-10-31.
+    Open,
+    /// The group, with its Outline id.
+    Found(String, String),
+    /// Configured, but Outline has no such group (yet: outline-roles makes it).
+    Missing(String),
+}
+
+/// What the house group gets on a plenum's collection: what everyone got before
+/// ([`permission`]), and read and write when it is the plenum's own `group` too (the grant of
+/// [`grant_group`]; anything less would take it back every hour).
+fn house_permission(access: Access, group: Option<&str>, house: &str) -> Option<&'static str> {
+    if group == Some(house) {
+        Some("read_write")
+    } else {
+        permission(access)
+    }
+}
+
+/// Gives the group `wanted` on the collection (None: takes it away), when it differs.
+async fn set_group<C: Collections>(
+    api: &C,
+    collection_id: &str,
+    group: &str,
+    group_id: &str,
+    wanted: Option<&str>,
+) -> Result<()> {
+    let has = api.group_permission(collection_id, group_id).await?;
+    if has.as_deref() == wanted {
+        return Ok(());
+    }
+    match wanted {
+        Some(p) => api.add_group(collection_id, group_id, p).await,
+        None => api.remove_group(collection_id, group_id).await,
+    }
+    .context("setting the house group's access")?;
+    tracing::info!(%group, ?has, ?wanted, "The house group's access to a collection set");
+    Ok(())
+}
+
+/// [`Wiki::ensure_collection`] with the house group `house_group` (module docs). With a house
+/// group configured nothing is ever opened to the workspace: one Outline does not have (yet)
+/// leaves an existing collection's permission as it is (a private one stays private, logged)
+/// and makes a new one private (closed to the house too until the group exists; the next hourly
+/// check gives it the group). A plenum made `private` is made private either way.
+async fn ensure_collection<C: Collections>(
+    api: &C,
+    house_group: Option<&str>,
+    known: Option<&str>,
+    name: &str,
+    access: Access,
+    group: Option<&str>,
+) -> Result<String> {
+    let house = match house_group {
+        None => House::Open,
+        Some(g) => match api.group_id(g).await? {
+            Some(id) => House::Found(g.to_owned(), id),
+            None => House::Missing(g.to_owned()),
+        },
+    };
+    // the permission for everyone in the workspace
+    let wanted = match house {
+        House::Open => permission(access),
+        House::Found(..) | House::Missing(_) => None,
+    };
+    // Without the group the house cannot be given what it should have: no collection is
+    // opened (that would widen a private one) and none is closed (that would lock out the
+    // house), unless the plenum itself is private.
+    let keep = matches!(house, House::Missing(_)) && access != Access::Private;
+    if let (House::Missing(g), true) = (&house, keep) {
+        tracing::warn!(group = %g, collection = %name, "The wiki has no such house group yet (outline-roles makes it): an existing collection's access stays as it is, a new one is private until the group exists");
+    }
+    let mut found = None;
+    if let Some(id) = known {
+        match api.info(id).await {
+            Ok(c) if c.deleted_at.is_none() && c.archived_at.is_none() => found = Some(c),
+            Ok(_) => {}
+            // deleted, or no longer the bot's: looked up by its name
+            Err(e) if matches!(status_of(&e), Some(400 | 403 | 404)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // A private one only by its ID: one with that name that someone else made would keep
+    // its maker as a member, who would then read the group's minutes.
+    if found.is_none() && access != Access::Private {
+        found = api
+            .list(name)
+            .await?
+            .into_iter()
+            .find(|c| c.name.trim() == name);
+    }
+    if let Some(c) = found {
+        // the group before the collection is made private: the house never loses it
+        if let House::Found(g, id) = &house {
+            set_group(api, &c.id, g, id, house_permission(access, group, g)).await?;
+        }
+        let mut update = serde_json::Map::new();
+        if c.permission.as_deref() != wanted && !keep {
+            update.insert("permission".into(), json!(wanted));
+        }
+        if c.name.trim() != name {
+            update.insert("name".into(), json!(name));
+        }
+        if !update.is_empty() {
+            // Outline answers 403 when the key's account is no admin of the collection
+            // (one made by hand): an error, so it shows in the log until fixed.
+            api.update(&c.id, update)
+                .await
+                .context("setting the collection's access and name")?;
+            tracing::info!(collection = %name, from = %c.name, ?wanted, "Collection access and name set");
+        }
+        return Ok(c.id);
+    }
+    let c = api.create(name, wanted).await?;
+    if let House::Found(g, id) = &house {
+        set_group(api, &c.id, g, id, house_permission(access, group, g)).await?;
+    }
+    Ok(c.id)
+}
+
+/// [`Wiki::grant_group`].
+async fn grant_group<C: Collections>(api: &C, collection_id: &str, group: &str) -> Result<bool> {
+    let Some(group_id) = api.group_id(group).await? else {
+        return Ok(false);
+    };
+    api.add_group(collection_id, &group_id, "read_write")
+        .await?;
+    Ok(true)
+}
+
 impl Wiki for Outline {
     async fn ensure_collection(
         &self,
         known: Option<&str>,
         name: &str,
         access: Access,
+        group: Option<&str>,
     ) -> Result<String> {
-        let wanted = permission(access);
-        let mut found = None;
-        if let Some(id) = known {
-            match self
-                .call::<ApiCollection>("collections.info", json!({"id": id}))
-                .await
-            {
-                Ok(c) if c.deleted_at.is_none() && c.archived_at.is_none() => found = Some(c),
-                Ok(_) => {}
-                // deleted, or no longer the bot's: looked up by its name
-                Err(e) if matches!(status_of(&e), Some(400 | 403 | 404)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        // A private one only by its ID: one with that name that someone else made would keep
-        // its maker as a member, who would then read the group's minutes.
-        if found.is_none() && access != Access::Private {
-            let listed: Vec<ApiCollection> = self
-                .call("collections.list", json!({"query": name, "limit": 100}))
-                .await?;
-            found = listed.into_iter().find(|c| c.name.trim() == name);
-        }
-        if let Some(c) = found {
-            let mut update = serde_json::Map::new();
-            if c.permission.as_deref() != wanted {
-                update.insert("permission".into(), json!(wanted));
-            }
-            if c.name.trim() != name {
-                update.insert("name".into(), json!(name));
-            }
-            if !update.is_empty() {
-                update.insert("id".into(), json!(c.id));
-                // Outline answers 403 when the key's account is no admin of the collection
-                // (one made by hand): an error, so it shows in the log until fixed.
-                let _: ApiCollection = self
-                    .call("collections.update", Value::Object(update))
-                    .await
-                    .context("setting the collection's access and name")?;
-                tracing::info!(collection = %name, from = %c.name, ?wanted, "Collection access and name set");
-            }
-            return Ok(c.id);
-        }
-        let c: ApiCollection = self
-            .call(
-                "collections.create",
-                json!({"name": name, "permission": wanted, "sharing": false}),
-            )
-            .await?;
-        Ok(c.id)
+        ensure_collection(
+            self,
+            self.house_group.as_deref(),
+            known,
+            name,
+            access,
+            group,
+        )
+        .await
     }
 
     async fn grant_group(&self, collection_id: &str, group: &str) -> Result<bool> {
-        // Outline 1.11 answers {groups, groupMemberships} here, not a list (checked 2026-10-22).
-        let found: GroupList = self
-            .call("groups.list", json!({"query": group, "limit": 100}))
-            .await?;
-        let Some(g) = found.groups.into_iter().find(|g| g.name == group) else {
-            return Ok(false);
-        };
-        // Outline keeps one membership per group and collection: adding again only sets the
-        // permission.
-        let _: Value = self
-            .call(
-                "collections.add_group",
-                json!({"id": collection_id, "groupId": g.id, "permission": "read_write"}),
-            )
-            .await?;
-        Ok(true)
+        grant_group(self, collection_id, group).await
     }
 
     async fn find_doc(&self, collection_id: &str, title: &str) -> Result<Option<Doc>> {
@@ -427,6 +647,353 @@ impl Wiki for Outline {
     }
 }
 
+/// The collection rules ([`ensure_collection`], [`grant_group`]) against a fake Outline that
+/// models the groups' memberships and logs every change in order.
+#[cfg(test)]
+mod collection_rules {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct Col {
+        id: String,
+        name: String,
+        permission: Option<String>,
+        /// group id → permission
+        groups: BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FakeOutline {
+        /// the groups' names (the id is `g-<name>`)
+        groups: Mutex<Vec<String>>,
+        cols: Mutex<Vec<Col>>,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl FakeOutline {
+        fn with_groups(names: &[&str]) -> Self {
+            let wiki = Self::default();
+            wiki.groups
+                .lock()
+                .unwrap()
+                .extend(names.iter().map(|n| (*n).to_owned()));
+            wiki
+        }
+        /// A collection someone (or the bot before) made, with the groups' permissions.
+        fn add(&self, name: &str, permission: Option<&str>, groups: &[(&str, &str)]) -> String {
+            let mut cols = self.cols.lock().unwrap();
+            let id = format!("col-{}", cols.len());
+            cols.push(Col {
+                id: id.clone(),
+                name: name.into(),
+                permission: permission.map(Into::into),
+                groups: groups
+                    .iter()
+                    .map(|(g, p)| (format!("g-{g}"), (*p).to_owned()))
+                    .collect(),
+            });
+            id
+        }
+        fn col(&self, id: &str) -> Col {
+            let cols = self.cols.lock().unwrap();
+            cols.iter().find(|c| c.id == id).unwrap().clone()
+        }
+        /// The group's permission on the collection.
+        fn group(&self, id: &str, group: &str) -> Option<String> {
+            self.col(id).groups.get(&format!("g-{group}")).cloned()
+        }
+        /// The changes since the last call.
+        fn changes(&self) -> Vec<String> {
+            std::mem::take(&mut *self.log.lock().unwrap())
+        }
+        fn note(&self, line: String) {
+            self.log.lock().unwrap().push(line);
+        }
+        fn with<T>(&self, id: &str, f: impl FnOnce(&mut Col) -> T) -> Result<T> {
+            let mut cols = self.cols.lock().unwrap();
+            let c = cols.iter_mut().find(|c| c.id == id).ok_or(ApiError {
+                status: 404,
+                error: "not_found".into(),
+                message: String::new(),
+            })?;
+            Ok(f(c))
+        }
+    }
+
+    fn api(c: &Col) -> ApiCollection {
+        ApiCollection {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            permission: c.permission.clone(),
+            deleted_at: None,
+            archived_at: None,
+        }
+    }
+
+    fn shown(permission: Option<&str>) -> &str {
+        permission.unwrap_or("null")
+    }
+
+    impl Collections for FakeOutline {
+        async fn group_id(&self, name: &str) -> Result<Option<String>> {
+            let groups = self.groups.lock().unwrap();
+            Ok(groups.iter().find(|g| *g == name).map(|g| format!("g-{g}")))
+        }
+        async fn info(&self, id: &str) -> Result<ApiCollection> {
+            self.with(id, |c| api(c))
+        }
+        async fn list(&self, name: &str) -> Result<Vec<ApiCollection>> {
+            let cols = self.cols.lock().unwrap();
+            Ok(cols.iter().filter(|c| c.name == name).map(api).collect())
+        }
+        async fn create(&self, name: &str, permission: Option<&str>) -> Result<ApiCollection> {
+            self.note(format!("create {name} permission={}", shown(permission)));
+            let id = self.add(name, permission, &[]);
+            Ok(api(&self.col(&id)))
+        }
+        async fn update(&self, id: &str, fields: serde_json::Map<String, Value>) -> Result<()> {
+            let mut changed: Vec<String> = Vec::new();
+            self.with(id, |c| {
+                if let Some(p) = fields.get("permission") {
+                    c.permission = p.as_str().map(Into::into);
+                    changed.push(format!("permission={}", shown(p.as_str())));
+                }
+                if let Some(n) = fields.get("name") {
+                    c.name = n.as_str().unwrap().into();
+                    changed.push(format!("name={}", c.name));
+                }
+            })?;
+            self.note(format!("update {id} {}", changed.join(" ")));
+            Ok(())
+        }
+        async fn group_permission(
+            &self,
+            collection_id: &str,
+            group_id: &str,
+        ) -> Result<Option<String>> {
+            self.with(collection_id, |c| c.groups.get(group_id).cloned())
+        }
+        async fn add_group(
+            &self,
+            collection_id: &str,
+            group_id: &str,
+            permission: &str,
+        ) -> Result<()> {
+            self.with(collection_id, |c| {
+                c.groups.insert(group_id.into(), permission.into())
+            })?;
+            let group = group_id.trim_start_matches("g-");
+            self.note(format!("add_group {collection_id} {group} {permission}"));
+            Ok(())
+        }
+        async fn remove_group(&self, collection_id: &str, group_id: &str) -> Result<()> {
+            self.with(collection_id, |c| c.groups.remove(group_id))?;
+            let group = group_id.trim_start_matches("g-");
+            self.note(format!("remove_group {collection_id} {group}"));
+            Ok(())
+        }
+    }
+
+    const HOUSE: Option<&str> = Some("residents");
+
+    async fn ensure(
+        wiki: &FakeOutline,
+        known: Option<&str>,
+        name: &str,
+        access: Access,
+        group: Option<&str>,
+    ) -> String {
+        ensure_collection(wiki, HOUSE, known, name, access, group)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_missing_house_group_never_opens_a_collection() {
+        // made private while the group existed; the group renamed or not made yet
+        let wiki = FakeOutline::with_groups(&["kitchen-floor-3"]);
+        let house = wiki.add("House plenum", None, &[]);
+        let kitchen = wiki.add("Kitchen", None, &[("kitchen-floor-3", "read_write")]);
+        let old = wiki.add("Old plenum", Some("read_write"), &[]);
+        ensure(&wiki, Some(&house), "House plenum", Access::House, None).await;
+        ensure(
+            &wiki,
+            Some(&kitchen),
+            "Kitchen",
+            Access::Members,
+            Some("kitchen-floor-3"),
+        )
+        .await;
+        // found by its name too
+        ensure(&wiki, None, "House plenum", Access::House, None).await;
+        // an open one is not closed (that would lock out the house) either
+        ensure(&wiki, Some(&old), "Old plenum", Access::House, None).await;
+        assert_eq!(wiki.changes(), Vec::<String>::new());
+        assert_eq!(wiki.col(&house).permission, None);
+        assert_eq!(wiki.col(&kitchen).permission, None);
+        assert_eq!(wiki.col(&old).permission.as_deref(), Some("read_write"));
+        // a new name: only the name
+        ensure(&wiki, Some(&house), "House", Access::Members, None).await;
+        assert_eq!(wiki.changes(), [format!("update {house} name=House")]);
+        // a new collection is private (closed to the house until the group exists)
+        let fresh = ensure(&wiki, None, "Fresh", Access::House, None).await;
+        assert_eq!(wiki.changes(), ["create Fresh permission=null"]);
+        assert_eq!(wiki.col(&fresh).permission, None);
+        // a plenum made private is made private
+        ensure(&wiki, Some(&old), "Old plenum", Access::Private, None).await;
+        assert_eq!(wiki.changes(), [format!("update {old} permission=null")]);
+        // the group made: the house gets its access, nothing is opened
+        wiki.groups.lock().unwrap().push("residents".into());
+        ensure(&wiki, Some(&fresh), "Fresh", Access::House, None).await;
+        assert_eq!(
+            wiki.changes(),
+            [format!("add_group {fresh} residents read_write")]
+        );
+        assert_eq!(wiki.col(&fresh).permission, None);
+    }
+
+    #[tokio::test]
+    async fn the_house_group_gets_its_access_before_a_collection_is_made_private() {
+        let wiki = FakeOutline::with_groups(&["residents", "kitchen-floor-3"]);
+        // open to the workspace, as before the house group
+        let house = wiki.add("House plenum", Some("read_write"), &[]);
+        let kitchen = wiki.add(
+            "Kitchen",
+            Some("read"),
+            &[("kitchen-floor-3", "read_write")],
+        );
+        ensure(&wiki, Some(&house), "House plenum", Access::House, None).await;
+        assert_eq!(
+            wiki.changes(),
+            [
+                format!("add_group {house} residents read_write"),
+                format!("update {house} permission=null"),
+            ]
+        );
+        ensure(
+            &wiki,
+            Some(&kitchen),
+            "Kitchen",
+            Access::Members,
+            Some("kitchen-floor-3"),
+        )
+        .await;
+        assert_eq!(
+            wiki.changes(),
+            [
+                format!("add_group {kitchen} residents read"),
+                format!("update {kitchen} permission=null"),
+            ]
+        );
+        assert_eq!(
+            wiki.group(&kitchen, "kitchen-floor-3").as_deref(),
+            Some("read_write")
+        );
+        // the next check changes nothing
+        ensure(&wiki, Some(&house), "House plenum", Access::House, None).await;
+        ensure(
+            &wiki,
+            Some(&kitchen),
+            "Kitchen",
+            Access::Members,
+            Some("kitchen-floor-3"),
+        )
+        .await;
+        assert_eq!(wiki.changes(), Vec::<String>::new());
+        // a new one: made private, then the house gets it
+        let fresh = ensure(&wiki, None, "Fresh", Access::House, None).await;
+        assert_eq!(
+            wiki.changes(),
+            [
+                "create Fresh permission=null".to_owned(),
+                format!("add_group {fresh} residents read_write"),
+            ]
+        );
+        // without a house group: open as before
+        let open = ensure_collection(&wiki, None, None, "Open", Access::Members, None)
+            .await
+            .unwrap();
+        assert_eq!(wiki.changes(), ["create Open permission=read"]);
+        assert_eq!(wiki.group(&open, "residents"), None);
+    }
+
+    #[tokio::test]
+    async fn a_kitchen_made_private_and_back_loses_and_gets_the_house_group() {
+        let wiki = FakeOutline::with_groups(&["residents", "kitchen-floor-3"]);
+        let kitchen = wiki.add(
+            "Kitchen",
+            None,
+            &[("residents", "read"), ("kitchen-floor-3", "read_write")],
+        );
+        let k = Some("kitchen-floor-3");
+        ensure(&wiki, Some(&kitchen), "Kitchen", Access::Private, k).await;
+        assert_eq!(
+            wiki.changes(),
+            [format!("remove_group {kitchen} residents")]
+        );
+        assert_eq!(wiki.group(&kitchen, "residents"), None);
+        assert_eq!(
+            wiki.group(&kitchen, "kitchen-floor-3").as_deref(),
+            Some("read_write")
+        );
+        ensure(&wiki, Some(&kitchen), "Kitchen", Access::Members, k).await;
+        assert_eq!(
+            wiki.changes(),
+            [format!("add_group {kitchen} residents read")]
+        );
+        // members → house → members: the house's permission follows
+        ensure(&wiki, Some(&kitchen), "Kitchen", Access::House, k).await;
+        ensure(&wiki, Some(&kitchen), "Kitchen", Access::Members, k).await;
+        assert_eq!(
+            wiki.changes(),
+            [
+                format!("add_group {kitchen} residents read_write"),
+                format!("add_group {kitchen} residents read"),
+            ]
+        );
+        assert_eq!(wiki.col(&kitchen).permission, None);
+        // an open one made private: the house group goes (it had none), then the collection
+        let open = wiki.add("Open kitchen", Some("read"), &[("residents", "read")]);
+        ensure(&wiki, Some(&open), "Open kitchen", Access::Private, k).await;
+        assert_eq!(
+            wiki.changes(),
+            [
+                format!("remove_group {open} residents"),
+                format!("update {open} permission=null"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plenum_whose_group_is_the_house_group_keeps_writing() {
+        let wiki = FakeOutline::with_groups(&["residents"]);
+        for access in [Access::Members, Access::Private] {
+            let id = wiki.add(&format!("{access:?}"), None, &[]);
+            // hourly: the collection, then the plenum's group (as engine.rs setup() does)
+            for round in 0..3 {
+                ensure(&wiki, Some(&id), &format!("{access:?}"), access, HOUSE).await;
+                assert!(grant_group(&wiki, &id, "residents").await.unwrap());
+                assert_eq!(
+                    wiki.group(&id, "residents").as_deref(),
+                    Some("read_write"),
+                    "{access:?} {round}"
+                );
+            }
+            // never taken down to read or away, only given read and write again
+            let changes = wiki.changes();
+            assert!(
+                changes
+                    .iter()
+                    .all(|c| c == &format!("add_group {id} residents read_write")),
+                "{access:?}: {changes:?}"
+            );
+            assert_eq!(changes.len(), 4, "{changes:?}");
+        }
+    }
+}
+
 /// Against a real Outline (`cargo test -- --ignored`, with `OUTLINE_IT_URL` and
 /// `OUTLINE_IT_KEY`): a whole meeting, from the template to the PDF, in a new collection.
 #[cfg(test)]
@@ -539,7 +1106,7 @@ mod against_outline {
         assert_eq!(texts.len(), 1, "announced: {texts:?}");
         let col = engine
             .wiki
-            .ensure_collection(None, &collection, crate::config::Access::House)
+            .ensure_collection(None, &collection, crate::config::Access::House, None)
             .await
             .unwrap();
         let doc = listed(&engine.wiki, &col, "House plenum 2026-11-01").await;
@@ -876,5 +1443,186 @@ mod against_outline {
             .await
             .unwrap()
             .is_none());
+    }
+    /// The house group (2026-10-31): the house plenum, a kitchen and the finance group as the
+    /// engine sets them up (`ensure_collection`, then `grant_group` for a plenum with a group
+    /// that is not the house's), first without it (open to the workspace, as before), then with
+    /// it: every collection private, the house group with what everyone had. Needs the groups
+    /// in Outline (`OUTLINE_IT_HOUSE_GROUP`, `OUTLINE_IT_KITCHEN_GROUP`,
+    /// `OUTLINE_IT_FINANCE_GROUP`, as outline-roles makes them); `OUTLINE_IT_PREFIX` names the
+    /// collections ("<prefix>House plenum", ...). It leaves them set up, for a look at what a
+    /// subtenant sees.
+    #[tokio::test]
+    #[ignore = "needs a running Outline"]
+    async fn house_group_areas_in_a_real_outline() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
+        let (url, key, admin_key) = (
+            var("OUTLINE_IT_URL"),
+            var("OUTLINE_IT_KEY"),
+            var("OUTLINE_IT_ADMIN_KEY"),
+        );
+        let (house_group, kitchen_group, finance_group) = (
+            var("OUTLINE_IT_HOUSE_GROUP"),
+            var("OUTLINE_IT_KITCHEN_GROUP"),
+            var("OUTLINE_IT_FINANCE_GROUP"),
+        );
+        let prefix = std::env::var("OUTLINE_IT_PREFIX")
+            .unwrap_or_else(|_| format!("IT {} ", &uuid::Uuid::new_v4().to_string()[..8]));
+        mxbot_common::logging::init("plenum_bot");
+        let areas = [
+            (format!("{prefix}House plenum"), Access::House, None),
+            (
+                format!("{prefix}Kitchen 1st floor"),
+                Access::Members,
+                Some(kitchen_group.as_str()),
+            ),
+            (
+                format!("{prefix}Finance group"),
+                Access::Private,
+                Some(finance_group.as_str()),
+            ),
+        ];
+        // as engine.rs setup() does it
+        async fn setup(
+            wiki: &Outline,
+            known: Option<&str>,
+            name: &str,
+            access: Access,
+            group: Option<&str>,
+        ) -> String {
+            let id = wiki
+                .ensure_collection(known, name, access, group)
+                .await
+                .unwrap();
+            if let (Some(g), true) = (group, access != Access::House) {
+                assert!(wiki.grant_group(&id, g).await.unwrap(), "no group {g}");
+            }
+            id
+        }
+        // (group name, permission) of a collection, sorted
+        async fn groups_of(url: &str, admin_key: &str, id: &str) -> Vec<(String, String)> {
+            let v = admin(
+                url,
+                admin_key,
+                "collections.group_memberships",
+                json!({"id": id, "limit": 100}),
+            )
+            .await;
+            let names: std::collections::HashMap<&str, &str> = v["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|g| (g["id"].as_str().unwrap(), g["name"].as_str().unwrap()))
+                .collect();
+            let mut out: Vec<(String, String)> = v["groupMemberships"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    (
+                        names[m["groupId"].as_str().unwrap()].to_owned(),
+                        m["permission"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        }
+        async fn permission_of(url: &str, admin_key: &str, id: &str) -> Value {
+            admin(url, admin_key, "collections.info", json!({"id": id})).await["permission"].clone()
+        }
+
+        // before: open to the workspace
+        let legacy = Outline::new(&url, &url, &key, Duration::from_secs(30)).unwrap();
+        let mut ids = Vec::new();
+        for (name, access, group) in &areas {
+            ids.push(setup(&legacy, None, name, *access, *group).await);
+        }
+        assert_eq!(permission_of(&url, &admin_key, &ids[0]).await, "read_write");
+        assert_eq!(permission_of(&url, &admin_key, &ids[1]).await, "read");
+
+        // with the house group: private, the group has what everyone had
+        let wiki = Outline::new(&url, &url, &key, Duration::from_secs(30))
+            .unwrap()
+            .with_house_group(Some(house_group.clone()));
+        for _ in 0..2 {
+            // twice: the second changes nothing
+            for ((name, access, group), id) in areas.iter().zip(&ids) {
+                let again = setup(&wiki, Some(id), name, *access, *group).await;
+                assert_eq!(&again, id);
+            }
+        }
+        let rw = |g: &str| (g.to_owned(), "read_write".to_owned());
+        let ro = |g: &str| (g.to_owned(), "read".to_owned());
+        for id in &ids[..2] {
+            assert!(
+                permission_of(&url, &admin_key, id).await.is_null(),
+                "private now: {id}"
+            );
+        }
+        assert_eq!(
+            groups_of(&url, &admin_key, &ids[0]).await,
+            [rw(&house_group)]
+        );
+        let mut kitchen = vec![ro(&house_group), rw(&kitchen_group)];
+        kitchen.sort();
+        assert_eq!(groups_of(&url, &admin_key, &ids[1]).await, kitchen);
+        assert_eq!(
+            groups_of(&url, &admin_key, &ids[2]).await,
+            [rw(&finance_group)]
+        );
+
+        // a kitchen made private: the house loses it; back to members: the house reads again
+        let (k, kitchen_name) = (ids[1].clone(), areas[1].0.clone());
+        setup(
+            &wiki,
+            Some(&k),
+            &kitchen_name,
+            Access::Private,
+            Some(&kitchen_group),
+        )
+        .await;
+        assert_eq!(groups_of(&url, &admin_key, &k).await, [rw(&kitchen_group)]);
+        setup(
+            &wiki,
+            Some(&k),
+            &kitchen_name,
+            Access::Members,
+            Some(&kitchen_group),
+        )
+        .await;
+        assert_eq!(groups_of(&url, &admin_key, &k).await, kitchen);
+
+        // a new collection is made private with the group at once
+        let fresh = setup(&wiki, None, &format!("{prefix}New"), Access::House, None).await;
+        assert!(permission_of(&url, &admin_key, &fresh).await.is_null());
+        assert_eq!(
+            groups_of(&url, &admin_key, &fresh).await,
+            [rw(&house_group)]
+        );
+
+        // without such a group in Outline: never opened to the workspace; an existing
+        // collection stays as it is, a new one is private (closed to the house until the group
+        // exists)
+        let missing = Outline::new(&url, &url, &key, Duration::from_secs(30))
+            .unwrap()
+            .with_house_group(Some("no-such-group-in-outline".into()));
+        let closed = setup(
+            &missing,
+            None,
+            &format!("{prefix}Closed"),
+            Access::House,
+            None,
+        )
+        .await;
+        assert!(permission_of(&url, &admin_key, &closed).await.is_null());
+        setup(&missing, Some(&ids[0]), &areas[0].0, Access::House, None).await;
+        assert!(permission_of(&url, &admin_key, &ids[0]).await.is_null());
+        assert_eq!(
+            groups_of(&url, &admin_key, &ids[0]).await,
+            [rw(&house_group)]
+        );
+        admin(&url, &key, "collections.delete", json!({"id": closed})).await;
+        println!("collections: {ids:?} new {fresh} closed {closed}");
     }
 }

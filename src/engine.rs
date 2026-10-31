@@ -58,6 +58,7 @@ use crate::{
     protocol::{self, PdfNote},
     schedule::{self, MeetingKey},
     state::{Carried, Meeting, State, Top},
+    stay,
 };
 
 /// A document as the bot needs it.
@@ -79,12 +80,14 @@ pub trait Wiki {
     /// The collection's ID: `known` (the one used last time, renamed to `name` if its name
     /// differs) while it exists, else the one named `name` (never for a private one: someone
     /// else's would keep its members), else a new one; set to `access` (everyone writes;
-    /// everyone reads; nobody but its groups) if it is not.
+    /// everyone reads; nobody but its groups) if it is not. `group`: the plenum's own group
+    /// ([`Wiki::grant_group`]), so a house group that is it too keeps writing (`outline.rs`).
     async fn ensure_collection(
         &self,
         known: Option<&str>,
         name: &str,
         access: Access,
+        group: Option<&str>,
     ) -> Result<String>;
     /// The wiki group `group` may write in the collection; false when the wiki has no such
     /// group (yet: outline-roles makes it from the directory).
@@ -191,6 +194,11 @@ pub struct Engine<W, C> {
     /// How old the directory's last good read may be before no room changes
     /// (`[directory] stale_after_minutes`).
     pub stale_after: std::time::Duration,
+    /// `[members] subtenant_groups`: they live here too, for the kitchens' rooms ([`room_rule`]).
+    pub subtenant_groups: Vec<String>,
+    /// `[members] stay_reminder_days`: the admins hear of a stay's end this many days before
+    /// ([`crate::stay`]).
+    pub stay_reminder_days: u32,
     /// The directory's last good read (for an admin's `!members confirm`).
     snapshot: std::sync::Mutex<Option<Arc<Snapshot>>>,
     /// One round of the rooms at a time: the directory loop's and an admin's confirmation.
@@ -252,6 +260,8 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             choose_url: None,
             grace: membership::Grace::default(),
             stale_after: std::time::Duration::from_secs(3600),
+            subtenant_groups: Vec::new(),
+            stay_reminder_days: 14,
             snapshot: std::sync::Mutex::new(None),
             members_round: Mutex::new(()),
             calendar_url: None,
@@ -673,7 +683,12 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             .and_then(|ps| ps.collection_id.clone());
         let collection = self
             .wiki
-            .ensure_collection(known.as_deref(), &p.collection, p.access)
+            .ensure_collection(
+                known.as_deref(),
+                &p.collection,
+                p.access,
+                p.group.as_deref(),
+            )
             .await?;
         // Kept before the group is granted, which may fail: the next try finds it by ID.
         st.plenums.entry(p.key.clone()).or_default().collection_id = Some(collection.clone());
@@ -1724,6 +1739,17 @@ fn name_key(name: &str) -> String {
 }
 
 impl<W: Wiki, C: Chat> Engine<W, C> {
+    /// The groups whose people the bot serves ([`config::managed_groups`]): the link codes and
+    /// direct chats (main.rs `link_loop`) and the members' read (`members_loop`) use the same.
+    pub fn managed_groups(&self) -> BTreeSet<String> {
+        config::managed_groups(&self.plenums, &self.subtenant_groups)
+    }
+
+    /// Who lives here ([`config::living_groups`]): a stay of someone in none of them is over.
+    fn living_groups(&self) -> BTreeSet<String> {
+        config::living_groups(&self.plenums, &self.subtenant_groups)
+    }
+
     /// Who the wiki's mentions are: every active person of a fresh read of the directory, by
     /// their shown name and by their login (a mention carries the name the wiki shows, which it
     /// takes from the house login), with their chosen account, else their house account
@@ -1777,7 +1803,12 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 // who the wiki's @ mentions are, for the summaries in the chat
                 self.set_people(&snapshot.people);
                 *self.snapshot.lock().unwrap() = Some(Arc::clone(&snapshot));
-                self.sync_members(&snapshot, now).await
+                let synced = self.sync_members(&snapshot, now).await;
+                // not when a guard stopped the round: the read is not to be acted on
+                if synced.is_ok() && self.me.is_some() {
+                    self.remind_stays(&snapshot.people, now).await;
+                }
+                synced
             }
             Err(e) => {
                 warn!("Members: the directory could not be read ({e:#}); nothing changed");
@@ -1839,12 +1870,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         for (room, here) in self.managed_rooms() {
             let rules: Vec<Rule> = here
                 .iter()
-                .filter_map(|p| {
-                    p.group.as_ref().map(|g| Rule {
-                        group: g.clone(),
-                        require: p.require_group.clone(),
-                    })
-                })
+                .filter_map(|p| room_rule(p, &house, &self.subtenant_groups))
                 .collect();
             match self
                 .sync_room(snapshot, &room, &here, &rules, &me, now)
@@ -1937,12 +1963,15 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
         let gate = membership::gate(remembered, &plan.remove, plan.humans, now);
         let groups: Vec<&str> = rules.iter().map(|r| r.group.as_str()).collect();
-        let required: BTreeSet<&str> = rules.iter().filter_map(|r| r.require.as_deref()).collect();
+        let required: BTreeSet<&str> = rules
+            .iter()
+            .flat_map(|r| r.require.iter().map(String::as_str))
+            .collect();
         let reason = if required.is_empty() {
             format!("not in the group {}", groups.join(", "))
         } else {
             format!(
-                "not in the group {} or not in {}",
+                "not in the group {} or in none of {}",
                 groups.join(", "),
                 required.into_iter().collect::<Vec<_>>().join(", ")
             )
@@ -2100,14 +2129,8 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             if !st.people.may_ask(id, now) {
                 continue;
             }
-            // the house account and the links they proved: where they read for sure
-            let to: Vec<&UserId> = people
-                .accounts(person)
-                .filter(|a| {
-                    person.house.as_deref() == Some(*a)
-                        || person.links.iter().any(|l| l.verified && l.id == *a)
-                })
-                .collect();
+            // every account of theirs (house account and links): where they read
+            let to: Vec<&UserId> = people.accounts(person).collect();
             let times = st.people.asked.get(id).map_or(0, |a| a.times);
             let text = choose_message(person, rooms, url, self.me.as_deref());
             for account in &to {
@@ -2175,6 +2198,35 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 }
                 Err(e) => {
                     warn!(person = %person.username, "Members: telling the admins failed: {e:#}")
+                }
+            }
+        }
+        self.save_or_log(&st).await;
+    }
+
+    /// The admins hear of the end of a person's stay ([`crate::stay`]): before it, on the day,
+    /// and when it is overdue, each once per person and date, in their direct chats with the bot
+    /// (a notice that cannot be sent is tried again at the next read).
+    async fn remind_stays(&self, people: &People, now: DateTime<Utc>) {
+        let today = self.today(now);
+        let mut st = self.state.lock().await;
+        stay::tidy(&mut st.stays, people);
+        let due = stay::due(
+            people,
+            &self.living_groups(),
+            &st.stays,
+            today,
+            self.stay_reminder_days,
+        );
+        for reminder in &due {
+            let text = stay::notice(reminder, today);
+            match self.chat.tell_admins(&text, &reminder.key(today)).await {
+                Ok(()) => {
+                    info!(person = %reminder.person.username, until = %reminder.until, stage = reminder.stage.word(), "Members: told the admins about the end of a stay");
+                    stay::record(&mut st.stays, reminder);
+                }
+                Err(e) => {
+                    warn!(person = %reminder.person.username, "Members: telling the admins failed: {e:#}")
                 }
             }
         }
@@ -2264,12 +2316,23 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 accounts.join(", ")
             ));
         }
-        let read = match &*self.snapshot.lock().unwrap() {
-            Some(s) => format!(
-                "The directory was last read {} min ago.",
-                s.age(now.into()).as_secs() / 60
+        let (read, stays) = match &*self.snapshot.lock().unwrap() {
+            Some(s) => (
+                format!(
+                    "The directory was last read {} min ago.",
+                    s.age(now.into()).as_secs() / 60
+                ),
+                stay::overview(
+                    &s.people,
+                    &self.living_groups(),
+                    self.today(now),
+                    self.stay_reminder_days,
+                ),
             ),
-            None => "The directory has not been read since the start.".to_owned(),
+            None => (
+                "The directory has not been read since the start.".to_owned(),
+                Vec::new(),
+            ),
         };
         let held = if lines.is_empty() {
             "No removals are held.".to_owned()
@@ -2291,7 +2354,17 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 handovers.join("\n")
             )
         };
-        format!("{held}{handed}\n\n{read}")
+        let stays = if stays.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nStays ending within {} days or ended (the directory's `stay_until`; \
+                 nothing happens by itself):\n{}",
+                self.stay_reminder_days,
+                stays.join("\n")
+            )
+        };
+        format!("{held}{handed}{stays}\n\n{read}")
     }
 
     /// `!members confirm <room> <digest>`: the room's held removals go once, at once if the
@@ -2401,6 +2474,28 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             ),
         }
     }
+}
+
+/// The rule of a plenum's room (mxbot-common `membership::Rule`): its group, and who of it
+/// counts: its `require_group`. A kitchen (access `members`) that requires the house's group
+/// (`house`, the default) takes the members who live here, so `subtenant_groups` count too;
+/// the house plenum's room (its own group, no requirement) and a private plenum's (finance)
+/// never take them. None without a group.
+pub(crate) fn room_rule(
+    p: &Plenum,
+    house: &BTreeSet<String>,
+    subtenant_groups: &[String],
+) -> Option<Rule> {
+    let group = p.group.clone()?;
+    let mut require: Vec<String> = p.require_group.iter().cloned().collect();
+    let lives_here =
+        p.access == Access::Members && p.require_group.as_ref().is_some_and(|r| house.contains(r));
+    if lives_here {
+        require.extend(subtenant_groups.iter().cloned());
+    }
+    require.sort();
+    require.dedup();
+    Some(Rule { group, require })
 }
 
 /// A room by its plenums' names.
@@ -2526,7 +2621,7 @@ fn invalid_notice(
     };
     let why = match why {
         Invalid::Malformed => "it is no Matrix ID",
-        Invalid::NotTheirs => "it is neither their house account nor a link they verified",
+        Invalid::NotTheirs => "it is neither their house account nor one of their links",
         Invalid::Conflict => "another active person claims it too",
     };
     let fix = url.map_or(String::new(), |u| format!(" ({u})"));
@@ -2739,6 +2834,7 @@ pub(crate) mod fakes {
             known: Option<&str>,
             name: &str,
             access: Access,
+            _group: Option<&str>,
         ) -> Result<String> {
             self.check()?;
             let mut c = self.collections.lock().unwrap();
@@ -4181,6 +4277,7 @@ mod tests {
                 house: Some(house),
                 links: Vec::new(),
                 choice: Choice::None,
+                stay_until: None,
             }
         };
         e.set_people(&People::new(vec![
@@ -4350,6 +4447,7 @@ mod tests {
             house: Some(house),
             links: Vec::new(),
             choice: Choice::None,
+            stay_until: None,
         }
     }
 
@@ -4360,15 +4458,11 @@ mod tests {
         p
     }
 
-    /// `p` with a verified link, chosen or not.
+    /// `p` with a link, chosen or not.
     fn linked(mut p: DirPerson, account: &str, chosen: bool) -> DirPerson {
         let id: OwnedUserId = account.try_into().unwrap();
         p.accounts.push(id.clone());
-        p.links.push(Link {
-            id: id.clone(),
-            by_admin: false,
-            verified: true,
-        });
+        p.links.push(Link { id: id.clone() });
         if chosen {
             p.choice = Choice::Account(id);
         }
@@ -4713,6 +4807,251 @@ mod tests {
         );
     }
 
+    #[test]
+    fn subtenants_count_in_the_kitchens_rooms_only() {
+        let house: BTreeSet<String> = ["residents".to_owned()].into();
+        let subtenants = ["subtenants".to_owned()];
+        let rule = |p: &Plenum| room_rule(p, &house, &subtenants).unwrap();
+        // the house plenum's room: its group, nobody else
+        let r = rule(&house_with_group());
+        assert_eq!((r.group.as_str(), r.require.len()), ("residents", 0));
+        // a kitchen requiring the house's group: who lives here, subtenants too
+        assert_eq!(rule(&kitchen3()).require, ["residents", "subtenants"]);
+        // a private plenum (finance) requiring it: full members only
+        let finance = Plenum {
+            group: Some("finance".into()),
+            require_group: Some("residents".into()),
+            access: Access::Private,
+            ..plenum("finance", "Finance plenum", "!fin:x")
+        };
+        assert_eq!(rule(&finance).require, ["residents"]);
+        // a kitchen requiring another group, or none: as configured
+        let guests = Plenum {
+            require_group: Some("guests".into()),
+            ..kitchen3()
+        };
+        assert_eq!(rule(&guests).require, ["guests"]);
+        let open = Plenum {
+            require_group: None,
+            ..kitchen3()
+        };
+        assert!(rule(&open).require.is_empty());
+        // without subtenant groups configured: as before
+        assert_eq!(
+            room_rule(&kitchen3(), &house, &[]).unwrap().require,
+            ["residents"]
+        );
+        // no group, no rule
+        assert!(room_rule(&plenum("x", "X", "!x:x"), &house, &subtenants).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_subtenant_is_invited_to_their_kitchen_and_never_to_the_house_room() {
+        let mut e = managing(vec![house_with_group(), kitchen3()]);
+        e.subtenant_groups = vec!["subtenants".into()];
+        e.chat.members.lock().unwrap().extend([
+            in_room("!k3:x", "@plenum-bot:x", true),
+            in_room("!house:x", "@plenum-bot:x", true),
+            // someone invited the subtenant into the house's room by hand
+            in_room("!house:x", "@sub:x", false),
+        ]);
+        let people = |sub_groups: &[&str]| {
+            vec![
+                resident("anna", &["residents", "kitchen-floor-3"]),
+                resident("sub", sub_groups),
+                resident("finn", &["residents", "finance"]),
+            ]
+        };
+        let groups: Vec<&str> = GROUPS.iter().copied().chain(["subtenants"]).collect();
+        let now = at(2026, 10, 22, 10, 0);
+        sync(
+            &e,
+            read(people(&["subtenants", "kitchen-floor-3"]), &groups, now),
+            now,
+        )
+        .await;
+        assert_eq!(
+            members_of(&e, "!k3:x"),
+            set_of(&["@plenum-bot:x", "@anna:x", "@sub:x"])
+        );
+        assert_eq!(
+            members_of(&e, "!house:x"),
+            set_of(&["@plenum-bot:x", "@anna:x", "@finn:x"])
+        );
+        // the subtenants group missing from the read: the kitchen is left alone
+        let later = at(2026, 10, 22, 10, 15);
+        sync(
+            &e,
+            read(people(&["kitchen-floor-3"]), &GROUPS, later),
+            later,
+        )
+        .await;
+        assert!(members_of(&e, "!k3:x").contains("@sub:x"));
+        // moved out (subtenants → former-residents): out of the kitchen too
+        let later = at(2026, 10, 22, 10, 30);
+        sync(
+            &e,
+            read(
+                people(&["former-residents", "kitchen-floor-3"]),
+                &groups,
+                later,
+            ),
+            later,
+        )
+        .await;
+        assert_eq!(
+            members_of(&e, "!k3:x"),
+            set_of(&["@plenum-bot:x", "@anna:x"])
+        );
+        let removed = e.chat.removed.lock().unwrap().clone();
+        let out = removed.iter().find(|(r, _, _)| r == "!k3:x").unwrap();
+        assert!(
+            out.2.contains("in none of residents, subtenants"),
+            "{}",
+            out.2
+        );
+    }
+
+    #[test]
+    fn a_subtenant_without_a_kitchen_yet_may_ask_for_a_link_and_write_to_the_bot() {
+        let id = |s: &str| -> OwnedUserId { s.try_into().unwrap() };
+        let mut e = managing(vec![house_with_group(), kitchen3()]);
+        let only_subtenants = |e: &Engine<FakeWiki, FakeChat>| {
+            let people = People::new(vec![
+                resident("anna", &["residents"]),
+                // just moved in: the kitchen's group comes later
+                resident("sub", &["subtenants"]),
+                resident("guest", &["guests"]),
+            ]);
+            let groups = e.managed_groups();
+            // who may write to the bot (`DmAccounts::follow`) and ask for a code
+            // (`Directory::link_requests`: active people in one of the groups)
+            let known = mxbot_common::rooms::known_accounts(&people, &groups);
+            let mut asks: Vec<String> = people
+                .active()
+                .filter(|p| p.groups.iter().any(|g| groups.contains(g)))
+                .map(|p| p.username.clone())
+                .collect();
+            asks.sort();
+            (known, asks)
+        };
+        let (known, asks) = only_subtenants(&e);
+        assert!(
+            !known.contains(&id("@sub:x")),
+            "no subtenant groups configured"
+        );
+        assert_eq!(asks, ["anna"]);
+        e.subtenant_groups = vec!["subtenants".into()];
+        let (known, asks) = only_subtenants(&e);
+        assert!(known.contains(&id("@sub:x")) && known.contains(&id("@anna:x")));
+        assert!(!known.contains(&id("@guest:x")));
+        assert_eq!(asks, ["anna", "sub"]);
+        // the members' read asks for the same groups
+        assert!(e.managed_groups().contains("subtenants"));
+    }
+
+    #[tokio::test]
+    async fn the_admins_hear_of_the_end_of_a_stay_once_per_stage() {
+        let mut t = setup(vec![house_with_group(), kitchen3()]);
+        t.engine.me = Some("@plenum-bot:x".try_into().unwrap());
+        t.engine.subtenant_groups = vec!["subtenants".into()];
+        let groups: Vec<&str> = GROUPS.iter().copied().chain(["subtenants"]).collect();
+        let people = |until: Option<NaiveDate>, active: bool| {
+            let mut sub = resident("sub", &["subtenants", "kitchen-floor-3"]);
+            sub.name = "Sam Sub".into();
+            sub.stay_until = until;
+            if !active {
+                sub.active = false;
+                sub.groups.clear();
+            }
+            vec![resident("anna", &["residents", "kitchen-floor-3"]), sub]
+        };
+        let nov30 = NaiveDate::from_ymd_opt(2026, 11, 30);
+        let stays = |e: &Engine<FakeWiki, FakeChat>| -> Vec<String> {
+            e.chat
+                .admin_notes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| k.starts_with("members-stay:"))
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        // more than 14 days before: nothing
+        let now = at(2026, 11, 15, 12, 0);
+        sync(&t.engine, read(people(nov30, true), &groups, now), now).await;
+        assert!(stays(&t.engine).is_empty());
+        // 14 days before: once, however often the directory is read
+        for h in [9, 10, 11] {
+            let now = at(2026, 11, 16, h, 0);
+            sync(&t.engine, read(people(nov30, true), &groups, now), now).await;
+        }
+        assert_eq!(
+            stays(&t.engine),
+            ["members-stay:u-sub:2026-11-30:soon:2026-11-16"]
+        );
+        let text = t.engine.chat.admin_notes.lock().unwrap()[0].1.clone();
+        assert!(
+            text.contains("sub (Sam Sub) ends in 14 days (30 Nov 2026"),
+            "{text}"
+        );
+        // `!members` lists it
+        let now = at(2026, 11, 16, 11, 0);
+        let overview = t
+            .engine
+            .command_in(&room(), &anna(), Command::Members, now, Scope::AdminDm)
+            .await;
+        assert!(
+            overview.contains("- sub (Sam Sub): until 30 Nov 2026 (ends in 14 days;"),
+            "{overview}"
+        );
+        // a restart remembers it: nothing again
+        restart(&mut t).await;
+        t.engine.me = Some("@plenum-bot:x".try_into().unwrap());
+        t.engine.subtenant_groups = vec!["subtenants".into()];
+        let now = at(2026, 11, 20, 9, 0);
+        sync(&t.engine, read(people(nov30, true), &groups, now), now).await;
+        assert!(stays(&t.engine).is_empty());
+        // the day in the bot's time zone: 00:30 in Berlin is still the 29th in UTC
+        let now = at(2026, 11, 30, 0, 30);
+        assert_eq!(
+            now.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 11, 29).unwrap()
+        );
+        sync(&t.engine, read(people(nov30, true), &groups, now), now).await;
+        assert_eq!(
+            stays(&t.engine),
+            ["members-stay:u-sub:2026-11-30:today:2026-11-30"]
+        );
+        // still active two days later: overdue, once; nobody is removed for it
+        for d in [2, 3] {
+            let now = at(2026, 12, d, 9, 0);
+            sync(&t.engine, read(people(nov30, true), &groups, now), now).await;
+        }
+        assert_eq!(stays(&t.engine).len(), 2);
+        assert!(stays(&t.engine)[1].contains(":overdue:2026-12-02"));
+        assert!(t.engine.chat.removed.lock().unwrap().is_empty());
+        let now = at(2026, 12, 3, 9, 0);
+        let overview = t
+            .engine
+            .command_in(&room(), &anna(), Command::Members, now, Scope::AdminDm)
+            .await;
+        assert!(overview.contains("overdue: still active"), "{overview}");
+        // extended: a new date starts again (quiet until two weeks before it)
+        let jan31 = NaiveDate::from_ymd_opt(2027, 1, 31);
+        let now = at(2027, 1, 17, 9, 0);
+        sync(&t.engine, read(people(jan31, true), &groups, now), now).await;
+        assert_eq!(stays(&t.engine).len(), 3);
+        assert!(stays(&t.engine)[2].contains("2027-01-31:soon"));
+        // deactivated: ignored; the attribute removed: forgotten
+        let now = at(2027, 1, 31, 9, 0);
+        sync(&t.engine, read(people(jan31, false), &groups, now), now).await;
+        assert_eq!(stays(&t.engine).len(), 3);
+        sync(&t.engine, read(people(None, true), &groups, now), now).await;
+        assert_eq!(stays(&t.engine).len(), 3);
+        assert!(t.engine.state.lock().await.stays.is_empty());
+    }
+
     #[tokio::test]
     async fn a_room_with_a_plenum_without_group_is_never_managed() {
         let e = managing(vec![plenum("house", "House plenum", "!house:x")]);
@@ -4762,7 +5101,7 @@ mod tests {
                 resident("z", &["residents"]),
                 // A: only the house account, nothing chosen
                 unchosen("a", &["residents"]),
-                // B: chose a verified link
+                // B: chose a link
                 linked(unchosen("b", &["residents"]), "@b:matrix.org", true),
                 // C: two links and the house account, chose one
                 linked(
@@ -5223,7 +5562,7 @@ mod tests {
             in_room("!house:x", "@i:x", false),
         ]);
         let mut i = unchosen("i", &["residents"]);
-        i.choice = Choice::Account("@i:matrix.org".try_into().unwrap()); // not verified
+        i.choice = Choice::Account("@i:matrix.org".try_into().unwrap()); // not one of theirs
         let people = || {
             vec![
                 i.clone(),
@@ -5255,7 +5594,7 @@ mod tests {
             notes[1]
         );
         assert!(
-            notes[2].contains("i chose @i:matrix.org") && notes[2].contains("verified"),
+            notes[2].contains("i chose @i:matrix.org") && notes[2].contains("one of their links"),
             "{}",
             notes[2]
         );
@@ -5758,6 +6097,7 @@ mod tests {
             house: Some(house),
             links: Vec::new(),
             choice: Choice::None,
+            stay_until: None,
         }]));
         let now = at(2026, 10, 20, 12, 0);
         let a = e

@@ -19,7 +19,7 @@
 //! bot sends to a stranger).
 //!
 //! Not served: a request older than a slot (or far in the future), an account on the house's
-//! server (it needs no link), one the person has proved already, one another active person
+//! server (it needs no link), one linked to the person already, one another active person
 //! claims (from the last full read of the directory; none yet: wait). At most
 //! [`PER_PERSON_PER_DAY`] deliveries per person, [`PER_ACCOUNT_PER_DAY`] per account (whoever
 //! asks: nobody's account is written to over and over) and [`PER_HOUR`] in all; more are
@@ -113,7 +113,7 @@ pub enum Eligibility {
     Refused(&'static str),
 }
 
-/// Whether `request` is served now: fresh, not on the house's server, not proved by the person
+/// Whether `request` is served now: fresh, not on the house's server, not linked to the person
 /// already, and claimed by no other active person in `people` (the last full read; `None`:
 /// wait for one).
 pub fn eligibility(
@@ -128,7 +128,7 @@ pub fn eligibility(
     if request.account.server_name().as_str() == house_server {
         return Eligibility::Refused("an account on the house's server needs no link");
     }
-    if request.verified.contains(&request.account) {
+    if request.linked.contains(&request.account) {
         return Eligibility::Refused("the person has linked it already");
     }
     let Some(people) = people else {
@@ -585,20 +585,13 @@ mod tests {
             username: person.into(),
             account: id(account),
             at,
-            verified: Vec::new(),
+            linked: Vec::new(),
         }
     }
 
     fn person(name: &str, links: &[&str]) -> Person {
         let house = id(&format!("@{name}:house.org"));
-        let links: Vec<Link> = links
-            .iter()
-            .map(|l| Link {
-                id: id(l),
-                by_admin: false,
-                verified: true,
-            })
-            .collect();
+        let links: Vec<Link> = links.iter().map(|l| Link { id: id(l) }).collect();
         Person {
             id: format!("u-{name}"),
             username: name.into(),
@@ -611,6 +604,7 @@ mod tests {
             house: Some(house),
             links,
             choice: Choice::None,
+            stay_until: None,
         }
     }
 
@@ -657,7 +651,7 @@ mod tests {
             Eligibility::Refused(_)
         ));
         let mut linked = request("ben", "@ben:matrix.org", t0());
-        linked.verified = vec![id("@ben:matrix.org")];
+        linked.linked = vec![id("@ben:matrix.org")];
         assert!(matches!(
             eligibility(&linked, "house.org", Some(&people), now),
             Eligibility::Refused(_)
@@ -667,7 +661,7 @@ mod tests {
             eligibility(&bens, "house.org", Some(&people), now),
             Eligibility::Refused("another active person claims this account")
         );
-        // their own (an admin entered it, not proved yet): served
+        // claimed in the full read by the asking person only (not in the request's `linked`): served
         let own = request("ben", "@ben:matrix.org", t0());
         assert_eq!(
             eligibility(&own, "house.org", Some(&people), now),

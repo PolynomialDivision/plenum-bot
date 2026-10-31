@@ -24,6 +24,7 @@ mod pdf;
 mod protocol;
 mod schedule;
 mod state;
+mod stay;
 
 use std::{
     sync::Arc,
@@ -259,8 +260,9 @@ impl LinkChat for MatrixChat {
 const ADMIN_HELP: &str =
     "For everyone in the plenum rooms: !plenum · !top <topic> (also as a reply to a message) · \
 !minutes done · !minutes confidential|link|full [day] · !plenum help. The meetings are in the plenums' Nextcloud calendars. \
-Here in the admin chat !plenum shows every plenum, !members the rooms' held removals and the \
-running handovers (a member's old account → the one they chose, until when it stays) and \
+Here in the admin chat !plenum shows every plenum, !members the rooms' held removals, the \
+running handovers (a member's old account → the one they chose, until when it stays) and the \
+stays that end soon or are overdue (the directory's stay_until), and \
 !members confirm <plenum key|room> <digest> carries a room's held plan out once (the digest is \
 in the notice and in !members). \
 From an account on another server, !link <username> in a direct chat gives its link code; an \
@@ -285,7 +287,10 @@ async fn main() -> Result<()> {
         &config.public_url(),
         &config.api_key()?,
         Duration::from_secs(config.outline.timeout_secs),
-    )?;
+    )?
+    // nothing in the wiki open to everyone: the house group gets what everyone had
+    // (subtenants are wiki members too, house-infra stacks/outline README "Subtenants")
+    .with_house_group(config::wiki_house_group(&plenums)?);
     if config.pdf.enabled {
         for font in ["DejaVuSans.ttf", "DejaVuSans-Bold.ttf"] {
             let path = std::path::Path::new(&config.pdf.font_dir).join(font);
@@ -345,6 +350,8 @@ async fn main() -> Result<()> {
         engine.ask_to_choose = config.members.ask_to_choose;
         engine.choose_url = config.members.choose_url().map(str::to_owned);
         engine.grace = config.members.grace();
+        engine.subtenant_groups = config.members.subtenant_groups();
+        engine.stay_reminder_days = config.members.stay_reminder_days;
         if let Some(dir) = &config.directory {
             engine.stale_after = dir.stale_after();
         }
@@ -479,9 +486,9 @@ async fn main() -> Result<()> {
 
 /// Every [`link_delivery::ROUND`]: the link requests (and every `refresh_minutes` the whole
 /// directory, for the accounts that may open a direct chat and for who claims an account),
-/// then a [`link_delivery::round`]. Only the people of the groups whose rooms the bot manages
-/// (`config::directory_groups`) may ask for a code or write to the bot. The first good read
-/// takes up the direct-chat invites held for it. A directory that is down is another service's
+/// then a [`link_delivery::round`]. Only the people of the groups the bot serves
+/// (`Engine::managed_groups`, the subtenants' too) may ask for a code or write to the bot. The
+/// first good read takes up the direct-chat invites held for it. A directory that is down is another service's
 /// outage (`Alive::unavailable`; the deliveries under way go on); one that refuses the token or
 /// answers what the bot cannot read, and Matrix or the state failing, are this loop's failure.
 async fn link_loop(
@@ -497,7 +504,7 @@ async fn link_loop(
     let pending = mxbot_common::status::queue("link_codes");
     let skipped = mxbot_common::status::gauge("link_codes_skipped");
     let gave_up = mxbot_common::status::gauge("link_codes_gave_up");
-    let groups = config::directory_groups(&engine.plenums);
+    let groups = engine.managed_groups();
     if groups.is_empty() {
         warn!("Link requests: no plenum has a group, so nobody may ask for a code or write to me");
     }
@@ -695,7 +702,10 @@ async fn members_loop(
     alive: Alive,
 ) {
     alive.expect_every(directory.config().refresh());
-    let wanted = config::directory_groups(&engine.plenums);
+    // the plenums' groups and the ones they require, and the subtenants' (a kitchen's room
+    // requires them too: a group the read does not know leaves that room alone); the same the
+    // link loop serves
+    let wanted = engine.managed_groups();
     loop {
         let read = directory.snapshot(&wanted).await;
         // `[security] admin_groups`: their members' house accounts are admins while this read

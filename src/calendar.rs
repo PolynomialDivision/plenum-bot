@@ -7,7 +7,9 @@
 //! The bot's own Nextcloud account owns the calendars: it makes a missing one and keeps who
 //! may see and edit it in line with the plenum's access (`shares`): the house plenum is
 //! edited by the house group; a kitchen's by its group and read by the house; a private one
-//! (the Finanz-AG) only by its group. The readers of `[calendar] readers` (calendar-bot) read
+//! (the Finanz-AG) only by its group. A subtenant (in `subtenants` and a kitchen's group, not in
+//! the house group) so edits their kitchen's calendar and sees no other: the subtenants group
+//! is shared nothing. The readers of `[calendar] readers` (calendar-bot) read
 //! every calendar that is not private. Nothing else is shared: a share made by hand goes.
 //!
 //! The Nextcloud side (making, sharing and reading a calendar) is mxbot-common's
@@ -204,6 +206,54 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         assert_eq!(
             wanted_shares(Access::Members, Some("residents"), "residents", &[]),
             vec![w("principal:principals/groups/residents", true)]
+        );
+    }
+
+    #[test]
+    fn a_subtenant_reads_and_edits_only_their_kitchens_calendar() {
+        // the house's plenums as house-infra configures them
+        let plenums = [
+            ("house", Access::House, Some("residents")),
+            ("kitchen-floor-1", Access::Members, Some("kitchen-floor-1")),
+            ("kitchen-floor-3", Access::Members, Some("kitchen-floor-3")),
+            ("finance", Access::Private, Some("finance")),
+        ];
+        // what a Nextcloud user in `groups` may do with each calendar: None, Some(false) read,
+        // Some(true) write
+        let access = |groups: &[&str]| -> Vec<(&str, Option<bool>)> {
+            plenums
+                .iter()
+                .map(|(key, access, plenum_group)| {
+                    let shares = wanted_shares(*access, *plenum_group, "residents", &[]);
+                    let mine = shares
+                        .iter()
+                        .filter(|s| groups.iter().any(|g| s.principal == group(g)))
+                        .map(|s| s.write)
+                        .max();
+                    (*key, mine)
+                })
+                .collect()
+        };
+        // a subtenant of kitchen 3: its calendar (edit), nothing of the house, the other
+        // kitchens or finance (the subtenants group is shared nothing)
+        assert_eq!(
+            access(&["subtenants", "kitchen-floor-3"]),
+            [
+                ("house", None),
+                ("kitchen-floor-1", None),
+                ("kitchen-floor-3", Some(true)),
+                ("finance", None)
+            ]
+        );
+        // a resident of kitchen 3: the house's (edit), every kitchen's (kitchen 3 edit)
+        assert_eq!(
+            access(&["residents", "kitchen-floor-3"]),
+            [
+                ("house", Some(true)),
+                ("kitchen-floor-1", Some(false)),
+                ("kitchen-floor-3", Some(true)),
+                ("finance", None)
+            ]
         );
     }
 

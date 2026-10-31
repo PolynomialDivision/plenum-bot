@@ -40,6 +40,9 @@ pub struct Config {
 /// The longest `[members] handover_days` and `handover_max_days`: a year.
 pub const HANDOVER_DAYS_MAX: u32 = 365;
 
+/// The longest `[members] stay_reminder_days`: a year.
+pub const STAY_REMINDER_DAYS_MAX: u32 = 365;
+
 /// The rooms of plenums with a group follow it: the chosen account of each member is invited,
 /// accounts of nobody in it are removed (mxbot-common `membership`).
 #[derive(Deserialize, Clone, Debug)]
@@ -60,6 +63,15 @@ pub struct MembersConfig {
     pub handover_days: u32,
     /// …and this many days at most after the bot first saw the choice, joined or not.
     pub handover_max_days: u32,
+    /// Directory groups of people who live here for a while (`subtenants`): they have a kitchen
+    /// of their own. In the room of a plenum with access `members` (a kitchen) that requires the
+    /// house plenum's group (`require_group`, by default), its members in one of these count as
+    /// living here too; never in the house plenum's room or a private plenum's (finance).
+    /// Empty (the default): only the house's group counts.
+    pub subtenant_groups: Vec<String>,
+    /// The admins are reminded this many days before a person's stay ends (the directory's
+    /// `stay_until`), and on the day; 1 to [`STAY_REMINDER_DAYS_MAX`].
+    pub stay_reminder_days: u32,
 }
 
 impl Default for MembersConfig {
@@ -71,6 +83,8 @@ impl Default for MembersConfig {
             choose_url: None,
             handover_days: 7,
             handover_max_days: 30,
+            subtenant_groups: Vec::new(),
+            stay_reminder_days: 14,
         }
     }
 }
@@ -118,7 +132,29 @@ impl MembersConfig {
                 self.handover_max_days
             );
         }
+        if self.subtenant_groups.iter().any(|g| g.trim().is_empty()) {
+            bail!("[members] subtenant_groups: no empty names");
+        }
+        if !(1..=STAY_REMINDER_DAYS_MAX).contains(&self.stay_reminder_days) {
+            bail!(
+                "[members] stay_reminder_days ({}) must be 1 to {STAY_REMINDER_DAYS_MAX}",
+                self.stay_reminder_days
+            );
+        }
         Ok(())
+    }
+
+    /// `subtenant_groups`, trimmed, each once.
+    pub fn subtenant_groups(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .subtenant_groups
+            .iter()
+            .map(|g| g.trim().to_owned())
+            .filter(|g| !g.is_empty())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 }
 
@@ -551,6 +587,30 @@ pub fn house_groups(plenums: &[Plenum]) -> BTreeSet<String> {
         .collect()
 }
 
+/// The wiki's house group ([`crate::outline::Outline::with_house_group`], 2026-10-31): the one
+/// house plenum's group, which gets in Outline what everyone in the workspace got before. None
+/// without a house plenum with a group; several are an error (which one is the house?), at
+/// startup: a config with house plenums of different groups, valid before 2026-10-31 when each
+/// other plenum sets its `require_group`, is refused since (README "The house group").
+pub fn wiki_house_group(plenums: &[Plenum]) -> Result<Option<String>> {
+    let groups = house_groups(plenums);
+    if groups.len() > 1 {
+        let keys: Vec<&str> = plenums
+            .iter()
+            .filter(|p| p.access == Access::House && p.group.is_some())
+            .map(|p| p.key.as_str())
+            .collect();
+        bail!(
+            "the plenums with access house ({}) have different groups ({}), but the wiki has \
+             one house group (it gets what everyone in the workspace had, outline.rs): give \
+             them the same group, or all but one access members",
+            keys.join(", "),
+            groups.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(groups.into_iter().next())
+}
+
 /// Every directory group the plenums read: their own and the ones these require.
 pub fn directory_groups(plenums: &[Plenum]) -> BTreeSet<String> {
     plenums
@@ -558,6 +618,24 @@ pub fn directory_groups(plenums: &[Plenum]) -> BTreeSet<String> {
         .flat_map(|p| p.group.iter().chain(p.require_group.iter()))
         .cloned()
         .collect()
+}
+
+/// The groups whose people the bot serves: [`directory_groups`] and `[members]
+/// subtenant_groups` (a subtenant may be in their group alone before their kitchen's is added).
+/// Who is in one may ask for a link code and write to the bot, and the members' read asks for
+/// them. One list for both, so nobody is a member to one and a stranger to the other.
+pub fn managed_groups(plenums: &[Plenum], subtenant_groups: &[String]) -> BTreeSet<String> {
+    let mut groups = directory_groups(plenums);
+    groups.extend(subtenant_groups.iter().cloned());
+    groups
+}
+
+/// Who lives here: the [`house_groups`] and `[members] subtenant_groups`. Someone in none of
+/// them (moved out to former-residents, their user still active) does not live here any more.
+pub fn living_groups(plenums: &[Plenum], subtenant_groups: &[String]) -> BTreeSet<String> {
+    let mut groups = house_groups(plenums);
+    groups.extend(subtenant_groups.iter().cloned());
+    groups
 }
 
 fn trimmed(group: &Option<String>) -> Option<&str> {
@@ -742,6 +820,35 @@ access = "members"
         assert!(grace("handover_days = 4294967295\nhandover_max_days = 4294967295").is_err());
     }
 
+    #[test]
+    fn subtenant_groups_and_stay_reminders_default_off_and_are_checked() {
+        let m = MembersConfig::default();
+        assert!(m.subtenant_groups().is_empty());
+        assert_eq!(m.stay_reminder_days, 14);
+        m.check().unwrap();
+        let members = |extra: &str| -> MembersConfig { toml::from_str(extra).unwrap() };
+        let m = members("subtenant_groups = [' subtenants', 'lodgers', 'subtenants']");
+        m.check().unwrap();
+        assert_eq!(m.subtenant_groups(), ["lodgers", "subtenants"]);
+        assert!(members("subtenant_groups = ['']").check().is_err());
+        // 1 to 365 days before
+        for ok in [1, 14, 365] {
+            members(&format!("stay_reminder_days = {ok}"))
+                .check()
+                .unwrap();
+        }
+        for bad in [0u64, 366, 4_294_967_295] {
+            assert!(
+                members(&format!("stay_reminder_days = {bad}"))
+                    .check()
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        assert!(toml::from_str::<MembersConfig>("stay_reminder_days = -1").is_err());
+        assert!(toml::from_str::<MembersConfig>("subtenant_group = ['x']").is_err());
+    }
+
     const DIRECTORY: &str =
         "[directory]\nprovider = 'authentik'\napi_url = 'https://login.example.org/api/v3'\n";
 
@@ -774,6 +881,30 @@ access = "members"
                 .into()
         );
         assert_eq!(house_groups(&ps), ["residents".to_owned()].into());
+        // with the subtenants: the groups the bot serves, and who lives here
+        let subtenants = ["subtenants".to_owned()];
+        assert_eq!(
+            managed_groups(&ps, &subtenants),
+            ["residents", "kitchen-floor-1", "finance", "subtenants"]
+                .map(String::from)
+                .into()
+        );
+        assert_eq!(managed_groups(&ps, &[]), directory_groups(&ps));
+        assert_eq!(
+            living_groups(&ps, &subtenants),
+            ["residents", "subtenants"].map(String::from).into()
+        );
+        assert_eq!(wiki_house_group(&ps).unwrap().as_deref(), Some("residents"));
+        // no house plenum with a group: none; two house groups: which one?
+        assert_eq!(wiki_house_group(&ps[1..]).unwrap(), None);
+        let mut two = ps.clone();
+        two[3].group = Some("others".into());
+        let e = wiki_house_group(&two).unwrap_err().to_string();
+        assert!(
+            e.contains("(house, open) have different groups (others, residents)")
+                && e.contains("give them the same group, or all but one access members"),
+            "{e}"
+        );
 
         // explicit: another group, or "" for no such rule
         let c = parse(&format!(

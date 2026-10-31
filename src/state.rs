@@ -40,6 +40,10 @@ pub struct State {
     /// restart sends no invitation or code twice, and the day's deliveries are counted.
     #[serde(default)]
     pub link_requests: BTreeMap<String, LinkDelivery>,
+    /// Per person (the directory's id): what the admins were told about the end of their stay
+    /// (`stay_until`; [`crate::stay`]). Left out when empty, so an older image reads the file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stays: crate::stay::Memory,
 }
 
 /// One link request the bot took up ([`crate::link_delivery`]). Holds no code: the code is

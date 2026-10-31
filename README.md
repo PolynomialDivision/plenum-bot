@@ -10,7 +10,8 @@ each with its own room, collection and Nextcloud calendar.
 A plenum may belong to a directory group (`group`): its room's members follow the group
 (`[directory]`, `[members]`; mxbot-common `membership`, house-infra docs/HOUSE-DIRECTORY.md),
 and the group writes in its collection (`access`: `house` everyone writes, `members` everyone
-reads and the group writes, `private` only the group). Per room, from one read of the
+reads and the group writes, `private` only the group; "everyone" is the house plenum's group
+in the wiki, "In Outline": the house group). Per room, from one read of the
 directory:
 
 - **invited**: the account each member *chose* for the house (`matrix_preferred`: their house
@@ -23,7 +24,7 @@ directory:
   links, German, at most three times, two weeks apart) where to choose (`choose_url`);
 - **kept**: one account per member, the one they chose; while they have not chosen (or their
   choice cannot be used), every account the directory knows as theirs (the house account,
-  links an admin entered, verified links). The house's bots and `keep`, and the room's admins
+  their links in `matrix_ids`). The house's bots and `keep`, and the room's admins
   (power level 100), always;
 - **handed over**: a member's other accounts in the room once they chose one (the house
   account that joined on its own, an older choice, a link an admin entered) stay until
@@ -68,6 +69,35 @@ drops a key it has seen before, so a recurring notice would otherwise be lost. O
 former resident still in a kitchen's group is neither kept nor invited. The directory token
 needs to view users and groups.
 
+**Subtenants.** People who live here for a while (house-infra's `subtenants` group,
+docs/HOUSE-DIRECTORY.md) get their own kitchen and nothing of the house plenum. With
+`[members] subtenant_groups = ["subtenants"]` a kitchen (access `members`) that requires the
+house plenum's group takes its members in one of these groups too: they are invited with their
+chosen account (asked to choose like everyone, may link accounts and write `!link`, as members
+of a managed group, also while they are only in `subtenants` and their kitchen's group comes
+later), kept, and removed once they are in neither (moved out to
+`former-residents`). The house plenum's room follows its own group (`residents`) alone, and a
+private plenum (finance) keeps requiring the house's group only, so subtenants are never
+invited there; who is invited there by hand is removed. A subtenant group the directory does
+not know leaves the kitchens' rooms alone (logged), as any unknown group. Their calendars: a
+kitchen's is edited by its group and read by the house group (`residents`), the house plenum's
+by the house group only, so a subtenant edits their kitchen's calendar and sees no other
+(`calendar.rs`). Unset (the default): only the house plenum's group counts, as before.
+
+**The end of a stay.** An admin may set `stay_until` ("YYYY-MM-DD"; `[directory]
+stay_until_attribute`) on anyone in the directory, typically a subtenant. The admins hear of
+it in their direct chats with the bot `[members] stay_reminder_days` (14, 1–365) before it, on
+the day (or the day after, when the bot was down that day), and once more when the person
+still lives here more than a day after it ("overdue"); each once per person and date (kept in
+`store/state.json`, `stays`, so a restart tells nothing twice), only the stage it is in now
+(a reminder missed while the bot was down is not sent late). A changed date starts again; a
+removed date, a deactivated or a deleted person is forgotten. The day is the bot's
+(`[defaults] timezone`). `!members` lists the stays that end within those days and the overdue
+ones. A stay is over once the person is in none of the living groups (the house plenum's group
+and `subtenant_groups`; moved out to `former-residents`, their user still active): no reminder,
+not listed. Nothing else follows from it: nobody is locked out or removed; the directory's groups
+decide that. An unreadable value is ignored (debug log), never a failed read.
+
 Mentions in the summaries (`@Name` in the wiki) ping the person's chosen account, else their
 house account: a mention is no invitation.
 
@@ -89,7 +119,7 @@ slot, the same as `!link` gives. The account may be anyone's, so the messages na
 login (as code, which the person cannot change), never the name they show (which they edit
 themselves). Only the people in the groups whose rooms the bot manages (the plenums' `group`
 and `require_group`) may ask: a guest's or a former resident's request is not read. Not
-served: an account on the house's server, one the person has proved already, one another
+served: an account on the house's server, one linked to the person already, one another
 active person claims (from the bot's own full read of the directory every `refresh_minutes`),
 a request withdrawn or replaced meanwhile. At most 5 deliveries per person a day, 3 a day to
 one account (whoever asks) and 30 an hour in all (more are skipped: logged, counted in the
@@ -143,7 +173,8 @@ container's `TZ`.
 | `!plenum help` | this list |
 
 In an admin's direct chat with the bot: `!plenum` (every plenum), `!members` (the held
-removals and their digests, the running handovers and their end dates), `!members confirm <plenum key|room> <digest>`. In a direct chat from an account on another
+removals and their digests, the running handovers and their end dates, the stays that end soon
+or are overdue), `!members confirm <plenum key|room> <digest>`. In a direct chat from an account on another
 server: `!link <username>`.
 
 Several plenums in one room: the key goes along, `!top kitchen-floor-1 dishwasher`. Commands
@@ -190,11 +221,30 @@ A plenum's collection and documents are found again by their IDs: when its name 
 are renamed, not made anew; a document nobody changed since the bot made it gets the new text
 too. A private collection is only ever found by its ID, never taken over by its name.
 
+**The house group** (2026-10-31, for subtenants): Outline 1.12.0 self-hosted has no guest role
+(its Community plan refuses it), so a subtenant in the wiki is a member or viewer, and both read
+every collection open to the whole workspace. With the house group (the house plenum's
+`group`, `config::wiki_house_group`, given to `Outline::with_house_group` in main.rs) no
+collection is open to the workspace: each is private, and the house group gets what "everyone"
+got before: `house` read and write, `members` read (the plenum's group read and write, as
+before), `private` nothing (taken away when a plenum becomes private). A plenum whose own group
+is the house group gives it read and write (no read one hour, read and write the next). The
+group gets it before the collection is made private, so who lives here never loses it on the
+way; an existing collection is changed in place at the hourly check. While Outline has no group
+of that name (house-infra's outline-roles makes it), nothing is opened: an existing collection
+keeps its access (a private one stays private), a new one is made private (closed to the house
+too until the group exists, then the next check gives it), a plenum made private is made
+private; the log says so. Without a house plenum with a group: everything as before. There is
+one house group: house plenums with different groups are refused at startup (give them the same
+group, or all but one access `members`; before 2026-10-31 that was allowed when every other
+plenum set its `require_group`). Tested against Outline 1.12.0
+(`house_group_areas_in_a_real_outline`, below; house-infra stacks/outline README "Subtenants").
+
 API key: the key of an Outline account of its own, as `OUTLINE_API_KEY`, with the scopes
-`documents.* collections.* attachments.* files.* auth.info` (stored by Outline as
-`/api/documents.*` and so on). A member is enough: it creates its collections itself, readable
-and writable by every member (tested against Outline 1.11.0, 2026-10-20). In house-infra the
-account and key come from stacks/outline (outline-roles, outline-keys).
+`documents.* collections.* attachments.* files.* groups.list auth.info` (stored by Outline as
+`/api/documents.*` and so on). A member is enough: it creates its collections itself and is
+their admin (tested against Outline 1.11.0, 2026-10-20, and 1.12.0, 2026-10-31). In house-infra
+the account and key come from stacks/outline (outline-roles, outline-keys).
 
 ## Robustness
 
@@ -217,3 +267,8 @@ OUTLINE_IT_URL=http://localhost:3000 OUTLINE_IT_KEY=ol_api_… cargo test -- --i
 ```
 
 The second runs a whole meeting against a real Outline (it creates a collection "IT <uuid>").
+`house_group_areas_in_a_real_outline` (also `--ignored`) sets up a house plenum, a kitchen and
+the finance group first open to the workspace, then with the house group, and checks each
+collection's access and groups; it needs an admin's key (`OUTLINE_IT_ADMIN_KEY`) and the
+groups in Outline (`OUTLINE_IT_HOUSE_GROUP`, `OUTLINE_IT_KITCHEN_GROUP`,
+`OUTLINE_IT_FINANCE_GROUP`).

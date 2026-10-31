@@ -45,10 +45,10 @@ provider = "authentik"
 api_url = "https://login.example.org/api/v3"
 # server_name = "example.org"         # house accounts: @<login>:<server>; default: the bot's own
 localpart_attribute = "matrix_localpart"
-matrix_ids_attribute = "matrix_ids"   # a person's other accounts, entered by an admin
-# verified_attribute = "matrix_verified"     # the accounts the person proved (link codes)
+matrix_ids_attribute = "matrix_ids"   # a person's other accounts: entered by an admin or proved with a code
 # preferred_attribute = "matrix_preferred"   # the account the person chose: invited
 # stale_after_minutes = 60                   # an older last good read changes no room
+# stay_until_attribute = "stay_until"        # the end of a stay ("YYYY-MM-DD"), for [members] stay_reminder_days
 # link_request_attribute = "matrix_link_request"  # requests from the settings: the bot invites
 #                                                 # the account and sends the code (needs MATRIX_LINK_KEY)
 # token: DIRECTORY_TOKEN in the environment (token_env)
@@ -64,6 +64,11 @@ ask_to_choose = false   # write to members who have not chosen their account (ne
 choose_url = "https://login.example.org/if/flow/house-matrix-accounts/"
 handover_days = 7        # other accounts stay this long after the chosen one joined the room…
 handover_max_days = 30   # …and at most this long after the choice, joined or not (each 1–365)
+# people who live here for a while (a kitchen of their own, nothing of the house plenum): they
+# count like the house plenum's group in the kitchens' rooms (access members), never in the
+# house's or a private plenum's. Every group named must exist in the directory.
+# subtenant_groups = ["subtenants"]
+stay_reminder_days = 14  # the admins hear of a stay's end (`stay_until`) this long before and on the day (1–365)
 # link codes (!link <username>): MATRIX_LINK_KEY in the environment
 
 [[plenum]]
@@ -80,7 +85,9 @@ collection = "Kitchen ground floor"
 group = "kitchen-floor-0"   # its room and its editors follow this directory group
 access = "members"                # everyone reads, the group writes (house | members | private)
 # require_group = "residents"     # only who is in this group too counts; default for members
-#                                 # and private: the house plenum's group; "" for none
+#                                 # and private: the house plenum's group; "" for none. For
+#                                 # access members, the house plenum's group also lets in
+#                                 # [members] subtenant_groups
 prepare_days = 1
 organizers = ["@anna:example.org"]
 # publication = "link"            # this plenum's meetings share only the link by default
