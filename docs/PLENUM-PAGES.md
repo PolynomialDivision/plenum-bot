@@ -61,12 +61,38 @@ in `all` mode, the summary.
 
 ### 4.1 When it opens
 
-At `start − prepare_days`, but not before the plenum's previous meeting (the latest earlier one
-neither cancelled nor skipped) is closed or past its closing time (`end + close_after_hours`);
-a day before its meeting a page opens anyway (two meetings on one day). Time-based, so a failing
-close does not hold the next page back. With a large `prepare_days`
-(e.g. 28) the next meeting's page opens when the last one closes: there is always one page to
-add topics to. The default stays 3 (today's behaviour).
+"Over" below: the plenum's previous meeting (the latest earlier one neither cancelled nor
+skipped) is closed (`!minutes done`) or past its closing time (`end + close_after_hours`).
+Time-based, so a failing close does not hold the next page back.
+
+- **`page_after_days` = N** (`[pages]`, per plenum, the room's `page_after`; added 2026-11-07):
+  the page opens once the meeting before is over and the local day N days after that
+  meeting's end has begun (N = 0: as soon as it is over). So it is there for the whole time in
+  between, however far away the meeting is (the next meeting is always in view, not only
+  `prepare_days` ahead). With N = 1 and a meeting 19-21 h closed by `!minutes done`: the next
+  page at midnight; closed by the clock (12 h): at 09:00 the next day.
+- **unset** (the default, behaviour as before), and for a plenum's first meeting (no meeting
+  before): at `start − prepare_days`, once the meeting before is over.
+- Either way a page opens a day before its meeting even while the one before is open (two
+  meetings close together), and a page once open stays open.
+
+One rule decides, never both: with `page_after` set, `page_days` only matters for a first
+meeting (`!plenum settings` says so). A cancelled meeting is not "the meeting before": when
+the next meeting is cancelled, the one after it opens at once (its previous is long over),
+and the cancelled page's topics reach it at the cancelled meeting's end. Considered and left:
+`prepare_days 60` alone (the same "right after", no delay possible, misleading texts).
+
+Calendar edits that the long-open page meets more often now:
+- a move keeps the page (renamed, announced again);
+- a series changed "this and all future" in Nextcloud becomes a new event with new IDs: an open
+  page of a meeting still to come whose ID left the calendar takes the single occurrence on its
+  day that is new to the bot (a move if the time changed), instead of being cancelled while a
+  second page opens. Accepted: a meeting deleted on purpose and another one added that day in
+  the same 5 minutes keeps the page (moved, not cancelled); read between the two writes of
+  such a change, the meeting is cancelled first and back on at the next read;
+- an event entered twice (two IDs, one start) is one meeting; an occurrence the bot keeps
+  something of (a page, a publication set with `!minutes … <day>`) is never dropped;
+- two meetings at one time are ordered by their ID, so a carried topic goes to one only.
 
 ### 4.2 Its shape (the default template; each plenum may change its own in the wiki)
 
@@ -220,8 +246,8 @@ One setting per plenum, `messages`:
 | Layer | What | Who |
 |---|---|---|
 | technical | rooms, groups, access, calendar, `organizers`, `[pages] room_settings` | IT admins, matrix.yml + `make update-bots` |
-| house standard | `[pages] messages`, `[defaults]` / per plenum `prepare_days`, `remind_minutes`, `publication` | IT admins, the same file |
-| the plenum | in the room `messages`, `reminder` (0–1440 min), `page_days` (= prepare_days, 1–60); in the wiki its template; per meeting `!minutes full\|link\|confidential` | its `organizers`; without any, everyone in the room; admins always |
+| house standard | `[pages] messages`, `page_after_days`, `[defaults]` / per plenum `prepare_days`, `remind_minutes`, `publication` | IT admins, the same file |
+| the plenum | in the room `messages`, `reminder` (0–1440 min), `page_days` (= prepare_days, 1–60), `page_after` (= page_after_days, `off` or 0–60); in the wiki its template; per meeting `!minutes full\|link\|confidential` | its `organizers`; without any, everyone in the room; admins always |
 
 `!plenum settings`, `!plenum set <name> <value>`, `!plenum reset <name>`; 10 changes per person
 and 30 per plenum a day; kept in `store/settings.json` (a file of its own: an older image after a
@@ -229,8 +255,26 @@ rollback neither reads nor drops it). Not in the room, by design: publication (i
 per-meeting ratchet), access, carry-over (always on: a copy is easily deleted, a lost topic is
 not noticed).
 
-Config: a top-level `[pages]` table (an older image ignores it; `[defaults]` and `[[plenum]]`
-refuse unknown keys) with `messages`, `room_settings` and `[pages.plenum.<key>]`.
+Config: a top-level `[pages]` table (the image of before 2026-11-07 ignores it; `[defaults]`
+and `[[plenum]]` refuse unknown keys, and so does `[pages]` in an image that knows it) with
+`messages`, `room_settings`, `page_after_days` and `[pages.plenum.<key>]`.
+
+### 6.1 Finding the current page
+
+- **Pinned in the collection**: the bot pins each open page of its plenum in the plenum's
+  collection (`pins.create`, Outline 1.12: shown above the documents on every tab of the
+  collection, for everyone who reads it) and unpins it once closed or cancelled. It unpins only
+  what it pinned itself (Outline does not say who pinned): a closed page or another document
+  someone pins stays; a pin someone removes is not put back until the open pages change. A page
+  it may not pin (deleted in the wiki: Outline answers 403) does not keep the others unpinned. Needs `pins.*` in the bot's key (house-infra stacks/outline `PLENUM_BOT_SCOPE`)
+  and the bot as admin of the collection (it is of those it made); without it the bot logs
+  once per change and goes on. Several plenums in one collection: each pins its own.
+- "<Name>: Overview" lists the next meetings with their pages (as before), `!plenum` in the
+  room gives the link, and the link message in the room.
+- Considered and left: the collection's description (its "Overview" tab is the default only
+  until someone picks another tab, Outline remembers that per browser; a human text there would
+  need a marker), the home page's pins (only Outline admins pin there).
+
 
 ## 7. Code
 
@@ -314,4 +358,25 @@ anywhere, and Outline's API and websocket become reachable from the internet. Le
 | Quiet mode | the gate holds on every path; a house-infra `quiet` can be undone in the room; an older image's link message cannot be edited; answers promised a summary in a quiet plenum | documented as a default (`room_settings: false` fixes it); a move then posts the link anew; the answers say what a quiet plenum gets |
 | Simplification | the PDF printed the new markers and the help; the last fallback put chat topics under a heading that hid the real ones; three copies of the "Topics" lookup; German words the design had dropped | the PDF leaves out markers and the help; the fallback appends the block (under "## Topics" only on a page without topics); one lookup; only Result/Ergebnis, Decision/Beschluss, Topics/Themen, Tasks/Aufgaben stay |
 | Simplification | settings rate limits, settings.json, the `Notice` tags | kept: the limits keep a room from flipping a plenum back and forth, settings.json survives a rollback, the tags let the tests check every message's kind |
+
+## 12. Next page after the previous plenum, pins, publication link (2026-11-07)
+
+Owner: every plenum `publication: link` (house-infra `plenum.defaults`), `messages: all`, no
+organizers; the next page from the day after the previous plenum; the current page easy to find
+in Outline; the wiki stays VPN-only. Built: `page_after_days` (§4.1), pins (§6.1).
+
+| Review | Finding | Change |
+|---|---|---|
+| Design | `prepare_days 60` alone gives "right after" too | kept `page_after` for the delay the owner asked for; one rule decides (with it `page_days` only for a first meeting), texts say which |
+| Design | a cancelled meeting cannot count as "the one before" (one without a page leaves the state) | the same previous meeting as before (cancelled and skipped left out) |
+| Design | a series edit in Nextcloud gives new IDs: the long-open page cancelled, a second one opened | re-keyed to the new occurrence on its day |
+| Design | two meetings at one time both got the carried topics | ordered by ID (prepare, carrying topics and tasks); an event entered twice is one meeting |
+| Design | the collection description's "Overview" tab is the default only until someone picks another | pins instead (shown on every tab); the key gets `pins.*` |
+| Design | `!minutes done` promised "a summary here" in a `link` meeting | the answer follows the publication |
+| Real Outline 1.12.0 | `pins.list`/`create`/`delete` as expected (create idempotent, delete of a missing pin 404, no scope 403); a member who is no collection admin reads pins but gets 403 on create and delete, which failed the whole round | 403 on unpin counts as "not allowed"; test `pins_in_a_real_outline` |
+| Code | people's pins of closed pages were removed | only what the bot pinned is unpinned |
+| Code | a deleted open page stopped the other pins | each page tried on its own |
+| Code | the dedup could drop a per-meeting publication (and cancel a meeting still in the calendar) | an occurrence with state of its own is never dropped |
+| Code | the re-key moved a meeting already under way | only meetings still to come |
+| Code | two tests could not fail | assert the move message; count every pins call |
 

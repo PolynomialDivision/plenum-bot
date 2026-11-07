@@ -93,6 +93,13 @@ pub trait Wiki {
     /// The wiki group `group` may write in the collection; false when the wiki has no such
     /// group (yet: outline-roles makes it from the directory).
     async fn grant_group(&self, collection_id: &str, group: &str) -> Result<bool>;
+    /// The collection's pins `(pin, document)`, shown above its documents; None when the
+    /// wiki does not let the bot see or make them (its key has no `pins.*`).
+    async fn pins(&self, collection_id: &str) -> Result<Option<Vec<(String, String)>>>;
+    /// The document pinned in the collection (once); false when the wiki does not let the bot.
+    async fn pin(&self, collection_id: &str, doc_id: &str) -> Result<bool>;
+    /// false when the wiki does not let the bot; a pin that is gone counts as removed.
+    async fn unpin(&self, pin_id: &str) -> Result<bool>;
     /// A live document with exactly this title in the collection.
     async fn find_doc(&self, collection_id: &str, title: &str) -> Result<Option<Doc>>;
     async fn create_doc(
@@ -385,7 +392,58 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             self.areas_checked.lock().unwrap().insert(p.key.clone());
             self.save(st).await?;
         }
-        self.write_overview(st, p, now).await
+        let overview = self.write_overview(st, p, now).await;
+        if let Err(e) = self.write_pins(st, p).await {
+            warn!(plenum = %p.key, "Pinning the open pages (again at the next tick): {e:#}");
+        }
+        overview
+    }
+
+    /// The plenum's open pages pinned in its collection (Outline shows pins above the
+    /// documents, on every tab), each unpinned once closed or cancelled; only when they
+    /// changed. Pins of other documents (people's) are left alone.
+    async fn write_pins(&self, st: &mut State, p: &Plenum) -> Result<()> {
+        let ps = st.plenums.entry(p.key.clone()).or_default();
+        let Some(collection) = ps.collection_id.clone() else {
+            return Ok(());
+        };
+        let mut open: Vec<(MeetingKey, String)> = ps
+            .meetings
+            .values()
+            .filter(|m| m.created && !m.close.done && !m.skipped && !m.cancelled)
+            .filter_map(|m| Some((m.start?, m.doc_id.clone())))
+            .collect();
+        open.sort();
+        let wanted: Vec<String> = open.into_iter().map(|(_, d)| d).collect();
+        if ps.pinned.as_ref() == Some(&wanted) {
+            return Ok(());
+        }
+        // only what the bot pinned itself (Outline does not say who pinned): a closed page
+        // someone pinned stays
+        let pages: HashSet<String> = ps.pinned.iter().flatten().cloned().collect();
+        let allowed = match self.wiki.pins(&collection).await? {
+            None => false,
+            Some(pins) => {
+                let mut allowed = true;
+                for (pin, doc) in &pins {
+                    if pages.contains(doc) && !wanted.contains(doc) {
+                        allowed &= self.wiki.unpin(pin).await?;
+                    }
+                }
+                for doc in &wanted {
+                    if !pins.iter().any(|(_, d)| d == doc) {
+                        // false also for a page deleted in the wiki (Outline: 403)
+                        allowed &= self.wiki.pin(&collection, doc).await?;
+                    }
+                }
+                allowed
+            }
+        };
+        if !allowed {
+            warn!(plenum = %p.key, "The wiki did not let the bot pin or unpin a page (its key needs pins.*, it must be an admin of the collection, the page must exist): tried again when the open pages change");
+        }
+        st.plenums.entry(p.key.clone()).or_default().pinned = Some(wanted);
+        self.save(st).await
     }
 
     /// The overview's text now (None until the area is set up).
@@ -457,6 +515,30 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
         let occurrences = ps.occurrences.clone();
         let ids: HashSet<&str> = occurrences.iter().map(|o| o.id.as_str()).collect();
+        // A series changed "this and all future" in Nextcloud's app becomes a new event (a new
+        // UID, so new IDs): an open page whose ID left the calendar takes the one occurrence
+        // new to the bot on its day, and is moved rather than cancelled. (Read between the two
+        // writes of such a change, it is cancelled first and back on at the next read.)
+        let gone: Vec<(String, MeetingKey)> = ps
+            .meetings
+            .iter()
+            .filter(|(id, m)| !ids.contains(id.as_str()) && m.created && !m.close.done)
+            .filter_map(|(id, m)| Some((id.clone(), m.start?)))
+            .filter(|(_, start)| start.start(tz) > now)
+            .collect();
+        for (id, start) in gone {
+            let new: Vec<&Occurrence> = occurrences
+                .iter()
+                .filter(|o| o.start.date() == start.date())
+                // an ID the bot has not seen before (not another meeting of that day)
+                .filter(|o| !ps.meetings.contains_key(&o.id))
+                .collect();
+            if let [o] = new[..] {
+                info!(plenum = %p.key, from = %id, to = %o.id, "The calendar gave the meeting another ID: its page stays");
+                let m = ps.meetings.remove(&id).expect("listed above");
+                ps.meetings.insert(o.id.clone(), m);
+            }
+        }
         // What changed is recorded here, without a call that could fail: the notices and the
         // titles below follow from it and are tried again at every tick until they went out.
         for occ in &occurrences {
@@ -638,6 +720,24 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             }
             ps.calendar_remade = false;
         }
+        // One meeting per start: an event entered twice (or a single event at a series' time)
+        // is one meeting. An occurrence the bot keeps something of (a page, a publication set
+        // for it) is never dropped; of the others at that time only the first stays when none
+        // of them has anything.
+        let mut occurrences = occurrences;
+        let kept = |id: &str| {
+            ps.meetings
+                .get(id)
+                .is_some_and(|m| m.created || m.close.done || m.publication.is_some())
+        };
+        occurrences
+            .sort_by(|a, b| (a.start, !kept(&a.id), &a.id).cmp(&(b.start, !kept(&b.id), &b.id)));
+        let mut last: Option<MeetingKey> = None;
+        occurrences.retain(|o| {
+            let first = last != Some(o.start);
+            last = Some(o.start);
+            first || kept(&o.id)
+        });
         ps.occurrences = occurrences;
         ps.calendar_read = Some(now);
         self.save_or_log(&st).await;
@@ -649,8 +749,19 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             - Duration::days(
                 i64::from(p.duration_minutes / 1440 + 2) + i64::from(p.close_after_hours / 24 + 1),
             );
-        let to = today + Duration::days(i64::from(p.prepare_days) + 1);
+        let mut to = today + Duration::days(i64::from(p.prepare_days) + 1);
         let ps = st.plenums.entry(p.key.clone()).or_default();
+        // with page_after the next meeting is in view however far away (its page opens after
+        // the one before)
+        if p.page_after_days.is_some() {
+            if let Some(next) = (ps.occurrences.iter())
+                .filter(|o| o.start.start(self.tz) > now)
+                .map(|o| o.start.date())
+                .min()
+            {
+                to = to.max(next);
+            }
+        }
         // The calendar's occurrences in view get their meeting.
         for occ in ps.occurrences.clone() {
             if occ.start.date() >= from && occ.start.date() <= to {
@@ -763,7 +874,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 .iter()
                 .filter(|(_, m)| m.created && !m.close.done && !m.cancelled && !m.skipped)
                 .filter(|(_, m)| m.start.is_some_and(|s| s > t.from))
-                .min_by_key(|(_, m)| m.start)
+                .min_by_key(|(id, m)| (m.start, id.as_str()))
                 .map(|(id, m)| (id.clone(), m.doc_id.clone()));
             let Some((id, doc_id)) = next else {
                 continue;
@@ -826,13 +937,10 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         self.wiki.append(&doc.id, &text).await
     }
 
-    /// Whether the meeting before `start` (the latest earlier one that is neither cancelled
-    /// nor skipped) is closed or past its closing time: only then the next page opens
-    /// (docs/PLENUM-PAGES.md §4.1).
-    fn previous_over(&self, st: &State, p: &Plenum, start: MeetingKey, now: DateTime<Utc>) -> bool {
-        let Some(ps) = st.plenums.get(&p.key) else {
-            return true;
-        };
+    /// The meeting before `start`: the latest earlier one that is neither cancelled nor
+    /// skipped (docs/PLENUM-PAGES.md §4.1); its being over opens the next page.
+    fn previous(&self, st: &State, p: &Plenum, start: MeetingKey) -> Option<Meeting> {
+        let ps = st.plenums.get(&p.key)?;
         let mut earlier: Vec<Meeting> = ps
             .meetings
             .values()
@@ -848,15 +956,22 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 });
             }
         }
-        let Some(previous) = earlier
-            .iter()
+        earlier
+            .into_iter()
             .filter(|m| !m.cancelled && !m.skipped)
             .max_by_key(|m| m.start)
-        else {
-            return true;
-        };
-        previous.close.done
-            || now >= self.end_of(p, previous) + Duration::hours(i64::from(p.close_after_hours))
+    }
+
+    /// A meeting is over for the next page: its minutes closed, or past their closing time.
+    fn is_over(&self, p: &Plenum, m: &Meeting, now: DateTime<Utc>) -> bool {
+        m.close.done || now >= self.end_of(p, m) + Duration::hours(i64::from(p.close_after_hours))
+    }
+
+    /// The local midnight `days` after the day `m` ended (in local days: DST moves nothing).
+    fn days_after(&self, p: &Plenum, m: &Meeting, days: u32) -> DateTime<Utc> {
+        let day = self.end_of(p, m).with_timezone(&self.tz).date_naive()
+            + Duration::days(i64::from(days));
+        MeetingKey(day.and_time(chrono::NaiveTime::MIN)).start(self.tz)
     }
 
     /// When the meeting ends: the calendar's end, else its start and `duration_minutes`.
@@ -922,10 +1037,25 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             let m = &st.plenums[&p.key].meetings[key];
             // a day before, a page opens even while the one before is open (two meetings close
             // together)
-            let opens = now >= prepare_at
-                && (m.created
-                    || now + Duration::days(1) >= start
-                    || self.previous_over(st, p, start_key, now));
+            let soon = now + Duration::days(1) >= start;
+            let previous = self.previous(st, p, start_key);
+            let opens = match (p.page_after_days, &previous) {
+                // page_after: `n` days after the meeting before, once it is over
+                (Some(n), Some(prev)) => {
+                    m.created
+                        || soon
+                        || (self.is_over(p, prev, now) && now >= self.days_after(p, prev, n))
+                }
+                // else (and for a first meeting): prepare_days before, once the one before is over
+                _ => {
+                    now >= prepare_at
+                        && (m.created
+                            || soon
+                            || previous
+                                .as_ref()
+                                .is_none_or(|prev| self.is_over(p, prev, now)))
+                }
+            };
             let m = st
                 .plenums
                 .get_mut(&p.key)
@@ -982,7 +1112,11 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             )
             .await?;
         // Kept before the group is granted, which may fail: the next try finds it by ID.
-        st.plenums.entry(p.key.clone()).or_default().collection_id = Some(collection.clone());
+        let ps = st.plenums.entry(p.key.clone()).or_default();
+        if ps.collection_id.as_deref() != Some(collection.as_str()) {
+            ps.pinned = None; // another collection: pinned anew
+        }
+        ps.collection_id = Some(collection.clone());
         self.save(st).await?;
         if let (Some(group), true) = (&p.group, p.access != Access::House) {
             if !self.wiki.grant_group(&collection, group).await? {
@@ -1146,13 +1280,15 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 if page::has_topics(&text) {
                     // topics carried from earlier meetings first, then those from the chat
                     // each into the first page after its meeting: not when an earlier one is open
+                    // (two meetings at one time: the one with the smaller ID comes first)
                     let open_before = |from: MeetingKey| {
-                        ps.meetings.values().any(|m| {
+                        ps.meetings.iter().any(|(id, m)| {
                             m.created
                                 && !m.close.done
                                 && !m.cancelled
                                 && !m.skipped
-                                && m.start.is_some_and(|s| s > from && s < start)
+                                && m.start
+                                    .is_some_and(|s| s > from && (s, id.as_str()) < (start, key))
                         })
                     };
                     let mut stricter = None;
@@ -1513,10 +1649,11 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
         let next = ps
             .meetings
-            .values()
-            .filter(|m| m.created && !m.close.done && !m.cancelled && !m.skipped)
-            .filter(|m| m.start.is_some_and(|s| s > after))
-            .min_by_key(|m| m.start);
+            .iter()
+            .filter(|(_, m)| m.created && !m.close.done && !m.cancelled && !m.skipped)
+            .filter(|(_, m)| m.start.is_some_and(|s| s > after))
+            .min_by_key(|(id, m)| (m.start, id.as_str()))
+            .map(|(_, m)| m);
         let Some(next) = next else {
             return Ok(());
         };
@@ -2112,10 +2249,14 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
         let start = meeting(st, p, &key).start;
         meeting(st, p, &key).close.requested = true;
-        let here = if sends(self.effective(st, p).messages, Notice::Summary) {
-            ", a summary here"
-        } else {
-            ""
+        let shared = publication(p, meeting(st, p, &key));
+        let here = match (
+            sends(self.effective(st, p).messages, Notice::Summary),
+            shared,
+        ) {
+            (true, Publication::Full) => ", a summary here",
+            (true, Publication::Link) => ", the link here",
+            _ => "",
         };
         format!(
             "👍 The page of {} is closed in a moment: its result at the top, the decisions into the list, the PDF{here}.",
@@ -3345,6 +3486,10 @@ pub(crate) mod fakes {
         pub fail: StdMutex<bool>,
         /// changes of a document's text (replace, patch, append)
         pub writes: StdMutex<u32>,
+        /// (pin, collection, document); `no_pins`: the key has no pins.*
+        pub pins: StdMutex<Vec<(String, String, String)>>,
+        pub pin_calls: StdMutex<u32>,
+        pub no_pins: StdMutex<bool>,
     }
 
     impl FakeWiki {
@@ -3407,6 +3552,47 @@ pub(crate) mod fakes {
             if !g.contains(&grant) {
                 g.push(grant);
             }
+            Ok(true)
+        }
+        async fn pins(&self, collection_id: &str) -> Result<Option<Vec<(String, String)>>> {
+            self.check()?;
+            *self.pin_calls.lock().unwrap() += 1;
+            if *self.no_pins.lock().unwrap() {
+                return Ok(None);
+            }
+            Ok(Some(
+                self.pins
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, c, _)| c == collection_id)
+                    .map(|(p, _, d)| (p.clone(), d.clone()))
+                    .collect(),
+            ))
+        }
+        async fn pin(&self, collection_id: &str, doc_id: &str) -> Result<bool> {
+            self.check()?;
+            *self.pin_calls.lock().unwrap() += 1;
+            if *self.no_pins.lock().unwrap() {
+                return Ok(false);
+            }
+            let mut pins = self.pins.lock().unwrap();
+            if !pins
+                .iter()
+                .any(|(_, c, d)| c == collection_id && d == doc_id)
+            {
+                let id = format!("pin-{}", pins.len());
+                pins.push((id, collection_id.to_owned(), doc_id.to_owned()));
+            }
+            Ok(true)
+        }
+        async fn unpin(&self, pin_id: &str) -> Result<bool> {
+            self.check()?;
+            *self.pin_calls.lock().unwrap() += 1;
+            if *self.no_pins.lock().unwrap() {
+                return Ok(false);
+            }
+            self.pins.lock().unwrap().retain(|(p, _, _)| p != pin_id);
             Ok(true)
         }
         async fn rename(&self, id: &str, title: &str) -> Result<()> {
@@ -3779,6 +3965,7 @@ mod tests {
             publication: Publication::Full,
             messages: crate::config::Messages::All,
             room_settings: true,
+            page_after_days: None,
         }
     }
 
@@ -7413,6 +7600,470 @@ mod tests {
 
     fn admin_room_sender() -> OwnedRoomId {
         room()
+    }
+
+    /// The pages of the house plenum in the wiki, by title (deleted ones left out).
+    fn page_titles(e: &Engine<FakeWiki, FakeChat>) -> Vec<String> {
+        let mut t: Vec<String> = (e.wiki.docs.lock().unwrap().iter())
+            .filter(|(d, del)| !del && d.title.starts_with("House plenum 20"))
+            .map(|(d, _)| d.title.clone())
+            .collect();
+        t.sort();
+        t
+    }
+
+    fn pinned_titles(e: &Engine<FakeWiki, FakeChat>) -> Vec<String> {
+        let pins = e.wiki.pins.lock().unwrap().clone();
+        let docs = e.wiki.docs.lock().unwrap();
+        pins.iter()
+            .filter_map(|(_, _, d)| docs.iter().find(|(doc, _)| &doc.id == d))
+            .map(|(d, _)| d.title.clone())
+            .collect()
+    }
+
+    fn page_after(days: u32) -> Plenum {
+        let mut p = plenum("house", "House plenum", "!house:x");
+        p.page_after_days = Some(days);
+        p
+    }
+
+    /// October's meeting (4 Oct, 19-21) with a topic nobody reaches, closed at 21:05.
+    async fn october_closed(e: &Engine<FakeWiki, FakeChat>) {
+        e.tick(at(2026, 10, 2, 9, 0)).await;
+        e.command(
+            &room(),
+            &anna(),
+            cmd("!top Fahrräder"),
+            at(2026, 10, 2, 10, 0),
+        )
+        .await;
+        e.command(
+            &room(),
+            &admin(),
+            cmd("!minutes done"),
+            at(2026, 10, 4, 21, 5),
+        )
+        .await;
+        for m in 6..12 {
+            e.tick(at(2026, 10, 4, 21, m)).await;
+        }
+        assert!(
+            e.state.lock().await.plenums["house"].meetings["house-series#2026-10-04"]
+                .close
+                .done
+        );
+    }
+
+    #[tokio::test]
+    async fn with_page_after_the_next_page_opens_the_day_after_and_only_once() {
+        let mut t = setup(vec![page_after(1)]);
+        october_closed(&t.engine).await;
+        let e = &t.engine;
+        // the minutes are closed, but the next day has not begun
+        e.tick(at(2026, 10, 4, 23, 59)).await;
+        assert_eq!(page_titles(e), ["House plenum 2026-10-04"]);
+        e.tick(at(2026, 10, 5, 0, 0)).await;
+        assert_eq!(
+            page_titles(e),
+            ["House plenum 2026-10-04", "House plenum 2026-11-01"],
+            "November's page four weeks before, December's not"
+        );
+        let nov = e.wiki.by_title("House plenum 2026-11-01").unwrap();
+        assert_eq!(nov.text.matches("### Fahrräder").count(), 1, "{}", nov.text);
+        // the link message once, and only the open page is pinned
+        let links = e
+            .chat
+            .kinds()
+            .iter()
+            .filter(|k| **k == Notice::Link)
+            .count();
+        assert_eq!(links, 2, "October's and November's");
+        assert_eq!(pinned_titles(e), ["House plenum 2026-11-01"]);
+        // restarts and ticks make nothing twice
+        restart(&mut t).await;
+        let e = &t.engine;
+        for d in 5..20 {
+            e.tick(at(2026, 10, d, 12, 0)).await;
+        }
+        assert_eq!(page_titles(e).len(), 2);
+        assert_eq!(
+            e.chat.kinds(),
+            Vec::<Notice>::new(),
+            "no second link message"
+        );
+        let nov = e.wiki.by_title("House plenum 2026-11-01").unwrap();
+        assert_eq!(nov.text.matches("### Fahrräder").count(), 1);
+        // a topic from the chat goes onto it at once
+        let a = e
+            .command(&room(), &anna(), cmd("!top Hof"), at(2026, 10, 6, 9, 0))
+            .await;
+        assert!(a.contains("house-plenum-2026-11-01"), "{a}");
+        // it closes as usual; December's page opens the day after
+        e.tick(at(2026, 11, 2, 9, 0)).await;
+        for m in 1..6 {
+            e.tick(at(2026, 11, 2, 9, m)).await;
+        }
+        assert!(e.wiki.by_title("House plenum 2026-12-06").is_some());
+        assert_eq!(pinned_titles(e), ["House plenum 2026-12-06"]);
+    }
+
+    #[tokio::test]
+    async fn a_late_close_holds_the_next_page_back() {
+        let t = setup(vec![page_after(1)]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 2, 9, 0)).await;
+        e.command(
+            &room(),
+            &anna(),
+            cmd("!top Fahrräder"),
+            at(2026, 10, 2, 10, 0),
+        )
+        .await;
+        // nobody wrote !minutes done: the minutes close 12 hours after the end
+        e.tick(at(2026, 10, 5, 8, 59)).await;
+        assert!(e.wiki.by_title("House plenum 2026-11-01").is_none());
+        for m in 0..6 {
+            e.tick(at(2026, 10, 5, 9, m)).await;
+        }
+        let nov = e
+            .wiki
+            .by_title("House plenum 2026-11-01")
+            .expect("opened at the close");
+        assert_eq!(nov.text.matches("### Fahrräder").count(), 1, "{}", nov.text);
+        assert!(e.state.lock().await.plenums["house"].open_topics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn page_after_0_opens_the_next_page_when_the_minutes_close() {
+        let t = setup(vec![page_after(0)]);
+        october_closed(&t.engine).await;
+        assert!(t.engine.wiki.by_title("House plenum 2026-11-01").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_delay_of_days_and_the_room_setting() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        let a = e
+            .command(
+                &room(),
+                &anna(),
+                cmd("!plenum set page_after 3"),
+                at(2026, 10, 1, 9, 0),
+            )
+            .await;
+        assert!(a.contains("off → **3**"), "{a}");
+        let a = e
+            .command(
+                &room(),
+                &anna(),
+                cmd("!plenum settings"),
+                at(2026, 10, 1, 9, 1),
+            )
+            .await;
+        assert!(a.contains("`page_after`: **3** (set in this room)"), "{a}");
+        october_closed(e).await;
+        e.tick(at(2026, 10, 6, 23, 0)).await;
+        assert!(e.wiki.by_title("House plenum 2026-11-01").is_none());
+        e.tick(at(2026, 10, 7, 0, 0)).await;
+        assert!(e.wiki.by_title("House plenum 2026-11-01").is_some());
+        // off again: page_days before, as before
+        let a = e
+            .command(
+                &room(),
+                &anna(),
+                cmd("!plenum set page_after off"),
+                at(2026, 11, 1, 22, 0),
+            )
+            .await;
+        assert!(a.contains("3 → **off**"), "{a}");
+        for m in 0..6 {
+            e.tick(at(2026, 11, 2, 9, m)).await;
+        }
+        e.tick(at(2026, 11, 20, 9, 0)).await;
+        assert!(e.wiki.by_title("House plenum 2026-12-06").is_none());
+        e.tick(at(2026, 12, 3, 19, 0)).await;
+        assert!(e.wiki.by_title("House plenum 2026-12-06").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_page_open_for_weeks_follows_a_move_and_a_cancellation() {
+        let t = setup(vec![page_after(1)]);
+        let e = &t.engine;
+        october_closed(e).await;
+        e.tick(at(2026, 10, 5, 0, 0)).await;
+        // November moves to the 8th: the same page, renamed, announced again
+        calendar(
+            e,
+            "house",
+            |l| {
+                let o = l
+                    .iter_mut()
+                    .find(|o| o.id == "house-series#2026-11-01")
+                    .unwrap();
+                *o = Occurrence {
+                    id: o.id.clone(),
+                    ..occ("x", "2026-11-08 19:00")
+                };
+            },
+            at(2026, 10, 10, 9, 0),
+        )
+        .await;
+        e.tick(at(2026, 10, 10, 9, 1)).await;
+        assert_eq!(
+            page_titles(e),
+            ["House plenum 2026-10-04", "House plenum 2026-11-08"]
+        );
+        let kinds = e.chat.kinds();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == Notice::Moved).count(),
+            1,
+            "{kinds:?}"
+        );
+        // then it is cancelled: its page says so, December's opens at once (the meeting
+        // before it is October's), and the cancelled page's topics move once its time is over
+        calendar(
+            e,
+            "house",
+            |l| l.retain(|o| o.id != "house-series#2026-11-01"),
+            at(2026, 10, 12, 9, 0),
+        )
+        .await;
+        e.tick(at(2026, 10, 12, 9, 1)).await;
+        assert_eq!(
+            page_titles(e),
+            [
+                "House plenum 2026-10-04",
+                "House plenum 2026-11-08 (cancelled)",
+                "House plenum 2026-12-06"
+            ]
+        );
+        assert_eq!(pinned_titles(e), ["House plenum 2026-12-06"]);
+        let dec = e.wiki.by_title("House plenum 2026-12-06").unwrap();
+        assert_eq!(
+            dec.text.matches("### Fahrräder").count(),
+            0,
+            "still on the cancelled page"
+        );
+        e.tick(at(2026, 11, 8, 21, 0)).await;
+        e.tick(at(2026, 11, 8, 21, 1)).await;
+        let dec = e.wiki.by_title("House plenum 2026-12-06").unwrap();
+        assert_eq!(dec.text.matches("### Fahrräder").count(), 1, "{}", dec.text);
+    }
+
+    #[tokio::test]
+    async fn a_series_made_anew_keeps_the_open_page() {
+        let t = setup(vec![page_after(1)]);
+        let e = &t.engine;
+        october_closed(e).await;
+        e.tick(at(2026, 10, 5, 0, 0)).await;
+        // "this and all future" in Nextcloud: a new event with new IDs, from November at 20:00
+        calendar(
+            e,
+            "house",
+            |l| {
+                for o in l
+                    .iter_mut()
+                    .filter(|o| o.start.date() > NaiveDate::from_ymd_opt(2026, 10, 31).unwrap())
+                {
+                    let day = o.start.date();
+                    *o = occ(&format!("house-new#{day}"), &format!("{day} 20:00"));
+                }
+            },
+            at(2026, 10, 10, 9, 0),
+        )
+        .await;
+        for m in 1..4 {
+            e.tick(at(2026, 10, 10, 9, m)).await;
+        }
+        assert_eq!(
+            page_titles(e),
+            ["House plenum 2026-10-04", "House plenum 2026-11-01"]
+        );
+        let st = e.state.lock().await;
+        let ps = &st.plenums["house"];
+        let m = &ps.meetings["house-new#2026-11-01"];
+        assert!(m.created && !m.cancelled);
+        assert_eq!(m.start, Some("2026-11-01 20:00".parse().unwrap()));
+        assert!(!ps.meetings.contains_key("house-series#2026-11-01"));
+        drop(st);
+        assert!(!e.chat.kinds().contains(&Notice::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn a_meeting_deleted_on_a_day_with_another_is_cancelled_not_merged() {
+        let t = setup(vec![page_after(1)]);
+        let e = &t.engine;
+        calendar(
+            e,
+            "house",
+            |l| l.push(occ("evening", "2026-11-01 21:30")),
+            at(2026, 10, 3, 9, 0),
+        )
+        .await;
+        october_closed(e).await;
+        e.tick(at(2026, 10, 5, 0, 0)).await;
+        assert!(e.wiki.by_title("House plenum 2026-11-01").is_some());
+        // the 19:00 meeting is deleted; the one at 21:30 stays a meeting of its own
+        calendar(
+            e,
+            "house",
+            |l| l.retain(|o| o.id != "house-series#2026-11-01"),
+            at(2026, 10, 10, 9, 0),
+        )
+        .await;
+        e.tick(at(2026, 10, 10, 9, 1)).await;
+        let st = e.state.lock().await;
+        let ps = &st.plenums["house"];
+        assert!(ps.meetings["house-series#2026-11-01"].cancelled);
+        assert!(!ps
+            .meetings
+            .get("evening")
+            .is_some_and(|m| m.doc_id == ps.meetings["house-series#2026-11-01"].doc_id));
+    }
+
+    #[tokio::test]
+    async fn an_event_entered_twice_is_one_meeting() {
+        let t = setup(vec![page_after(1)]);
+        let e = &t.engine;
+        october_closed(e).await;
+        e.tick(at(2026, 10, 5, 0, 0)).await;
+        calendar(
+            e,
+            "house",
+            |l| l.push(occ("aaa-copy", "2026-11-01 19:00")),
+            at(2026, 10, 10, 9, 0),
+        )
+        .await;
+        for d in 10..14 {
+            e.tick(at(2026, 10, d, 9, 0)).await;
+        }
+        assert_eq!(
+            page_titles(e),
+            ["House plenum 2026-10-04", "House plenum 2026-11-01"]
+        );
+        let nov = e.wiki.by_title("House plenum 2026-11-01").unwrap();
+        assert_eq!(nov.text.matches("### Fahrräder").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn without_the_pin_right_the_bot_tries_once_per_change() {
+        let t = setup(vec![page_after(1)]);
+        let e = &t.engine;
+        *e.wiki.no_pins.lock().unwrap() = true;
+        october_closed(e).await;
+        e.tick(at(2026, 10, 5, 0, 0)).await;
+        let calls = *e.wiki.pin_calls.lock().unwrap();
+        for d in 5..15 {
+            e.tick(at(2026, 10, d, 12, 0)).await;
+        }
+        assert_eq!(*e.wiki.pin_calls.lock().unwrap(), calls);
+        assert!(e.wiki.by_title("House plenum 2026-11-01").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_pin_of_someone_else_stays() {
+        let t = setup(vec![page_after(1)]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 2, 9, 0)).await;
+        let rules = e.state.lock().await.plenums["house"]
+            .rules_doc_id
+            .clone()
+            .unwrap();
+        let col = e.state.lock().await.plenums["house"]
+            .collection_id
+            .clone()
+            .unwrap();
+        e.wiki
+            .pins
+            .lock()
+            .unwrap()
+            .push(("pin-people".into(), col, rules));
+        october_closed(e).await;
+        e.tick(at(2026, 10, 5, 0, 0)).await;
+        let pins = e.wiki.pins.lock().unwrap().clone();
+        assert!(pins.iter().any(|(p, _, _)| p == "pin-people"), "{pins:?}");
+        assert_eq!(pins.len(), 2, "{pins:?}");
+    }
+
+    #[tokio::test]
+    async fn a_closed_page_someone_pinned_stays_pinned() {
+        let t = setup(vec![page_after(1)]);
+        let e = &t.engine;
+        october_closed(e).await;
+        e.tick(at(2026, 10, 5, 0, 0)).await;
+        assert_eq!(pinned_titles(e), ["House plenum 2026-11-01"]);
+        // someone pins October's minutes
+        let oct = e.wiki.by_title("House plenum 2026-10-04").unwrap();
+        let col = e.state.lock().await.plenums["house"]
+            .collection_id
+            .clone()
+            .unwrap();
+        e.wiki
+            .pins
+            .lock()
+            .unwrap()
+            .push(("pin-people".into(), col, oct.id));
+        for m in 0..6 {
+            e.tick(at(2026, 11, 2, 9, m)).await;
+        }
+        assert_eq!(
+            pinned_titles(e),
+            ["House plenum 2026-10-04", "House plenum 2026-12-06"],
+            "November's unpinned by the bot, October's kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_of_the_event_keeps_the_meetings_own_publication() {
+        let t = setup(vec![page_after(1)]);
+        let e = &t.engine;
+        october_closed(e).await;
+        let a = e
+            .command(
+                &room(),
+                &anna(),
+                cmd("!minutes confidential 1.11."),
+                at(2026, 10, 4, 22, 0),
+            )
+            .await;
+        assert!(a.starts_with("🔒"), "{a}");
+        calendar(
+            e,
+            "house",
+            |l| l.push(occ("aaa-copy", "2026-11-01 19:00")),
+            at(2026, 10, 4, 22, 30),
+        )
+        .await;
+        e.tick(at(2026, 10, 5, 0, 0)).await;
+        assert_eq!(
+            page_titles(e),
+            ["House plenum 2026-10-04", "House plenum 2026-11-01"]
+        );
+        let last = e.chat.sent.lock().unwrap().last().unwrap().1.clone();
+        assert!(last.starts_with("🔒"), "{last}");
+    }
+
+    #[test]
+    fn the_day_after_is_a_local_day() {
+        let t = setup(vec![page_after(1)]);
+        let e = &t.engine;
+        let p = &e.plenums[0];
+        // the night the clocks go back (25 Oct 2026) and forward (28 Mar 2027)
+        for (day, next) in [
+            ("2026-10-24 19:00", (2026, 10, 25)),
+            ("2027-03-27 19:00", (2027, 3, 28)),
+        ] {
+            let m = Meeting {
+                start: Some(day.parse().unwrap()),
+                ..Default::default()
+            };
+            assert_eq!(
+                e.days_after(p, &m, 1),
+                at(next.0, next.1, next.2, 0, 0),
+                "{day}"
+            );
+        }
     }
 
     #[tokio::test]

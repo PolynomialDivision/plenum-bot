@@ -503,6 +503,19 @@ fn days(n: u32) -> String {
     }
 }
 
+/// When a meeting's page opens, for people ("the day after the meeting before, …").
+pub fn page_opens(plenum: &Plenum) -> String {
+    match plenum.page_after_days {
+        Some(0) => "as soon as the meeting before is over (its minutes closed)".to_owned(),
+        Some(1) => "the day after the meeting before, once its minutes are closed".to_owned(),
+        Some(n) => format!("{n} days after the meeting before, once its minutes are closed"),
+        None => format!(
+            "{} before it, once the meeting before is over",
+            days(plenum.prepare_days)
+        ),
+    }
+}
+
 /// "1 hour", "12 hours"
 fn hours(n: u32) -> String {
     if n == 1 {
@@ -542,9 +555,9 @@ pub fn overview_text(
                 describe_meeting(*key)
             )),
             None => t.push_str(&format!(
-                "* {} (its page opens {} before, once the meeting before is over){chat}\n",
+                "* {} (its page opens {}){chat}\n",
                 describe_meeting(*key),
-                days(plenum.prepare_days)
+                page_opens(plenum)
             )),
         }
     }
@@ -565,8 +578,8 @@ pub fn overview_text(
     );
     t.push_str(&format!(
         "\n## How the minutes work\n\n\
-         1. **Before the meeting.** Up to {before} before it, once the meeting before is \
-         over, the bot opens its page from the [template]({template}). Everyone adds topics and \
+         1. **Before the meeting.** The bot opens its page from the [template]({template}) \
+         {before}. Everyone adds topics and \
          prepares them there: what it is about, a proposal, arguments as points with your name.\n\
          2. **During the meeting.** The page is the working copy: under each topic, its result \
          goes after \"Result:\".\n\
@@ -587,7 +600,7 @@ pub fn overview_text(
          confidential` keeps everything from a meeting's page out of the chat, `!minutes link` \
          gives only the link; `!minutes full` the summary again (`!minutes confidential 14.11.` \
          for another day).\n",
-        before = days(plenum.prepare_days),
+        before = page_opens(plenum),
         after = hours(plenum.close_after_hours),
         template = links.template,
         decisions = links.decisions,
@@ -912,6 +925,7 @@ mod tests {
             publication: crate::config::Publication::Full,
             messages: crate::config::Messages::All,
             room_settings: true,
+            page_after_days: None,
         }
     }
 
@@ -1288,7 +1302,7 @@ Decisions were taken quickly.
         assert!(t.contains("[its page](https://wiki.test/doc/p), for topics and minutes\n"));
         assert!(
             t.contains(
-                "(its page opens 3 days before, once the meeting before is over) · confidential: nothing of it in the chat"
+                "(its page opens 3 days before it, once the meeting before is over) · confidential: nothing of it in the chat"
             ),
             "{t}"
         );
@@ -1309,7 +1323,7 @@ Decisions were taken quickly.
         // how the minutes work, with the plenum's own times and links
         assert!(
             t.contains("## How the minutes work")
-                && t.contains("Up to 3 days before it, once the meeting before is over, the bot opens its page from the [template](https://wiki.test/doc/tpl)")
+                && t.contains("The bot opens its page from the [template](https://wiki.test/doc/tpl) 3 days before it, once the meeting before is over.")
                 && t.contains("12 hours after its end")
                 && t.contains("[list of decisions](https://wiki.test/doc/dec)")
                 && t.contains("[House plenum: Example minutes](https://wiki.test/doc/example)"),

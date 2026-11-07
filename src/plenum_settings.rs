@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Messages, Plenum, PREPARE_DAYS_MAX, REMIND_MINUTES_MAX};
+use crate::config::{Messages, Plenum, PAGE_AFTER_DAYS_MAX, PREPARE_DAYS_MAX, REMIND_MINUTES_MAX};
 
 /// Changes one person may make a day, and one plenum (admins are not counted).
 pub const PER_PERSON_A_DAY: usize = 10;
@@ -80,6 +80,8 @@ enum Kind {
     Messages,
     /// A number from..=to, with its unit for people.
     Number(u32, u32, &'static str),
+    /// The same, or `off`.
+    NumberOrOff(u32, u32, &'static str),
 }
 
 struct Spec {
@@ -89,7 +91,7 @@ struct Spec {
     says: &'static str,
 }
 
-const SPECS: [Spec; 3] = [
+const SPECS: [Spec; 4] = [
     Spec {
         name: "messages",
         kind: Kind::Messages,
@@ -103,7 +105,12 @@ const SPECS: [Spec; 3] = [
     Spec {
         name: "page_days",
         kind: Kind::Number(1, PREPARE_DAYS_MAX, "days"),
-        says: "how many days before a meeting its page opens at the earliest (it opens only once the meeting before is over)",
+        says: "how many days before a meeting its page opens, once the meeting before is over (only while `page_after` is `off`, and for a plenum's first meeting)",
+    },
+    Spec {
+        name: "page_after",
+        kind: Kind::NumberOrOff(0, PAGE_AFTER_DAYS_MAX, "days"),
+        says: "how many days after a meeting the next one's page opens, once its minutes are closed (0: right then; `off`: `page_days` before the meeting instead)",
     },
 ];
 
@@ -137,7 +144,8 @@ pub fn normalize(name: &str, value: &str) -> Result<String, String> {
             Some(m) => Ok(m.word().to_owned()),
             None => Err("`messages` is `quiet` or `all`.".to_owned()),
         },
-        Kind::Number(from, to, unit) => {
+        Kind::NumberOrOff(..) if value.trim().eq_ignore_ascii_case("off") => Ok("off".to_owned()),
+        Kind::Number(from, to, unit) | Kind::NumberOrOff(from, to, unit) => {
             let digits = value
                 .trim()
                 .trim_end_matches(|c: char| c.is_alphabetic())
@@ -145,10 +153,19 @@ pub fn normalize(name: &str, value: &str) -> Result<String, String> {
             match digits.parse::<u32>() {
                 Ok(n) if (from..=to).contains(&n) => Ok(n.to_string()),
                 _ => Err(format!(
-                    "`{}` is a number of {unit} from {from} to {to}, e.g. `!plenum set {} {}`.",
+                    "`{}` is a number of {unit} from {from} to {to}{}, e.g. `!plenum set {} {}`.",
                     s.name,
+                    if matches!(s.kind, Kind::NumberOrOff(..)) {
+                        " or `off`"
+                    } else {
+                        ""
+                    },
                     s.name,
-                    (from + to) / 4 + from
+                    if matches!(s.kind, Kind::NumberOrOff(..)) {
+                        1
+                    } else {
+                        (from + to) / 4 + from
+                    }
                 )),
             }
         }
@@ -178,6 +195,9 @@ fn base_value(base: &Plenum, name: &str) -> String {
         "messages" => base.messages.word().to_owned(),
         "reminder" => base.remind_minutes.to_string(),
         "page_days" => base.prepare_days.to_string(),
+        "page_after" => base
+            .page_after_days
+            .map_or_else(|| "off".to_owned(), |d| d.to_string()),
         _ => String::new(),
     }
 }
@@ -198,6 +218,9 @@ pub fn apply(base: &Plenum, values: &BTreeMap<String, String>) -> Plenum {
     }
     if let Some(v) = get("page_days").and_then(|v| v.parse().ok()) {
         p.prepare_days = v;
+    }
+    if let Some(v) = get("page_after") {
+        p.page_after_days = v.parse().ok();
     }
     p
 }
@@ -297,6 +320,32 @@ mod tests {
         assert!(normalize("messages", "some").is_err());
         let e = normalize("publication", "full").unwrap_err();
         assert!(e.contains("`messages`"), "{e}");
+        assert_eq!(normalize("page_after", "Off").unwrap(), "off");
+        assert_eq!(normalize("page_after", "0").unwrap(), "0");
+        assert_eq!(normalize("page_after", "1 day").unwrap(), "1");
+        let e = normalize("page_after", "61").unwrap_err();
+        assert!(e.contains("or `off`") && e.contains("page_after 1"), "{e}");
+    }
+
+    #[test]
+    fn page_after_is_off_or_a_number_of_days() {
+        let mut b = base();
+        assert_eq!(current(&b, &set(&[]), "page_after"), "off");
+        assert_eq!(
+            apply(&b, &set(&[("page_after", "2")])).page_after_days,
+            Some(2)
+        );
+        b.page_after_days = Some(1);
+        assert_eq!(current(&b, &set(&[]), "page_after"), "1");
+        // the room may switch the house's value off
+        assert_eq!(
+            apply(&b, &set(&[("page_after", "off")])).page_after_days,
+            None
+        );
+        assert_eq!(
+            apply(&b, &set(&[("page_after", "x")])).page_after_days,
+            Some(1)
+        );
     }
 
     #[test]

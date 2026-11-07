@@ -127,6 +127,10 @@ pub struct PlenumState {
     /// The overview's text as last written (it is only written when it changes).
     #[serde(default)]
     pub overview_text: Option<String>,
+    /// The open pages (document IDs) as last pinned in the collection (pinned again only when
+    /// they change: a pin someone removed stays removed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<Vec<String>>,
     /// When the collection, its access and its documents were last checked.
     #[serde(default)]
     pub area_checked: Option<DateTime<Utc>>,

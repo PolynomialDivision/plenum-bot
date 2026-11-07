@@ -112,6 +112,18 @@ struct ApiCollection {
 }
 
 #[derive(Deserialize)]
+struct ApiPin {
+    id: String,
+    #[serde(rename = "documentId")]
+    document_id: String,
+}
+
+#[derive(Deserialize)]
+struct PinList {
+    pins: Vec<ApiPin>,
+}
+
+#[derive(Deserialize)]
 struct ApiGroup {
     id: String,
     name: String,
@@ -490,6 +502,50 @@ impl Wiki for Outline {
 
     async fn grant_group(&self, collection_id: &str, group: &str) -> Result<bool> {
         grant_group(self, collection_id, group).await
+    }
+
+    async fn pins(&self, collection_id: &str) -> Result<Option<Vec<(String, String)>>> {
+        match self
+            .call::<PinList>(
+                "pins.list",
+                json!({"collectionId": collection_id, "limit": 100}),
+            )
+            .await
+        {
+            Ok(l) => Ok(Some(
+                l.pins.into_iter().map(|p| (p.id, p.document_id)).collect(),
+            )),
+            // the key has no pins.* (house-infra stacks/outline PLENUM_BOT_SCOPE)
+            Err(e) if matches!(status_of(&e), Some(401 | 403)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn pin(&self, collection_id: &str, doc_id: &str) -> Result<bool> {
+        // Outline keeps one pin per document and collection (pinCreator: findOrCreate)
+        match self
+            .call::<Value>(
+                "pins.create",
+                json!({"documentId": doc_id, "collectionId": collection_id}),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            // no right to pin there: the bot is no admin of the collection, or the key
+            Err(e) if matches!(status_of(&e), Some(401 | 403)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn unpin(&self, pin_id: &str) -> Result<bool> {
+        match self.call_ok("pins.delete", json!({"id": pin_id})).await {
+            Ok(()) => Ok(true),
+            // gone already
+            Err(e) if status_of(&e) == Some(404) => Ok(true),
+            // no right to unpin it (a member who is no admin of the collection, or the key)
+            Err(e) if matches!(status_of(&e), Some(401 | 403)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     async fn find_doc(&self, collection_id: &str, title: &str) -> Result<Option<Doc>> {
@@ -1086,6 +1142,7 @@ mod against_outline {
             publication: crate::config::Publication::Full,
             messages: crate::config::Messages::All,
             room_settings: true,
+            page_after_days: None,
         };
         let fonts = ["/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/TTF"]
             .into_iter()
@@ -1487,6 +1544,7 @@ mod against_outline {
             publication: crate::config::Publication::Full,
             messages: crate::config::Messages::All,
             room_settings: true,
+            page_after_days: None,
         };
         let kitchen = Plenum {
             group: Some(group.clone()),
@@ -1874,5 +1932,121 @@ mod against_outline {
         );
         admin(&url, &key, "collections.delete", json!({"id": closed})).await;
         println!("collections: {ids:?} new {fresh} closed {closed}");
+    }
+
+    async fn pins(w: &Outline, col: &str) -> Option<Vec<(String, String)>> {
+        w.pins(col).await.unwrap()
+    }
+
+    /// The pins of a collection (the open meeting's page, engine `sync_pins`) as Outline 1.12
+    /// answers them: one pin per page however often it is pinned, a second unpin is 404 (gone).
+    /// Optional: `OUTLINE_IT_NOPINS_KEY`, a key whose scope has no `/api/pins.*` (the bot sees
+    /// no pins and may not pin), and `OUTLINE_IT_MEMBER_KEY`, a key of a member (no admin) who
+    /// writes in a collection someone else made (reads the pins, may not pin or unpin).
+    #[tokio::test]
+    #[ignore = "needs a running Outline"]
+    async fn pins_in_a_real_outline() {
+        let (Ok(url), Ok(key)) = (
+            std::env::var("OUTLINE_IT_URL"),
+            std::env::var("OUTLINE_IT_KEY"),
+        ) else {
+            panic!("set OUTLINE_IT_URL and OUTLINE_IT_KEY");
+        };
+        let wiki = Outline::new(&url, &url, &key, Duration::from_secs(30)).unwrap();
+        let col = wiki
+            .ensure_collection(
+                None,
+                &format!("IT {}", uuid::Uuid::new_v4()),
+                Access::House,
+                None,
+            )
+            .await
+            .unwrap();
+        let (a, b) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        wiki.create_doc(&a, &col, None, "Pin A", "a").await.unwrap();
+        wiki.create_doc(&b, &col, None, "Pin B", "b").await.unwrap();
+        assert_eq!(pins(&wiki, &col).await, Some(vec![]));
+
+        // pinned twice: still one pin
+        assert!(wiki.pin(&col, &a).await.unwrap());
+        assert!(wiki.pin(&col, &a).await.unwrap());
+        assert!(wiki.pin(&col, &b).await.unwrap());
+        let listed = pins(&wiki, &col).await.expect("the key may list pins");
+        println!("pins: {listed:?}");
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        let pin_of = |doc: &str| {
+            listed
+                .iter()
+                .find(|(_, d)| d == doc)
+                .unwrap_or_else(|| panic!("{doc} is not pinned: {listed:?}"))
+                .0
+                .clone()
+        };
+        let (pin_a, pin_b) = (pin_of(&a), pin_of(&b));
+
+        // unpinned, and again: gone (404), also for a pin that never was
+        wiki.unpin(&pin_a).await.unwrap();
+        assert_eq!(
+            pins(&wiki, &col).await,
+            Some(vec![(pin_b.clone(), b.clone())])
+        );
+        let again = wiki
+            .call_ok("pins.delete", json!({"id": pin_a}))
+            .await
+            .unwrap_err();
+        assert_eq!(status_of(&again), Some(404), "{again:#}");
+        wiki.unpin(&pin_a).await.unwrap();
+        wiki.unpin(&uuid::Uuid::new_v4().to_string()).await.unwrap();
+
+        // a key without pins.* in its scope: 403, no pins and no pinning for the bot
+        if let Ok(nopins) = std::env::var("OUTLINE_IT_NOPINS_KEY") {
+            let w = Outline::new(&url, &url, &nopins, Duration::from_secs(30)).unwrap();
+            for (method, body) in [
+                ("pins.list", json!({"collectionId": col, "limit": 100})),
+                ("pins.create", json!({"documentId": a, "collectionId": col})),
+            ] {
+                let e = w.call_ok(method, body).await.unwrap_err();
+                println!("without pins.*: {method}: {e:#}");
+                assert_eq!(status_of(&e), Some(403), "{method}: {e:#}");
+            }
+            assert_eq!(pins(&w, &col).await, None);
+            assert!(!w.pin(&col, &a).await.unwrap());
+        } else {
+            println!("OUTLINE_IT_NOPINS_KEY not set: the scoped key is not checked");
+        }
+
+        // a member who writes but is no admin of the collection: sees the pins, may not pin
+        // (403 → Ok(false)); nor unpin (403 → Ok(false))
+        if let Ok(member) = std::env::var("OUTLINE_IT_MEMBER_KEY") {
+            let w = Outline::new(&url, &url, &member, Duration::from_secs(30)).unwrap();
+            assert_eq!(pins(&w, &col).await, Some(vec![(pin_b.clone(), b.clone())]));
+            let e = w
+                .call_ok("pins.create", json!({"documentId": a, "collectionId": col}))
+                .await
+                .unwrap_err();
+            println!("member: pins.create: {e:#}");
+            assert_eq!(status_of(&e), Some(403), "{e:#}");
+            assert!(!w.pin(&col, &a).await.unwrap());
+            let e = w
+                .call_ok("pins.delete", json!({"id": pin_b}))
+                .await
+                .unwrap_err();
+            println!("member: pins.delete: {e:#}");
+            assert_eq!(status_of(&e), Some(403), "{e:#}");
+            assert!(!w.unpin(&pin_b).await.unwrap());
+            assert_eq!(
+                pins(&wiki, &col).await,
+                Some(vec![(pin_b.clone(), b.clone())])
+            );
+        } else {
+            println!("OUTLINE_IT_MEMBER_KEY not set: the member is not checked");
+        }
+
+        wiki.unpin(&pin_b).await.unwrap();
+        assert_eq!(pins(&wiki, &col).await, Some(vec![]));
+        admin(&url, &key, "collections.delete", json!({"id": col})).await;
     }
 }

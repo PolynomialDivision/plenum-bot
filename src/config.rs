@@ -77,6 +77,9 @@ pub struct PagesConfig {
     pub messages: Messages,
     /// The people of a plenum may change its settings in its room (`!plenum set`).
     pub room_settings: bool,
+    /// The next page opens this many days after the meeting before it (0: as soon as that is
+    /// over); unset: only `prepare_days` before its meeting (docs/PLENUM-PAGES.md §4.1).
+    pub page_after_days: Option<u32>,
     pub plenum: BTreeMap<String, PagesPlenumConfig>,
 }
 
@@ -85,6 +88,7 @@ impl Default for PagesConfig {
         Self {
             messages: Messages::All,
             room_settings: true,
+            page_after_days: None,
             plenum: BTreeMap::new(),
         }
     }
@@ -96,10 +100,14 @@ impl Default for PagesConfig {
 pub struct PagesPlenumConfig {
     pub messages: Option<Messages>,
     pub room_settings: Option<bool>,
+    pub page_after_days: Option<u32>,
 }
 
 /// The longest `prepare_days` (a page opens at most this many days before its meeting).
 pub const PREPARE_DAYS_MAX: u32 = 60;
+
+/// The longest `page_after_days`.
+pub const PAGE_AFTER_DAYS_MAX: u32 = 60;
 
 /// The latest reminder, in minutes before the start (a day).
 pub const REMIND_MINUTES_MAX: u32 = 1440;
@@ -468,6 +476,9 @@ pub struct Plenum {
     pub messages: Messages,
     /// The room may change its settings (`!plenum set`).
     pub room_settings: bool,
+    /// `[pages] page_after_days`: the page opens this many days after the meeting before
+    /// (None: only `prepare_days` before its own).
+    pub page_after_days: Option<u32>,
 }
 
 impl Plenum {
@@ -639,6 +650,9 @@ impl Config {
                 room_settings: (self.pages.plenum.get(&p.key))
                     .and_then(|o| o.room_settings)
                     .unwrap_or(self.pages.room_settings),
+                page_after_days: (self.pages.plenum.get(&p.key))
+                    .and_then(|o| o.page_after_days)
+                    .or(self.pages.page_after_days),
             });
             let last = out.last().expect("pushed");
             if !(1..=PREPARE_DAYS_MAX).contains(&last.prepare_days) {
@@ -646,6 +660,12 @@ impl Config {
             }
             if last.remind_minutes > REMIND_MINUTES_MAX {
                 bail!("{at}: remind_minutes is 0 to {REMIND_MINUTES_MAX}");
+            }
+            if last
+                .page_after_days
+                .is_some_and(|d| d > PAGE_AFTER_DAYS_MAX)
+            {
+                bail!("{at}: page_after_days is 0 to {PAGE_AFTER_DAYS_MAX}");
             }
         }
         if let Some(unknown) =

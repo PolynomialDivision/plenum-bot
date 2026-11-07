@@ -172,7 +172,7 @@ container's `TZ`.
 | `!minutes link` | only the link to them |
 | `!minutes full` | the summary again, as usual |
 | `!top` as a reply | the message it answers is the topic (by its author) |
-| `!plenum settings` | the plenum's own settings: `messages`, `reminder`, `page_days` |
+| `!plenum settings` | the plenum's own settings: `messages`, `reminder`, `page_days`, `page_after` |
 | `!plenum set <name> <value>`, `!plenum reset <name>` | change one, back to the default (the `organizers`; without any, everyone in the room; admins always; 10 a day per person, 30 per plenum) |
 | `!plenum help` | this list |
 
@@ -203,10 +203,14 @@ its result goes after "Result:" (also "Ergebnis:"). `src/page.rs` reads it:
   they come from, open checkboxes as plain points, mentions as names);
 - **to check**: two "Result:" lines (not carried, named in the result box).
 
-The page opens `prepare_days` (the room's `page_days`) before its meeting, but not before the
-plenum's previous meeting is closed or past its closing time (`end + close_after_hours`); a
-day before it opens anyway (two meetings close together). With a large value the next page
-opens when the last meeting is over.
+The page opens, once the plenum's previous meeting is closed or past its closing time
+(`end + close_after_hours`): with `[pages] page_after_days` N (the room's `page_after`) on the
+N-th day after that meeting (0: right then), however far its own meeting is; without it (and
+for a first meeting) `prepare_days` (the room's `page_days`) before its meeting. A day before
+it opens anyway (two meetings close together). An open page whose calendar event got another
+ID (a series changed "this and all future") keeps its meeting; an event entered twice is one
+meeting (docs/PLENUM-PAGES.md §4.1). The open pages are pinned in the collection and unpinned
+when closed or cancelled (§6.1; needs `pins.*` in the key).
 
 At close: the topics not reached go into the state (`open_topics`) and from there into the next
 page that is open (above its marker, else above its "Tasks" heading, else at the end), and are
@@ -303,7 +307,7 @@ plenum set its `require_group`). Tested against Outline 1.12.0
 (`house_group_areas_in_a_real_outline`, below; house-infra stacks/outline README "Subtenants").
 
 API key: the key of an Outline account of its own, as `OUTLINE_API_KEY`, with the scopes
-`documents.* collections.* attachments.* files.* groups.list auth.info` (stored by Outline as
+`documents.* collections.* attachments.* files.* pins.* groups.list auth.info` (stored by Outline as
 `/api/documents.*` and so on). A member is enough: it creates its collections itself and is
 their admin (tested against Outline 1.11.0, 2026-10-20, and 1.12.0, 2026-10-31). In house-infra
 the account and key come from stacks/outline (outline-roles, outline-keys).
