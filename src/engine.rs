@@ -54,15 +54,13 @@ use tracing::{error, info, warn};
 use crate::{
     calendar::Occurrence,
     commands::{Command, When},
-    config::{self, Access, PdfConfig, Plenum, Publication},
+    config::{self, Access, Messages, PdfConfig, Plenum, Publication},
+    page, plenum_settings,
     protocol::{self, PdfNote},
     schedule::{self, MeetingKey},
-    state::{Carried, Meeting, State, Top},
+    state::{Carried, CarriedTopic, LinkMessage, Meeting, State, Top},
     stay,
 };
-
-mod topic_flow;
-pub use topic_flow::{Inbound, Origin, Place};
 
 /// A document as the bot needs it.
 #[derive(Clone, Debug, PartialEq)]
@@ -129,17 +127,36 @@ pub trait Wiki {
 /// The chat (Matrix in production).
 #[allow(async_fn_in_trait)]
 pub trait Chat {
-    /// Send Markdown with this transaction ID (a resend with the same ID is dropped).
-    async fn send(&self, room: &RoomId, markdown: &str, txn: &str) -> Result<()>;
+    /// Send Markdown with this transaction ID (a resend with the same ID is dropped). Every
+    /// message into a plenum's room says what it is ([`Notice`]): [`sends`] decides.
+    async fn send(&self, room: &RoomId, markdown: &str, notice: Notice, txn: &str) -> Result<()>;
     /// [`Self::send`], pinging `users` (Matrix mentions).
     async fn send_mentioning(
         &self,
         room: &RoomId,
         markdown: &str,
         users: &[OwnedUserId],
+        notice: Notice,
         txn: &str,
     ) -> Result<()>;
-    async fn send_file(&self, room: &RoomId, name: &str, bytes: Vec<u8>, txn: &str) -> Result<()>;
+    async fn send_file(
+        &self,
+        room: &RoomId,
+        name: &str,
+        bytes: Vec<u8>,
+        notice: Notice,
+        txn: &str,
+    ) -> Result<()>;
+    /// [`Self::send`], giving back the message's event ID (to edit it later).
+    async fn post(
+        &self,
+        room: &RoomId,
+        markdown: &str,
+        notice: Notice,
+        txn: &str,
+    ) -> Result<String>;
+    /// Replace the text of the bot's own message `event` (`txn` as for [`Self::send`]).
+    async fn edit(&self, room: &RoomId, event: &str, markdown: &str, txn: &str) -> Result<()>;
     /// Who is in the room, joined or invited.
     async fn members(&self, room: &RoomId) -> Result<Vec<Member>>;
     async fn invite(&self, room: &RoomId, user: &UserId) -> Result<()>;
@@ -153,30 +170,6 @@ pub trait Chat {
     async fn message_person(&self, user: &UserId, markdown: &str, key: &str) -> Result<()>;
     /// The room an alias (`#name:server`) points to.
     async fn resolve_alias(&self, alias: &str) -> Result<OwnedRoomId>;
-    /// Post Markdown at `place`, pinging `users`; its event ID. A resend with the same
-    /// transaction ID is dropped (as [`Self::send`]).
-    async fn post(
-        &self,
-        room: &RoomId,
-        markdown: &str,
-        users: &[OwnedUserId],
-        place: Place<'_>,
-        txn: &str,
-    ) -> Result<String>;
-    /// Replace the text of the bot's own message `event`; `users` are the ones it pinged
-    /// (nobody is pinged again).
-    async fn edit(
-        &self,
-        room: &RoomId,
-        event: &str,
-        markdown: &str,
-        users: &[OwnedUserId],
-        txn: &str,
-    ) -> Result<()>;
-    /// React to `event` with `key` (a button).
-    async fn react(&self, room: &RoomId, event: &str, key: &str, txn: &str) -> Result<()>;
-    /// The reactions under `event` as the homeserver has them now: (who, key).
-    async fn reactions(&self, room: &RoomId, event: &str) -> Result<Vec<(OwnedUserId, String)>>;
 }
 
 /// Where a command comes from: what the overview may show there.
@@ -187,6 +180,33 @@ pub enum Scope {
     /// An admin's private chat with the bot: everything.
     AdminDm,
 }
+
+/// What a message into a plenum's room is (docs/PLENUM-PAGES.md §5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Notice {
+    /// The link to a meeting's new page (the one message of `messages quiet`).
+    Link,
+    /// The meeting moved or is back after a cancellation: a new message with the link.
+    Moved,
+    Reminder,
+    Cancelled,
+    /// The summary or the closed note after the meeting.
+    Summary,
+    Pdf,
+    /// A setting changed from somewhere else (an admin's direct chat).
+    Setting,
+}
+
+/// Whether the bot posts `notice` by itself in a plenum with these `messages`.
+pub fn sends(messages: Messages, notice: Notice) -> bool {
+    messages == Messages::All || notice == Notice::Link
+}
+
+/// What a cancelled meeting's page has after its title.
+const CANCELLED: &str = " (cancelled)";
+
+/// Attempts at the result box before the close goes on without it.
+const BOX_ATTEMPTS: u32 = 3;
 
 /// How often the area of a plenum (collection access, documents, filing) is checked.
 const AREA_EVERY: Duration = Duration::hours(1);
@@ -241,8 +261,6 @@ pub struct Engine<W, C> {
     /// The plenums whose area was checked since the start: a restart (a deploy with a new
     /// name, say) checks every area at once, not only an hour after the last check.
     areas_checked: std::sync::Mutex<HashSet<String>>,
-    /// What came in from Matrix for the topics since the last tick (topic_flow.rs).
-    inbox: std::sync::Mutex<Vec<Inbound>>,
 }
 
 /// Who sent a command.
@@ -298,7 +316,6 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             state: Mutex::new(state),
             state_path,
             areas_checked: std::sync::Mutex::new(HashSet::new()),
-            inbox: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -327,29 +344,30 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     /// Everything that is due. Errors are logged per meeting; the others go on.
     pub async fn tick(&self, now: DateTime<Utc>) {
         let mut st = self.state.lock().await;
-        let inbound = self.take_inbox();
-        self.handle_inbound(&mut st, &inbound, now);
-        // saved before anything is sent because of it (a withdrawal, a proposal)
-        if !inbound.is_empty() {
-            self.save_or_log(&st).await;
-        }
         for base in &self.plenums {
-            // with the settings its room made (plenum_settings.rs)
-            let p = &self.effective(base, &st);
-            self.migrate_pending(&mut st, p);
+            let p = &self.effective(&st, base);
             self.follow_calendar(&mut st, p, now).await;
             self.tick_plenum(&mut st, p, now).await;
-            self.tick_topics(&mut st, p, now).await;
+            if let Err(e) = self.carry_topics_on(&mut st, p).await {
+                warn!(plenum = %p.key, "Topics onto the next page (again at the next tick): {e:#}");
+            }
             if let Err(e) = self.tick_area(&mut st, p, now).await {
                 warn!(plenum = %p.key, "Wiki area: {e:#}");
             }
             st.plenums.entry(p.key.clone()).or_default().prune();
-        }
-        // every plenum's topics, also with topics off or a plenum gone from the config
-        for area in st.book.plenums.values_mut() {
-            area.prune(now);
+            if let Some(room) = st.settings.plenums.get_mut(&p.key) {
+                room.prune(now);
+            }
         }
         self.save_or_log(&st).await;
+    }
+
+    /// The plenum with its room's own settings applied (plenum_settings.rs).
+    pub(crate) fn effective(&self, st: &State, base: &Plenum) -> Plenum {
+        match st.settings.plenums.get(&base.key) {
+            Some(room) => plenum_settings::apply(base, &room.values),
+            None => base.clone(),
+        }
     }
 
     /// The area in the wiki: checked every [`AREA_EVERY`] (and right after the start), the
@@ -401,35 +419,12 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             example: example.as_deref(),
             calendar: self.calendar_url.as_deref(),
         };
-        let topics = p.topics.enabled.then(|| {
-            let area = st.book.plenums.get(&p.key);
-            let open: Vec<&crate::topics::Topic> =
-                area.map(|a| a.open().collect()).unwrap_or_default();
-            let changed: Vec<(String, String)> = area
-                .map(|a| {
-                    a.settings
-                        .keys()
-                        .filter(|name| {
-                            p.topics.room_settings && crate::plenum_settings::is_setting(name)
-                        })
-                        .map(|name| {
-                            (
-                                name.clone(),
-                                crate::plenum_settings::current(p, &a.settings, name),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            crate::topics::overview_block(&open, &changed, area.map_or(&[][..], |a| &a.changes))
-        });
         Some(protocol::overview_text(
             p,
             &next,
             &ps.open_tasks,
             &ps.decisions,
             &links,
-            topics.as_deref(),
         ))
     }
 
@@ -546,26 +541,46 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let link = self.link_of(m);
         let shared = publication(p, m);
         self.save(st).await?;
-        let mut text = protocol::cancellation(p, start, &link, shared);
-        let there: Vec<String> = st
-            .book
-            .plenums
-            .get(&p.key)
-            .map(|a| {
-                a.open()
-                    .filter(|t| t.placed.as_deref() == Some(id))
-                    .map(|t| format!("#{}", t.number))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !there.is_empty() && p.topics.enabled {
-            text.push_str(&format!(
-                "\n\nIts topics ({}) move to the next plenum.",
-                there.join(", ")
-            ));
+        if sends(p.messages, Notice::Cancelled) {
+            self.chat
+                .send(
+                    &p.room,
+                    &protocol::cancellation(p, start, &link, shared),
+                    Notice::Cancelled,
+                    &txn,
+                )
+                .await?;
+        } else {
+            // quiet: the link message says it, no new message
+            let text = protocol::cancelled_link(p, start, &link, shared);
+            self.edit_link(st, p, id, &text).await?;
         }
-        self.chat.send(&p.room, &text, &txn).await?;
         meeting(st, p, id).cancel_notice.done = true;
+        self.save(st).await
+    }
+
+    /// The meeting's link message changed to `text` (an edit, each with its own transaction;
+    /// nothing without a link message, e.g. one an older image posted).
+    async fn edit_link(&self, st: &mut State, p: &Plenum, id: &str, text: &str) -> Result<()> {
+        let m = meeting(st, p, id);
+        let Some(link) = m.link.as_mut() else {
+            return Ok(());
+        };
+        if link.text == text {
+            return Ok(());
+        }
+        link.edits += 1;
+        let (event, txn) = (
+            link.event.clone(),
+            format!("plenum-edit-{}-{}", link.event, link.edits),
+        );
+        // the count first: a retry after a crash sends another edit (the same text), never
+        // an edit the server drops as a resend
+        self.save(st).await?;
+        self.chat.edit(&p.room, &event, text, &txn).await?;
+        if let Some(link) = meeting(st, p, id).link.as_mut() {
+            link.text = text.to_owned();
+        }
         self.save(st).await
     }
 
@@ -668,6 +683,180 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 warn!(plenum = %p.key, meeting = %id, "{e:#}");
             }
         }
+        // a cancelled meeting's page, once its time is over: its topics move on, and that is all
+        let over: Vec<String> = st.plenums[&p.key]
+            .meetings
+            .iter()
+            .filter(|(_, m)| m.cancelled && m.created && !m.close.done)
+            .filter(|(_, m)| m.start.is_some() && self.end_of(p, m) <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in over {
+            if let Err(e) = self.close_cancelled(st, p, &id).await {
+                warn!(plenum = %p.key, meeting = %id, "A cancelled meeting's topics (again at the next tick): {e:#}");
+            }
+        }
+    }
+
+    /// A cancelled meeting's page after its time: all its topics wait for the next page;
+    /// nothing else happens (no decisions list, PDF or message).
+    async fn close_cancelled(&self, st: &mut State, p: &Plenum, id: &str) -> Result<()> {
+        let (doc_id, start, link, shared) = {
+            let m = meeting(st, p, id);
+            let start = m.start.context("a meeting without a start")?;
+            (m.doc_id.clone(), start, self.link_of(m), publication(p, m))
+        };
+        if let Some(doc) = self.wiki.doc(&doc_id).await? {
+            // the meeting did not take place: every topic moves on
+            let topics = page::topics(&doc.text);
+            self.keep_topics(st, p, &topics, start, &link, shared);
+        }
+        let m = meeting(st, p, id);
+        m.close.topics_read = true;
+        m.close.done = true;
+        info!(plenum = %p.key, meeting = %id, "Cancelled meeting over: its topics move on");
+        self.save(st).await
+    }
+
+    /// `topics` of the meeting at `from` into the state, to go onto the next page (once: a
+    /// repeated read replaces them).
+    fn keep_topics(
+        &self,
+        st: &mut State,
+        p: &Plenum,
+        topics: &[page::Topic],
+        from: MeetingKey,
+        link: &str,
+        shared: Publication,
+    ) {
+        let ps = st.plenums.entry(p.key.clone()).or_default();
+        ps.open_topics.retain(|t| t.from != from);
+        for t in topics {
+            let block = page::carried_block(t, from.date(), link);
+            ps.open_topics.push(CarriedTopic {
+                heading: page::block_heading(&block).to_owned(),
+                block,
+                from,
+                publication: shared,
+            });
+        }
+    }
+
+    /// The topics waiting in the state into the next page that is made (each into the first
+    /// page after its meeting). One that the page has already (its heading) is dropped from the
+    /// state, so it is only dropped once seen there, at a later tick than it was written; the
+    /// meeting takes the stricter publication of the one it comes from.
+    async fn carry_topics_on(&self, st: &mut State, p: &Plenum) -> Result<()> {
+        let waiting = st
+            .plenums
+            .get(&p.key)
+            .map(|ps| ps.open_topics.clone())
+            .unwrap_or_default();
+        if waiting.is_empty() {
+            return Ok(());
+        }
+        let mut changed = false;
+        for t in waiting {
+            let ps = &st.plenums[&p.key];
+            let next = ps
+                .meetings
+                .iter()
+                .filter(|(_, m)| m.created && !m.close.done && !m.cancelled && !m.skipped)
+                .filter(|(_, m)| m.start.is_some_and(|s| s > t.from))
+                .min_by_key(|(_, m)| m.start)
+                .map(|(id, m)| (id.clone(), m.doc_id.clone()));
+            let Some((id, doc_id)) = next else {
+                continue;
+            };
+            let Some(doc) = self.wiki.doc(&doc_id).await? else {
+                continue;
+            };
+            let m = meeting(st, p, &id);
+            if publication(p, m) < t.publication {
+                m.publication = Some(t.publication);
+                changed = true;
+            }
+            if page::has_heading(&doc.text, &t.heading) {
+                let ps = st.plenums.get_mut(&p.key).expect("read above");
+                ps.open_topics.retain(|o| o != &t);
+                info!(plenum = %p.key, meeting = %id, "A carried topic is on the next page");
+                changed = true;
+            } else {
+                self.add_block(&doc, &t.block).await?;
+            }
+        }
+        if changed {
+            self.save(st).await?;
+        }
+        Ok(())
+    }
+
+    /// A topic block into a page people may be writing in: in place of the topics' marker
+    /// (above it), else of the old chat marker, else above the heading after the topics, else
+    /// at the end (under a "Topics" heading if the page has none).
+    async fn add_block(&self, doc: &Doc, block: &str) -> Result<()> {
+        // at the level the page's topics are written at
+        let block = &page::at_level(block, page::topics_level(&doc.text));
+        for marker in [page::TOPIC_MARKER, protocol::TOP_MARKER] {
+            if doc.text.contains(marker)
+                && self
+                    .wiki
+                    .patch(&doc.id, marker, &format!("{block}\n\n{marker}"))
+                    .await?
+            {
+                return Ok(());
+            }
+        }
+        // above the heading that ends the topics ("Tasks"), so it is read as a topic
+        if let Some(end) = page::end_of_topics(&doc.text) {
+            if self
+                .wiki
+                .patch(&doc.id, end, &format!("{block}\n\n{end}"))
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        // a page with topics up to its end: at the end; one without: under a "Topics" of its own
+        let text = if page::has_topics(&doc.text) {
+            format!("\n\n{block}")
+        } else {
+            format!("\n\n{}\n\n{block}", page::TOPICS_HEADING)
+        };
+        self.wiki.append(&doc.id, &text).await
+    }
+
+    /// Whether the meeting before `start` (the latest earlier one that is neither cancelled
+    /// nor skipped) is closed or past its closing time: only then the next page opens
+    /// (docs/PLENUM-PAGES.md §4.1).
+    fn previous_over(&self, st: &State, p: &Plenum, start: MeetingKey, now: DateTime<Utc>) -> bool {
+        let Some(ps) = st.plenums.get(&p.key) else {
+            return true;
+        };
+        let mut earlier: Vec<Meeting> = ps
+            .meetings
+            .values()
+            .filter(|m| m.start.is_some_and(|s| s < start))
+            .cloned()
+            .collect();
+        for o in &ps.occurrences {
+            if o.start < start && !ps.meetings.contains_key(&o.id) {
+                earlier.push(Meeting {
+                    start: Some(o.start),
+                    end: o.end,
+                    ..Default::default()
+                });
+            }
+        }
+        let Some(previous) = earlier
+            .iter()
+            .filter(|m| !m.cancelled && !m.skipped)
+            .max_by_key(|m| m.start)
+        else {
+            return true;
+        };
+        previous.close.done
+            || now >= self.end_of(p, previous) + Duration::hours(i64::from(p.close_after_hours))
     }
 
     /// When the meeting ends: the calendar's end, else its start and `duration_minutes`.
@@ -683,13 +872,26 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     /// time when another meeting that day has that title already.
     fn free_title(&self, st: &State, p: &Plenum, id: &str, start: MeetingKey) -> String {
         let title = protocol::title(p, start);
-        let taken = st.plenums.get(&p.key).is_some_and(|ps| {
+        let ps = st.plenums.get(&p.key);
+        let taken = ps.is_some_and(|ps| {
             ps.meetings.iter().any(|(other, m)| {
-                other != id && m.created && m.title.as_deref() == Some(title.as_str())
+                other != id
+                    && m.created
+                    && m.title
+                        .as_deref()
+                        .is_some_and(|t| t.trim_end_matches(CANCELLED) == title)
             })
         });
-        if taken {
+        let title = if taken {
             format!("{title} {}", start.0.format("%H:%M"))
+        } else {
+            title
+        };
+        let cancelled = ps
+            .and_then(|ps| ps.meetings.get(id))
+            .is_some_and(|m| m.cancelled);
+        if cancelled {
+            format!("{title}{CANCELLED}")
         } else {
             title
         }
@@ -704,6 +906,9 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     ) -> Result<()> {
         let (start_key, end) = {
             let m = &st.plenums[&p.key].meetings[key];
+            if m.close.done || m.skipped || m.cancelled {
+                return Ok(());
+            }
             (
                 m.start.context("a meeting without a start")?,
                 self.end_of(p, m),
@@ -714,12 +919,19 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let prepare_at =
             MeetingKey(start_key.0 - Duration::days(i64::from(p.prepare_days))).start(self.tz);
         {
-            let ps = st.plenums.entry(p.key.clone()).or_default();
-            let m = ps.meetings.get_mut(key).expect("due");
-            if m.close.done || m.skipped || m.cancelled {
-                return Ok(());
-            }
-            if now < prepare_at {
+            let m = &st.plenums[&p.key].meetings[key];
+            // a day before, a page opens even while the one before is open (two meetings close
+            // together)
+            let opens = now >= prepare_at
+                && (m.created
+                    || now + Duration::days(1) >= start
+                    || self.previous_over(st, p, start_key, now));
+            let m = st
+                .plenums
+                .get_mut(&p.key)
+                .and_then(|ps| ps.meetings.get_mut(key))
+                .expect("due");
+            if !opens {
                 // The room knew another date (or that it was cancelled): told now, not only
                 // when it is due.
                 if m.created && m.announce_again && !m.announce.done {
@@ -913,18 +1125,14 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         // Saved before the call: after a crash the same ID is looked up instead of a second
         // protocol being created.
         self.save(st).await?;
-        let pending: Vec<String> = st.plenums[&p.key]
-            .pending_tops
-            .iter()
-            .map(protocol::top_line)
-            .collect();
-        // the topics that went into a new protocol (topic_flow.rs)
-        let mut placed = Vec::new();
+        let tops = st.plenums[&p.key].pending_tops.clone();
         let doc = match self.wiki.doc(&doc_id).await? {
             // Created before a restart: items sent since then go in like any chat item.
             Some(d) => {
-                if self.add_lines(&doc_id, &pending).await?.is_none() {
-                    anyhow::bail!("the protocol vanished while it was being prepared");
+                for top in &tops {
+                    if self.add_top_to(&doc_id, top).await?.is_none() {
+                        anyhow::bail!("the protocol vanished while it was being prepared");
+                    }
                 }
                 d
             }
@@ -935,38 +1143,73 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 if !unknown.is_empty() {
                     warn!(plenum = %p.key, placeholders = %unknown.join(" "), "The template has placeholders the bot does not know: left as they are");
                 }
-                for line in &pending {
-                    text = protocol::insert_top(&text, line);
+                if page::has_topics(&text) {
+                    // topics carried from earlier meetings first, then those from the chat
+                    // each into the first page after its meeting: not when an earlier one is open
+                    let open_before = |from: MeetingKey| {
+                        ps.meetings.values().any(|m| {
+                            m.created
+                                && !m.close.done
+                                && !m.cancelled
+                                && !m.skipped
+                                && m.start.is_some_and(|s| s > from && s < start)
+                        })
+                    };
+                    let mut stricter = None;
+                    for t in ps
+                        .open_topics
+                        .iter()
+                        .filter(|t| t.from < start && !open_before(t.from))
+                    {
+                        text = page::insert_block(&text, &t.block);
+                        stricter = stricter.max(Some(t.publication));
+                    }
+                    for top in &tops {
+                        text = page::insert_block(&text, &page::topic_block(top));
+                    }
+                    let m = meeting(st, p, key);
+                    if stricter > Some(publication(p, m)) {
+                        m.publication = stricter;
+                    }
+                } else {
+                    for top in &tops {
+                        text = protocol::insert_top(&text, &protocol::top_line(top));
+                    }
                 }
+                let ps = &st.plenums[&p.key];
                 let parent = ps.protocols_doc_id.clone();
-                if p.topics.enabled {
-                    placed = self.due_for(st, p, key);
-                    text = self.with_topics(st, p, &placed, text);
-                }
                 info!(plenum = %p.key, meeting = %key, "Creating the protocol");
                 self.wiki
                     .create_doc(&doc_id, &collection, parent.as_deref(), &title, &text)
                     .await?
             }
         };
-        for n in placed {
-            if let Some(t) = st
-                .book
-                .plenums
-                .get_mut(&p.key)
-                .and_then(|a| a.topics.get_mut(&n))
-            {
-                t.placed = Some(key.to_owned());
-            }
-        }
         let ps = st.plenums.get_mut(&p.key).expect("set up");
         ps.pending_tops.clear();
         let m = ps.meetings.get_mut(key).expect("inserted");
         m.created = true;
         m.url = Some(doc.url);
-        info!(plenum = %p.key, meeting = %key, tops = pending.len(), "Protocol ready");
+        info!(plenum = %p.key, meeting = %key, tops = tops.len(), "Protocol ready");
         self.save(st).await?;
         Ok(())
+    }
+
+    /// A chat item into a page made already: a topic block on a page written in topics, an
+    /// agenda line on one of the old template. None: the page is gone.
+    async fn add_top_to(&self, doc_id: &str, top: &Top) -> Result<Option<()>> {
+        let Some(doc) = self.wiki.doc(doc_id).await? else {
+            return Ok(None);
+        };
+        if !page::has_topics(&doc.text) {
+            return self.add_lines(doc_id, &[protocol::top_line(top)]).await;
+        }
+        let block = page::topic_block(top);
+        // after a restart the same item is not added twice (its heading and its author)
+        let head: String = block.split("\n\n").take(2).collect::<Vec<_>>().join("\n\n");
+        if !protocol::contains_line(&doc.text, &head) {
+            self.add_block(&doc, &block).await?;
+        }
+        Ok(Some(()))
     }
 
     /// Agenda lines into a protocol people may be writing in: each in place of the marker
@@ -1013,58 +1256,36 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             .unwrap_or_default()
     }
 
+    /// The link message when the page is open; after a move or a return: a new one (`all`) or
+    /// the old one edited (`quiet`).
     async fn announce(&self, st: &mut State, p: &Plenum, key: &str) -> Result<()> {
         let m = meeting(st, p, key);
         if m.announce.done {
             return Ok(());
         }
-        let txn = m.announce.txn();
         let link = self.link_of(m);
-        let doc_id = m.doc_id.clone();
         let start = m.start.context("a meeting without a start")?;
-        let moved_from = m.moved_from;
         let shared = publication(p, m);
-        self.save(st).await?;
-        if p.topics.enabled {
-            // The agenda in it, and its event kept: it follows the agenda (topic_flow.rs).
-            let head = protocol::announcement(p, start, &link, 0, moved_from, shared);
-            let text = self.announcement_with_agenda(st, p, key, &head, shared);
-            let event = self
-                .chat
-                .post(&p.room, &text, &[], Place::Room, &txn)
-                .await?;
-            st.book
-                .plenums
-                .entry(p.key.clone())
-                .or_default()
-                .announcements
-                .insert(
-                    key.to_owned(),
-                    crate::topics::Posted {
-                        event,
-                        text,
-                        edits: 0,
-                        moved_from,
-                    },
-                );
+        let again = m.announce_again;
+        let text = protocol::announcement(p, start, &link, m.moved_from, shared);
+        let has_link = meeting(st, p, key).link.is_some();
+        if again && !sends(p.messages, Notice::Moved) && has_link {
+            self.edit_link(st, p, key, &text).await?;
         } else {
-            // The number of items is only known in the document now; count the list lines.
-            let tops = if shared == Publication::Confidential {
-                0
+            // quiet, but the link message is an older image's (not to be edited): the link anew
+            let notice = if again && sends(p.messages, Notice::Moved) {
+                Notice::Moved
             } else {
-                self.wiki
-                    .doc(&doc_id)
-                    .await?
-                    .map(|d| count_tops(&d.text))
-                    .unwrap_or(0)
+                Notice::Link
             };
-            self.chat
-                .send(
-                    &p.room,
-                    &protocol::announcement(p, start, &link, tops, moved_from, shared),
-                    &txn,
-                )
-                .await?;
+            let txn = meeting(st, p, key).announce.txn();
+            self.save(st).await?;
+            let event = self.chat.post(&p.room, &text, notice, &txn).await?;
+            meeting(st, p, key).link = Some(LinkMessage {
+                event,
+                text,
+                edits: 0,
+            });
         }
         let m = meeting(st, p, key);
         m.announce.done = true;
@@ -1079,6 +1300,11 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         if m.remind.done {
             return Ok(());
         }
+        if !sends(p.messages, Notice::Reminder) {
+            // left out counts as done: a switch to `all` later sends nothing stale
+            m.remind.done = true;
+            return self.save(st).await;
+        }
         let txn = m.remind.txn();
         let link = self.link_of(m);
         let start = m.start.context("a meeting without a start")?;
@@ -1088,6 +1314,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             .send(
                 &p.room,
                 &protocol::reminder(p, start, &link, started, shared),
+                Notice::Reminder,
                 &txn,
             )
             .await?;
@@ -1145,6 +1372,39 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             meeting(st, p, key).close.tasks_carried = true;
             self.save(st).await?;
         }
+        // the topics not reached wait for the next page (carry_topics_on puts them there)
+        let topics = page::topics(&doc.text);
+        if !meeting(st, p, key).close.topics_read {
+            let carried: Vec<page::Topic> = topics
+                .iter()
+                .filter(|t| t.reading.carried())
+                .cloned()
+                .collect();
+            self.keep_topics(st, p, &carried, start, &link, shared);
+            meeting(st, p, key).close.topics_read = true;
+            self.save(st).await?;
+        }
+        // the result box at the page's top, before the PDF; written, then seen at a later tick
+        // (an API edit can be lost in a race with a browser's save)
+        if !meeting(st, p, key).close.result_box {
+            let c = &mut meeting(st, p, key).close;
+            if page::has_box(&doc.text) || !doc.text.contains(page::RESULT_MARKER) {
+                c.result_box = true;
+            } else if c.box_attempts >= BOX_ATTEMPTS {
+                warn!(plenum = %p.key, meeting = %key, "The result box did not stay in the page; closed without it");
+                c.result_box = true;
+            } else {
+                c.box_attempts += 1;
+                self.save(st).await?;
+                let text = page::result_box(&outcome.decisions, &topics, &outcome.tasks);
+                self.wiki
+                    .patch(&doc_id, page::RESULT_MARKER, &format!("\n\n{text}\n\n"))
+                    .await?;
+                info!(plenum = %p.key, meeting = %key, "Result box written; the close goes on at the next tick");
+                return Ok(());
+            }
+            self.save(st).await?;
+        }
 
         // 1. the decisions into the plenum's list (found or created again)
         let mut decisions_link = None;
@@ -1181,6 +1441,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let c = &meeting(st, p, key).close;
         if self.pdf.post_to_room
             && shared == Publication::Full
+            && sends(p.messages, Notice::Pdf)
             && c.pdf_url.is_some()
             && !c.pdf_room.done
             && !c.pdf_room_failed
@@ -1210,7 +1471,9 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 PdfNote::Fine
             };
             self.save(st).await?;
-            if shared == Publication::Full {
+            if !sends(p.messages, Notice::Summary) {
+                // quiet: nothing after the meeting
+            } else if shared == Publication::Full {
                 let withheld = &st.plenums[&p.key].withheld_tasks;
                 let shown = protocol::Outcome {
                     decisions: outcome.decisions.clone(),
@@ -1224,11 +1487,13 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 // who a task or a decision mentions in the wiki is mentioned in the chat too
                 let (text, users) = protocol::for_matrix(&text, |name| self.account_of(name));
                 self.chat
-                    .send_mentioning(&p.room, &text, &users, &txn)
+                    .send_mentioning(&p.room, &text, &users, Notice::Summary, &txn)
                     .await?;
             } else {
                 let text = protocol::closed_note(p, start, &link, shared, note);
-                self.chat.send(&p.room, &text, &txn).await?;
+                self.chat
+                    .send(&p.room, &text, Notice::Summary, &txn)
+                    .await?;
             }
             meeting(st, p, key).close.summary.done = true;
         }
@@ -1346,7 +1611,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let text = protocol::without_withheld(&doc.text, &st.plenums[&p.key].withheld_tasks);
         let pdf = self.render_pdf(&text, title, now)?;
         self.chat
-            .send_file(&p.room, &format!("{title}.pdf"), pdf, &txn)
+            .send_file(&p.room, &format!("{title}.pdf"), pdf, Notice::Pdf, &txn)
             .await?;
         meeting(st, p, key).close.pdf_room.done = true;
         self.save(st).await?;
@@ -1424,22 +1689,6 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         now: DateTime<Utc>,
         scope: Scope,
     ) -> String {
-        self.command_from(room, sender, cmd, now, scope, &Origin::default())
-            .await
-    }
-
-    /// [`Self::command_in`] for a message `origin` says more about (its event, and whose
-    /// message a `!top` reply answers). An empty answer: nothing to say (a topic's message
-    /// was the answer).
-    pub async fn command_from(
-        &self,
-        room: &RoomId,
-        sender: &Sender,
-        cmd: Command,
-        now: DateTime<Utc>,
-        scope: Scope,
-        origin: &Origin,
-    ) -> String {
         const ORGANIZERS_ONLY: &str = "⛔ Only the organizers may do that here.";
         // the rooms' held removals: an admin in their direct chat with the bot only
         match (&cmd, scope) {
@@ -1457,49 +1706,18 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             Command::Help => help(),
             Command::Overview(key) => self.list(&mut st, room, key.as_deref(), now, scope),
             Command::Top { key, text } => match self.pick(room, key.as_deref()) {
-                Ok(base) => {
-                    let p = &self.effective(base, &st);
-                    if p.topics.enabled {
-                        self.new_topic(&mut st, p, sender, origin, &text, now).await
-                    } else {
-                        // as before topics: the item by the author of the message it answers
-                        let named = Sender {
-                            id: sender.id.clone(),
-                            name: origin.from.clone().unwrap_or_else(|| sender.name.clone()),
-                        };
-                        self.add_top(&mut st, p, &named, &text, now).await
-                    }
-                }
+                Ok(p) => self.add_top(&mut st, p, sender, &text, now).await,
                 Err(e) => e,
             },
-            Command::Topics(key) => match self.pick(room, key.as_deref()) {
-                Ok(base) => {
-                    let p = &self.effective(base, &st);
-                    if p.topics.enabled {
-                        self.topics_list(&mut st, p, now)
-                    } else {
-                        "Please add the topic: `!top <topic>`".to_owned()
-                    }
-                }
+            Command::Close(key) => match self.pick(room, key.as_deref()) {
+                Ok(p) if !self.may_organize(p, &sender.id) => ORGANIZERS_ONLY.to_owned(),
+                Ok(p) => self.request_close(&mut st, p, &sender.id, now),
                 Err(e) => e,
             },
-            Command::TopicAction {
-                key,
-                number,
-                action,
-            } => match self.pick(room, key.as_deref()) {
-                Ok(base) => {
-                    let p = &self.effective(base, &st);
-                    if p.topics.enabled {
-                        self.topic_action(&mut st, p, sender, number, action, now)
-                            .await
-                    } else {
-                        format!(
-                            "Topics are switched off for {} (`!plenum settings`); #{number} \
-                             waits until they are on again.",
-                            p.name
-                        )
-                    }
+            Command::Publish { key, mode, when } => match self.pick(room, key.as_deref()) {
+                Ok(p) => {
+                    self.set_publication(&mut st, p, &sender.id, mode, when, now)
+                        .await
                 }
                 Err(e) => e,
             },
@@ -1525,18 +1743,6 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                     Err(e) => e,
                 }
             }
-            Command::Close(key) => match self.pick(room, key.as_deref()) {
-                Ok(p) if !self.may_organize(p, &sender.id) => ORGANIZERS_ONLY.to_owned(),
-                Ok(p) => self.request_close(&mut st, p, &sender.id, now),
-                Err(e) => e,
-            },
-            Command::Publish { key, mode, when } => match self.pick(room, key.as_deref()) {
-                Ok(p) => {
-                    self.set_publication(&mut st, p, &sender.id, mode, when, now)
-                        .await
-                }
-                Err(e) => e,
-            },
             Command::Invalid(why) => why,
             Command::Members | Command::ConfirmRemovals { .. } => {
                 unreachable!("answered above")
@@ -1545,6 +1751,142 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         self.save_or_log(&st).await;
         drop(st);
         answer
+    }
+
+    /// The plenum a settings command is for: in its room by the key or alone, in an admin's
+    /// direct chat by its key.
+    fn pick_for_settings<'a>(
+        &'a self,
+        room: &RoomId,
+        key: Option<&str>,
+        scope: Scope,
+    ) -> Result<&'a Plenum, String> {
+        if scope == Scope::AdminDm && self.plenums_in(room).is_empty() {
+            return match key {
+                Some(k) => self
+                    .plenums
+                    .iter()
+                    .find(|p| p.key == k)
+                    .ok_or_else(|| format!("There is no plenum “{k}”.")),
+                None => Err("Which plenum? Add its key: `!plenum settings house`.".to_owned()),
+            };
+        }
+        self.pick(room, key)
+    }
+
+    fn key_hint(&self, p: &Plenum, room: &RoomId) -> String {
+        if self.plenums_in(room).len() == 1 && p.room == room {
+            String::new()
+        } else {
+            format!("{} ", p.key)
+        }
+    }
+
+    /// `!plenum settings`.
+    fn settings_text(&self, st: &State, p: &Plenum, user: &UserId, room: &RoomId) -> String {
+        let empty = plenum_settings::RoomSettings::default();
+        let own = st.settings.plenums.get(&p.key).unwrap_or(&empty);
+        plenum_settings::describe(p, own, self.may_organize(p, user), &self.key_hint(p, room))
+    }
+
+    /// `!plenum set <name> <value>` (`value` None: reset). The answer says what changed; a
+    /// change from somewhere else is said in the plenum's room too (with `messages all`).
+    #[allow(clippy::too_many_arguments)]
+    async fn change_setting(
+        &self,
+        st: &mut State,
+        p: &Plenum,
+        sender: &Sender,
+        room: &RoomId,
+        name: &str,
+        value: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> String {
+        if !plenum_settings::is_setting(name) {
+            return plenum_settings::normalize(name, "").unwrap_err();
+        }
+        if !self.may_organize(p, &sender.id) {
+            return "⛔ Only the plenum's organizers (or a bot admin) may change its settings."
+                .to_owned();
+        }
+        if let Some(why) = plenum_settings::refused(p) {
+            return why;
+        }
+        let value = match value {
+            Some(raw) => match plenum_settings::normalize(name, raw) {
+                Ok(v) => Some(v),
+                Err(why) => return why,
+            },
+            None => None,
+        };
+        let admin = self.admins.contains(&sender.id);
+        let own = st.settings.plenums.entry(p.key.clone()).or_default();
+        if !own.may_change(sender.id.as_str(), admin, now) {
+            return format!(
+                "⏳ That is enough changes for today ({} per person, {} per plenum); more tomorrow, please.",
+                plenum_settings::PER_PERSON_A_DAY,
+                plenum_settings::PER_PLENUM_A_DAY
+            );
+        }
+        let before_values = own.values.clone();
+        let before = plenum_settings::current(p, &own.values, name);
+        match &value {
+            Some(v) => {
+                own.values.insert(name.to_owned(), v.clone());
+            }
+            None => {
+                own.values.remove(name);
+            }
+        }
+        let after = plenum_settings::current(p, &own.values, name);
+        if before == after {
+            own.values = before_values;
+            return format!("`{name}` is **{after}** already.");
+        }
+        own.changes.push(plenum_settings::Change {
+            by: sender.name.clone(),
+            by_user: sender.id.to_string(),
+            name: name.to_owned(),
+            from: before.clone(),
+            to: after.clone(),
+            at: now,
+        });
+        if let Err(e) = self.save(st).await {
+            error!("{e:#}");
+            // undone: what is not saved must not seem changed
+            let own = st.settings.plenums.entry(p.key.clone()).or_default();
+            own.changes.pop();
+            own.values = before_values;
+            // settings.json may have been written before state.json failed
+            if let Err(e) = self.save(st).await {
+                error!("Undoing a setting that could not be saved: {e:#}");
+            }
+            return "⚠️ The setting could not be saved just now. Please try again.".to_owned();
+        }
+        info!(plenum = %p.key, setting = name, from = %before, to = %after, "Setting changed");
+        let said = format!(
+            "{}{}. `!plenum settings` shows them all.",
+            plenum_settings::change_text(p, &sender.name, name, &before, &after),
+            if value.is_none() {
+                " (the default again)"
+            } else {
+                ""
+            }
+        );
+        // changed elsewhere (an admin's direct chat): the room hears it, unless it is quiet
+        // (before the change or after it)
+        let now_p = self.effective(st, p);
+        let was_p = plenum_settings::apply(p, &before_values);
+        if room != p.room
+            && sends(now_p.messages, Notice::Setting)
+            && sends(was_p.messages, Notice::Setting)
+        {
+            let txn = format!("plenum-setting-{}", uuid::Uuid::new_v4());
+            if let Err(e) = self.chat.send(&p.room, &said, Notice::Setting, &txn).await {
+                warn!(plenum = %p.key, "Telling the room about a setting: {e:#}");
+            }
+        }
+        said
     }
 
     /// The next meeting that is not closed yet, from now on (one that runs counts).
@@ -1677,14 +2019,10 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             }
             match st.plenums[&p.key].pending_tops.len() {
                 0 => {}
-                1 => line.push_str("\n1 item waits for the next minutes."),
-                n => line.push_str(&format!("\n{n} items wait for the next minutes.")),
-            }
-            let open = st.book.plenums.get(&p.key).map_or(0, |a| a.open().count());
-            match open {
-                0 => {}
-                1 => line.push_str("\n1 open topic (`!top` lists it)."),
-                n => line.push_str(&format!("\n{n} open topics (`!top` lists them).")),
+                1 => line.push_str("\n1 topic from the chat waits for the next page."),
+                n => line.push_str(&format!(
+                    "\n{n} topics from the chat wait for the next page."
+                )),
             }
             out.push(line);
         }
@@ -1704,7 +2042,6 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             by: sender.name.clone(),
             at: now,
         };
-        let line = protocol::top_line(&top);
         // The open protocol of the next meeting, if it exists already.
         let target = self.next_meeting(st, p, now).and_then(|(id, _)| {
             st.plenums[&p.key]
@@ -1727,19 +2064,19 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 .push(top);
             return match self.next_meeting(st, p, now) {
                 Some((_, start)) => format!(
-                    "📝 Noted for {} on {}. The item goes into the minutes as soon as they are made.",
+                    "📝 Noted for {} on {}. The topic goes onto its page as soon as the page is open.",
                     p.name,
                     schedule::describe_meeting(start)
                 ),
-                None => format!("📝 Noted. {} has no meeting in the calendar yet; the item goes into the next minutes.", p.name),
+                None => format!("📝 Noted. {} has no meeting in the calendar yet; the topic goes onto the next page.", p.name),
             };
         };
-        match self.add_lines(&doc_id, std::slice::from_ref(&line)).await {
+        match self.add_top_to(&doc_id, &top).await {
             Ok(Some(())) => {
                 info!(plenum = %p.key, meeting = %key, "Agenda item added");
                 match link {
-                    Some(link) => format!("✅ On the agenda: {link}"),
-                    None => "✅ On the agenda. The minutes are confidential: they are in the \
+                    Some(link) => format!("✅ On the page: {link}"),
+                    None => "✅ On the page. The meeting is confidential: its page is in the \
                              wiki, not here."
                         .to_owned(),
                 }
@@ -1775,8 +2112,13 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
         let start = meeting(st, p, &key).start;
         meeting(st, p, &key).close.requested = true;
+        let here = if sends(self.effective(st, p).messages, Notice::Summary) {
+            ", a summary here"
+        } else {
+            ""
+        };
         format!(
-            "👍 The minutes of {} are closed in a moment: the decisions into the list, the PDF, a summary.",
+            "👍 The page of {} is closed in a moment: its result at the top, the decisions into the list, the PDF{here}.",
             start.map(schedule::describe_meeting).unwrap_or_default()
         )
     }
@@ -1931,6 +2273,11 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         );
         if posted && mode == Publication::Confidential {
             answer.push_str(" The link to them is in the chat already (the announcement).");
+        }
+        if !sends(self.effective(st, p).messages, Notice::Summary) {
+            answer.push_str(
+                " (This plenum is quiet: only the link to each new page comes here anyway.)",
+            );
         }
         answer
     }
@@ -2957,49 +3304,24 @@ fn choose_message(
     )
 }
 
-/// Agenda lines in a protocol: list items between the agenda heading and the next heading.
-fn count_tops(markdown: &str) -> usize {
-    let mut inside = false;
-    let mut n = 0;
-    for line in markdown.lines() {
-        let t = line.trim_start();
-        if t.starts_with('#') {
-            inside = protocol::is_agenda_heading(t);
-            continue;
-        }
-        if inside
-            && (t.starts_with("* ")
-                || t.starts_with("- ")
-                || t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains(". "))
-        {
-            n += 1;
-        }
-    }
-    n
-}
-
 pub fn help() -> String {
     "📋 **Plenum bot**\n\n\
-     `!top <topic>`: bring in a topic (or reply to a message with `!top`). Start with \
-     `decide:` for one to decide; a line `Proposal: …` is your proposal.\n\
-     Under the topic's message: tap 👍 to hear what came of it; reply in its thread to \
-     discuss it.\n\
-     `!top`: the topics so far\n\
-     `!top #12 withdraw|later|done|again|decide|talk` (also zurückziehen, später, erledigt, \
-     nochmal, entscheiden, besprechen): change your topic (its author, the plenum's \
-     organizers, the bot admins)\n\
-     `!plenum`: the next plenum and its minutes\n\
-     `!plenum settings`: this plenum's settings (`!plenum set <name> <value>`, \
+     Each meeting has a page in the wiki: its topics, prepared there, and its minutes. Add a \
+     topic as a heading under \"Topics\"; at the plenum its result goes after \"Result:\", \
+     a decision as a line starting with \"Decision:\". A topic whose result stays empty \
+     comes onto the next page.\n\n\
+     `!plenum`: the next plenum and its page\n\
+     `!top <topic>`: a topic onto the next page (the next lines: what it is about); or reply \
+     to a message with `!top`\n\
+     `!plenum settings`: what the bot posts here and when (`!plenum set <name> <value>`, \
      `!plenum reset <name>`)\n\
-     `!minutes done`: close the minutes now (decisions, PDF, summary)\n\
-     `!minutes confidential|link|full`: nothing of the minutes in the chat, only the link, or \
-     the summary (as usual), for the meeting that is on or comes next; another one by its \
-     day: `!minutes link 14.11.`\n\n\
+     `!minutes done`: close the page now (result, decisions, PDF)\n\
+     `!minutes confidential`, `!minutes link`, `!minutes full`: nothing from the page in the \
+     chat, only the link, or the summary, for the meeting that is on or comes next; for \
+     another add its day: `!minutes confidential 14.11.`\n\n\
      The meetings are in the plenum's Nextcloud calendar: add, move or cancel them there, or \
-     make a series; the bot follows it. Several plenums in one room: add the key, \
-     `!top kitchen-floor-1 dishwasher`.\n\
-     In the minutes: write under each topic's heading (`### #12 …`); a line starting with \
-     \"Decision:\" is a decision (it goes into the list of decisions after the plenum)."
+     make a series; the bot follows it. With several plenums in a room, add the key: \
+     `!top kitchen-floor-1 dishwasher`."
         .to_owned()
 }
 
@@ -3223,32 +3545,33 @@ pub(crate) mod fakes {
         pub dms: StdMutex<Vec<(String, String, String)>>,
         /// (alias, room)
         pub aliases: StdMutex<Vec<(String, String)>>,
-        /// (room, text, users, place, txn, event) of every post
-        pub posts: StdMutex<Vec<Post>>,
-        /// (room, event, text) of every edit
-        pub edits: StdMutex<Vec<(String, String, String)>>,
-        /// (room, event, key) of the bot's reactions
-        pub reacted: StdMutex<Vec<(String, String, String)>>,
-        /// the reactions under an event: (who, key)
-        pub reactions: StdMutex<HashMap<String, Vec<(String, String)>>>,
-        /// the transaction IDs of the edits (a resend is dropped, as by a homeserver)
-        pub edit_txns: StdMutex<Vec<String>>,
-        /// posts into threads fail (the rest works)
-        pub fail_threads: StdMutex<bool>,
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct Post {
-        pub room: String,
-        pub text: String,
-        pub users: Vec<String>,
-        /// "room", "reply:<event>", "thread:<event>"
-        pub place: String,
-        pub txn: String,
-        pub event: String,
+        /// What each message into a room was (by transaction ID), files too.
+        pub notices: StdMutex<Vec<(String, Notice)>>,
+        /// (room, event, text, txn) of each edit (a resend of a txn is dropped).
+        pub edits: StdMutex<Vec<(String, String, String, String)>>,
     }
 
     impl FakeChat {
+        /// The kinds of message that went into rooms, in order.
+        pub fn kinds(&self) -> Vec<Notice> {
+            self.notices
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, n)| *n)
+                .collect()
+        }
+
+        /// The text an event shows now (its last edit).
+        pub fn shown(&self, event: &str) -> Option<String> {
+            let edits = self.edits.lock().unwrap();
+            if let Some((_, _, t, _)) = edits.iter().rev().find(|(_, e, _, _)| e == event) {
+                return Some(t.clone());
+            }
+            let n: usize = event.strip_prefix("$ev-")?.parse().ok()?;
+            self.sent.lock().unwrap().get(n).map(|(_, t, _)| t.clone())
+        }
+
         pub fn texts(&self) -> Vec<String> {
             self.sent
                 .lock()
@@ -3260,14 +3583,49 @@ pub(crate) mod fakes {
     }
 
     impl Chat for FakeChat {
-        async fn send(&self, room: &RoomId, markdown: &str, txn: &str) -> Result<()> {
+        async fn send(
+            &self,
+            room: &RoomId,
+            markdown: &str,
+            notice: Notice,
+            txn: &str,
+        ) -> Result<()> {
+            self.post(room, markdown, notice, txn).await.map(|_| ())
+        }
+        async fn post(
+            &self,
+            room: &RoomId,
+            markdown: &str,
+            notice: Notice,
+            txn: &str,
+        ) -> Result<String> {
             if *self.fail.lock().unwrap() {
                 anyhow::bail!("matrix down");
             }
             let mut sent = self.sent.lock().unwrap();
             // like a homeserver: a resend with the same transaction ID is dropped
-            if !sent.iter().any(|(_, _, t)| t == txn) {
-                sent.push((room.to_string(), markdown.to_owned(), txn.to_owned()));
+            let i = match sent.iter().position(|(_, _, t)| t == txn) {
+                Some(i) => i,
+                None => {
+                    sent.push((room.to_string(), markdown.to_owned(), txn.to_owned()));
+                    self.notices.lock().unwrap().push((txn.to_owned(), notice));
+                    sent.len() - 1
+                }
+            };
+            Ok(format!("$ev-{i}"))
+        }
+        async fn edit(&self, room: &RoomId, event: &str, markdown: &str, txn: &str) -> Result<()> {
+            if *self.fail.lock().unwrap() {
+                anyhow::bail!("matrix down");
+            }
+            let mut edits = self.edits.lock().unwrap();
+            if !edits.iter().any(|(_, _, _, t)| t == txn) {
+                edits.push((
+                    room.to_string(),
+                    event.to_owned(),
+                    markdown.to_owned(),
+                    txn.to_owned(),
+                ));
             }
             Ok(())
         }
@@ -3276,9 +3634,10 @@ pub(crate) mod fakes {
             room: &RoomId,
             markdown: &str,
             users: &[OwnedUserId],
+            notice: Notice,
             txn: &str,
         ) -> Result<()> {
-            self.send(room, markdown, txn).await?;
+            self.send(room, markdown, notice, txn).await?;
             if !users.is_empty() {
                 self.pinged.lock().unwrap().push((
                     txn.to_owned(),
@@ -3292,11 +3651,13 @@ pub(crate) mod fakes {
             room: &RoomId,
             name: &str,
             bytes: Vec<u8>,
-            _txn: &str,
+            notice: Notice,
+            txn: &str,
         ) -> Result<()> {
             if *self.fail.lock().unwrap() || *self.fail_files.lock().unwrap() {
                 anyhow::bail!("matrix down");
             }
+            self.notices.lock().unwrap().push((txn.to_owned(), notice));
             self.files
                 .lock()
                 .unwrap()
@@ -3390,97 +3751,6 @@ pub(crate) mod fakes {
                 .context("M_NOT_FOUND")?;
             Ok(room.as_str().try_into()?)
         }
-        async fn post(
-            &self,
-            room: &RoomId,
-            markdown: &str,
-            users: &[OwnedUserId],
-            place: Place<'_>,
-            txn: &str,
-        ) -> Result<String> {
-            if *self.fail.lock().unwrap()
-                || (*self.fail_threads.lock().unwrap() && matches!(place, Place::Thread(_)))
-            {
-                anyhow::bail!("matrix down");
-            }
-            let mut posts = self.posts.lock().unwrap();
-            // like a homeserver: a resend with the same transaction ID is the same event
-            if let Some(p) = posts.iter().find(|p| p.txn == txn) {
-                return Ok(p.event.clone());
-            }
-            let event = format!("$ev{}", posts.len() + 1);
-            posts.push(Post {
-                room: room.to_string(),
-                text: markdown.to_owned(),
-                users: users.iter().map(|u| u.to_string()).collect(),
-                place: match place {
-                    Place::Room => "room".to_owned(),
-                    Place::ReplyTo(e) => format!("reply:{e}"),
-                    Place::Thread(e) => format!("thread:{e}"),
-                },
-                txn: txn.to_owned(),
-                event: event.clone(),
-            });
-            drop(posts);
-            self.sent
-                .lock()
-                .unwrap()
-                .push((room.to_string(), markdown.to_owned(), txn.to_owned()));
-            Ok(event)
-        }
-        async fn edit(
-            &self,
-            room: &RoomId,
-            event: &str,
-            markdown: &str,
-            _users: &[OwnedUserId],
-            txn: &str,
-        ) -> Result<()> {
-            if *self.fail.lock().unwrap() {
-                anyhow::bail!("matrix down");
-            }
-            let mut seen = self.edit_txns.lock().unwrap();
-            if seen.iter().any(|t| t == txn) {
-                return Ok(()); // the homeserver drops it
-            }
-            seen.push(txn.to_owned());
-            self.edits.lock().unwrap().push((
-                room.to_string(),
-                event.to_owned(),
-                markdown.to_owned(),
-            ));
-            Ok(())
-        }
-        async fn react(&self, room: &RoomId, event: &str, key: &str, _txn: &str) -> Result<()> {
-            if *self.fail.lock().unwrap() {
-                anyhow::bail!("matrix down");
-            }
-            self.reacted
-                .lock()
-                .unwrap()
-                .push((room.to_string(), event.to_owned(), key.to_owned()));
-            Ok(())
-        }
-        async fn reactions(
-            &self,
-            _room: &RoomId,
-            event: &str,
-        ) -> Result<Vec<(OwnedUserId, String)>> {
-            if *self.fail.lock().unwrap() {
-                anyhow::bail!("matrix down");
-            }
-            Ok(self
-                .reactions
-                .lock()
-                .unwrap()
-                .get(event)
-                .map(|list| {
-                    list.iter()
-                        .filter_map(|(u, k)| Some((u.as_str().try_into().ok()?, k.clone())))
-                        .collect()
-                })
-                .unwrap_or_default())
-        }
     }
 }
 
@@ -3507,10 +3777,8 @@ mod tests {
             require_group: None,
             access: Access::House,
             publication: Publication::Full,
-            topics: crate::config::TopicRules {
-                enabled: false,
-                ..Default::default()
-            },
+            messages: crate::config::Messages::All,
+            room_settings: true,
         }
     }
 
@@ -3639,7 +3907,12 @@ mod tests {
             .wiki
             .by_title("House plenum 2026-11-01")
             .expect("protocol");
-        assert!(doc.text.contains("* Müll (Anna)"), "{}", doc.text);
+        assert!(
+            doc.text
+                .contains("### Müll\n\n**From:** Anna (from the chat)\n\n**Result:**"),
+            "{}",
+            doc.text
+        );
         assert!(e.wiki.by_title("House plenum: Template").is_some());
         assert!(e.wiki.by_title("House plenum: Decisions").is_some());
         let texts = e.chat.texts();
@@ -3649,42 +3922,64 @@ mod tests {
             "{}",
             texts[0]
         );
-        assert!(texts[0].contains("1 item from the chat"));
+        assert_eq!(e.chat.kinds(), [Notice::Link]);
 
         // Ticks change nothing more; a second item goes straight into the document.
         e.tick(at(2026, 10, 29, 19, 1)).await;
         assert_eq!(e.chat.texts().len(), 1);
         let a = e
-            .command(&room(), &anna(), cmd("!top Kaffee"), at(2026, 10, 30, 9, 0))
+            .command(
+                &room(),
+                &anna(),
+                cmd("!top Kaffee\nWe need a new machine."),
+                at(2026, 10, 30, 9, 0),
+            )
             .await;
-        assert!(a.contains("On the agenda"), "{a}");
+        assert!(a.contains("On the page"), "{a}");
         let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
-        // In place of the marker, which stays below it for the next one.
-        let marker = protocol::TOP_MARKER;
+        // above the marker, which stays below it for the next one
+        let marker = page::TOPIC_MARKER;
         assert!(
-            doc.text
-                .contains(&format!("* Müll (Anna)\n* Kaffee (Anna)\n\n{marker}"))
-                || doc.text.contains(&format!("* Kaffee (Anna)\n\n{marker}")),
+            doc.text.contains(&format!(
+                "### Kaffee\n\n**From:** Anna (from the chat)\n\nWe need a new machine.\n\n**Result:**\n\n{marker}"
+            )),
             "{}",
             doc.text
         );
+        let titles: Vec<String> = page::topics(&doc.text).iter().map(|t| t.title()).collect();
+        assert_eq!(titles, ["Müll", "Kaffee"]);
 
         e.tick(at(2026, 11, 1, 18, 30)).await; // the reminder
         assert!(e.chat.texts()[1].contains("starts at 19:00"));
 
-        // During the meeting: decisions are written.
+        // During the meeting: a result for Müll, Kaffee not reached, a task.
         {
             let mut docs = e.wiki.docs.lock().unwrap();
             let (d, _) = docs
                 .iter_mut()
                 .find(|(d, _)| d.title == "House plenum 2026-11-01")
                 .unwrap();
-            d.text
-                .push_str("\nDecision: Kompost kommt.\n- [ ] Ben: Tonne kaufen\n");
+            d.text = d.text.replacen(
+                "**Result:**",
+                "**Result:** talked\n\nDecision: Kompost kommt.",
+                1,
+            );
+            d.text.push_str("\n- [ ] Ben: Tonne kaufen\n");
         }
         e.tick(at(2026, 11, 1, 21, 0)).await; // just ended: not closed yet
         assert_eq!(e.chat.texts().len(), 2);
-        e.tick(at(2026, 11, 2, 9, 0)).await; // 12 h after the end: closed
+        e.tick(at(2026, 11, 2, 9, 0)).await; // 12 h after the end: the result box goes in
+        assert_eq!(e.chat.texts().len(), 2);
+        let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
+        assert!(doc.text.contains("✅ Müll: Kompost kommt."), "{}", doc.text);
+        assert!(
+            doc.text
+                .contains("- ⏭️ On the next page: Kaffee (not reached)"),
+            "{}",
+            doc.text
+        );
+        assert!(!doc.text.contains(page::RESULT_MARKER));
+        e.tick(at(2026, 11, 2, 9, 1)).await; // seen there: closed
         let texts = e.chat.texts();
         assert_eq!(texts.len(), 3, "{texts:?}");
         assert!(texts[2].contains("- Kompost kommt."), "{}", texts[2]);
@@ -3707,6 +4002,25 @@ mod tests {
             decisions.text,
             e.wiki.by_title("House plenum: Decisions").unwrap().text
         );
+        // The topic not reached is on the next page once it opens, with where it comes from.
+        e.tick(at(2026, 12, 3, 19, 0)).await;
+        let next = e
+            .wiki
+            .by_title("House plenum 2026-12-06")
+            .expect("next page");
+        assert!(
+            next.text
+                .contains("### Kaffee\n\n*Carried over from the [plenum on "),
+            "{}",
+            next.text
+        );
+        assert!(next.text.contains("We need a new machine."));
+        assert!(!next.text.contains("### Müll"));
+        assert!(next.text.contains("- [ ] Ben: Tonne kaufen"));
+        e.tick(at(2026, 12, 3, 19, 1)).await; // seen there: no longer waiting
+        assert!(e.state.lock().await.plenums["house"].open_topics.is_empty());
+        let next2 = e.wiki.by_title("House plenum 2026-12-06").unwrap();
+        assert_eq!(next2.text.matches("### Kaffee").count(), 1);
     }
 
     #[tokio::test]
@@ -3803,8 +4117,9 @@ mod tests {
                 at(2026, 11, 1, 20, 0),
             )
             .await;
-        assert!(a.contains("are closed in a moment"), "{a}");
+        assert!(a.contains("is closed in a moment"), "{a}");
         e.tick(at(2026, 11, 1, 20, 1)).await;
+        e.tick(at(2026, 11, 1, 20, 2)).await;
         assert!(e.chat.texts().last().unwrap().contains("are closed:"));
 
         // The December meeting passes while the bot is down: skipped, not prepared late.
@@ -3848,9 +4163,10 @@ mod tests {
         assert_eq!(e.chat.texts().len(), 1, "announced once");
 
         // announced, then cancelled: said once, the protocol stays
-        e.tick(at(2026, 12, 3, 19, 0)).await; // 6.12. announced (and the 4.11. closed)
+        e.tick(at(2026, 12, 3, 19, 0)).await; // 6.12. announced (and the 4.11. closing)
+        e.tick(at(2026, 12, 3, 19, 1)).await;
         let before = e.chat.texts().len();
-        assert!(e.chat.texts().last().unwrap().contains("6 December 2026"));
+        assert!(e.chat.texts().iter().any(|t| t.contains("6 December 2026")));
         calendar(
             e,
             "house",
@@ -3867,7 +4183,11 @@ mod tests {
             last.contains("cancelled") && last.contains("6 December 2026"),
             "{last}"
         );
-        assert!(e.wiki.by_title("House plenum 2026-12-06").is_some());
+        // the page stays, its title says it
+        assert!(e
+            .wiki
+            .by_title("House plenum 2026-12-06 (cancelled)")
+            .is_some());
         e.tick(at(2026, 12, 6, 18, 30)).await; // no reminder for it
         assert_eq!(e.chat.texts().len(), before + 1);
 
@@ -3901,7 +4221,7 @@ mod tests {
         let texts = e.chat.texts();
         assert_eq!(texts.len(), 3, "{texts:?}");
         assert!(
-            texts[2].starts_with("📋 **House plenum** on Sunday, 1 November"),
+            texts[2].starts_with("📝 **House plenum** on Sunday, 1 November"),
             "{}",
             texts[2]
         );
@@ -4038,7 +4358,7 @@ mod tests {
                 at(2026, 10, 30, 9, 0),
             )
             .await;
-        assert!(a.contains("On the agenda"), "{a}");
+        assert!(a.contains("On the page"), "{a}");
         let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
         assert!(
             doc.text.contains("* Variante [x] Hof oder [ ] Keller"),
@@ -4047,7 +4367,7 @@ mod tests {
         );
         assert!(
             doc.text
-                .contains("* Item: Decision: Kasse an Anna ( ) sofort (Anna)"),
+                .contains("### Decision: Kasse an Anna \\[ \\] sofort\n\n**From:** Anna"),
             "{}",
             doc.text
         );
@@ -4059,11 +4379,45 @@ mod tests {
                 at(2026, 11, 1, 21, 5),
             )
             .await;
-        assert!(a.contains("closed in a moment"), "{a}");
+        assert!(a.contains("is closed in a moment"), "{a}");
         e.tick(at(2026, 11, 1, 21, 6)).await;
+        e.tick(at(2026, 11, 1, 21, 7)).await;
         let summary = e.chat.texts().last().unwrap().clone();
         assert!(summary.contains("No decisions"), "{summary}");
         assert!(!summary.contains("Kasse"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn a_page_of_the_old_template_gets_agenda_lines() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        // as the pages made before 2026-11-07 are
+        edit_doc(e, "House plenum 2026-11-01", |t| {
+            *t = format!(
+                "## Agenda\n\n* Hof (Ben)\n\n{}\n\n## Minutes\n",
+                protocol::TOP_MARKER
+            )
+        });
+        let a = e
+            .command(
+                &room(),
+                &anna(),
+                cmd("!top Decision: Kasse an Anna [ ] sofort"),
+                at(2026, 10, 30, 9, 0),
+            )
+            .await;
+        assert!(a.contains("On the page"), "{a}");
+        let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
+        assert!(
+            doc.text.contains(&format!(
+                "* Item: Decision: Kasse an Anna ( ) sofort (Anna)\n\n{}",
+                protocol::TOP_MARKER
+            )),
+            "{}",
+            doc.text
+        );
+        assert!(protocol::extract(&doc.text).decisions.is_empty());
     }
 
     #[tokio::test]
@@ -4072,19 +4426,39 @@ mod tests {
         let e = &t.engine;
         e.tick(at(2026, 10, 29, 19, 0)).await;
         edit_doc(e, "House plenum 2026-11-01", |t| {
-            *t = t.replace(protocol::TOP_MARKER, "")
+            *t = t.replace(page::TOPIC_MARKER, "")
         });
         for item in ["!top Garten", "!top Keller"] {
             e.command(&room(), &anna(), cmd(item), at(2026, 10, 30, 9, 0))
                 .await;
         }
+        // without the marker: at the end of the topics, so they are read as topics
+        let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
+        let titles: Vec<String> = page::topics(&doc.text).iter().map(|t| t.title()).collect();
+        assert_eq!(titles, ["Garten", "Keller"], "{}", doc.text);
+        // and on a page without topics at all, under a heading of their own at the end
+        edit_doc(e, "House plenum 2026-11-01", |t| {
+            *t = "Notes only.\n".to_owned()
+        });
+        e.command(&room(), &anna(), cmd("!top Dach"), at(2026, 10, 30, 9, 0))
+            .await;
         let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
         assert!(
             doc.text
-                .ends_with("## New items from the chat\n\n* Garten (Anna)\n\n* Keller (Anna)"),
+                .ends_with("## New items from the chat\n\n* Dach (Anna)"),
             "{}",
             doc.text
         );
+        edit_doc(e, "House plenum 2026-11-01", |t| {
+            *t = protocol::render_template(
+                protocol::DEFAULT_TEMPLATE,
+                &e.plenums[0],
+                "2026-11-01 19:00".parse().unwrap(),
+                &[],
+            )
+        });
+        e.command(&room(), &anna(), cmd("!top Garten"), at(2026, 10, 30, 9, 0))
+            .await;
         // Sent again (a lost answer, a second try): not twice.
         e.command(&room(), &anna(), cmd("!top Garten"), at(2026, 10, 30, 9, 1))
             .await;
@@ -4102,6 +4476,7 @@ mod tests {
             t.push_str("\nDecision: Kompost.\n")
         });
         e.tick(at(2026, 11, 2, 9, 0)).await;
+        e.tick(at(2026, 11, 2, 9, 1)).await;
         let list = e
             .wiki
             .by_title("House plenum: Decisions")
@@ -4149,7 +4524,8 @@ mod tests {
         }
         e.tick(at(2026, 10, 29, 19, 0)).await;
         *e.chat.fail_files.lock().unwrap() = true;
-        for minute in 0..PDF_ATTEMPTS {
+        // one tick for the result box, then the PDF's attempts
+        for minute in 0..=PDF_ATTEMPTS {
             e.tick(at(2026, 11, 2, 9, minute)).await;
         }
         let summary = e.chat.texts().last().unwrap().clone();
@@ -4174,6 +4550,9 @@ mod tests {
         )
         .await;
         e.tick(at(2026, 10, 29, 19, 0)).await;
+        // the evening's page opens a day before, though the noon meeting's is still open
+        assert!(e.wiki.by_title("House plenum 2026-11-01 19:00").is_none());
+        e.tick(at(2026, 10, 31, 19, 0)).await;
         let titles: Vec<String> = e
             .wiki
             .docs
@@ -4204,6 +4583,7 @@ mod tests {
         )
         .await;
         e.tick(at(2026, 10, 29, 19, 0)).await;
+        e.tick(at(2026, 10, 31, 19, 0)).await; // the evening's page a day before
         edit_doc(e, "House plenum 2026-11-01", |t| {
             t.push_str("\nDecision: noon decides.\n- [ ] Ann: noon task\n")
         });
@@ -4223,7 +4603,9 @@ mod tests {
         )
         .await;
         e.tick(at(2026, 11, 1, 19, 31)).await;
+        e.tick(at(2026, 11, 1, 19, 32)).await;
         e.tick(at(2026, 11, 2, 9, 0)).await;
+        e.tick(at(2026, 11, 2, 9, 1)).await;
         let st = e.state.lock().await;
         let ps = &st.plenums["house"];
         let decisions: Vec<&str> = ps.decisions.iter().map(|d| d.text.as_str()).collect();
@@ -4420,7 +4802,7 @@ mod tests {
         let a = e
             .command(&room(), &ben, cmd("!minutes done"), at(2026, 11, 1, 20, 0))
             .await;
-        assert!(a.contains("are closed in a moment"), "{a}");
+        assert!(a.contains("is closed in a moment"), "{a}");
     }
 
     #[tokio::test]
@@ -4433,12 +4815,6 @@ mod tests {
             texts.last().unwrap().contains("started at 19:00"),
             "{texts:?}"
         );
-    }
-
-    #[test]
-    fn agenda_items_are_counted_in_their_section() {
-        let md = "## Agenda\n\n* a\n* b\n1. c\n\n## Minutes\n\n* not\n";
-        assert_eq!(count_tops(md), 3);
     }
 
     fn kitchen() -> Plenum {
@@ -4629,7 +5005,8 @@ mod tests {
                  - [ ] @[Anna](mention://m2/user/u2): Liste\n",
             );
         }
-        e.tick(at(2026, 11, 2, 9, 0)).await; // closed
+        e.tick(at(2026, 11, 2, 9, 0)).await; // the result box
+        e.tick(at(2026, 11, 2, 9, 1)).await; // closed
         let summary = e
             .chat
             .texts()
@@ -6443,14 +6820,11 @@ mod tests {
 
         e.tick(at(2026, 10, 29, 19, 0)).await; // prepared and announced
         let doc = e.wiki.by_title("House plenum 2026-11-01").expect("made");
-        assert!(doc.text.contains("* Müll (Anna)"), "chat items still go in");
+        assert!(doc.text.contains("### Müll"), "chat items still go in");
         let a = e
             .command(&room(), &anna(), cmd("!top Kaffee"), at(2026, 10, 30, 9, 0))
             .await;
-        assert!(
-            a.contains("On the agenda") && !a.contains("wiki.test"),
-            "{a}"
-        );
+        assert!(a.contains("On the page") && !a.contains("wiki.test"), "{a}");
         let a = e
             .command(&room(), &anna(), cmd("!plenum"), at(2026, 10, 30, 9, 0))
             .await;
@@ -6462,9 +6836,13 @@ mod tests {
         edit_doc(e, "House plenum 2026-11-01", |t| {
             t.push_str(
                 "\nDecision: Kompost kommt.\n- [ ] @[Ben Berg](mention://m1/user/u1): Tonne kaufen\n",
-            )
+            );
+            // both topics were dealt with (a topic carried on would make December
+            // confidential too: a_topic_from_a_confidential_meeting_keeps_the_next_one_quiet)
+            *t = t.replace("**Result:**", "**Result:** done");
         });
-        e.tick(at(2026, 11, 2, 9, 0)).await; // closed
+        e.tick(at(2026, 11, 2, 9, 0)).await; // the result box (in the wiki only)
+        e.tick(at(2026, 11, 2, 9, 1)).await; // closed
 
         let texts = e.chat.texts();
         assert_eq!(texts.len(), 3, "announcement, reminder, closed: {texts:?}");
@@ -6500,6 +6878,7 @@ mod tests {
             t.push_str("\n- [ ] Cara: Liste schreiben\n")
         });
         e.tick(at(2026, 12, 7, 9, 0)).await;
+        e.tick(at(2026, 12, 7, 9, 1)).await;
         let summary = e.chat.texts().last().unwrap().clone();
         assert!(summary.contains("- Cara: Liste schreiben"), "{summary}");
         assert!(!summary.contains("Tonne"), "{summary}");
@@ -6517,7 +6896,7 @@ mod tests {
         let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
         let e = &t.engine;
         e.tick(at(2026, 10, 29, 19, 0)).await; // announced in full, as before
-        assert!(e.chat.texts()[0].contains("After the meeting a summary comes here"));
+        assert!(e.chat.texts()[0].contains("the page for its topics and minutes is open"));
         let a = e
             .command(
                 &room(),
@@ -6532,6 +6911,7 @@ mod tests {
         });
         e.tick(at(2026, 11, 1, 18, 30)).await;
         e.tick(at(2026, 11, 2, 9, 0)).await;
+        e.tick(at(2026, 11, 2, 9, 1)).await;
         let texts = e.chat.texts();
         assert_eq!(texts.len(), 3, "{texts:?}");
         let link = "https://wiki.test/doc/house-plenum-2026-11-01";
@@ -6713,6 +7093,7 @@ mod tests {
         // November is shared as always.
         e.tick(at(2026, 10, 29, 19, 0)).await;
         e.tick(at(2026, 11, 2, 9, 0)).await;
+        e.tick(at(2026, 11, 2, 9, 1)).await;
         assert!(e.chat.texts()[0].contains("wiki.test"));
         let a = say("!minutes confidential 1.11.", at(2026, 11, 2, 10, 0)).await;
         assert!(a.contains("closed already"), "{a}");
@@ -6730,6 +7111,8 @@ mod tests {
         )
         .await;
         e.tick(at(2026, 12, 4, 19, 0)).await;
+        // its page opens once the extra meeting on the 6th is over, or a day before
+        e.tick(at(2026, 12, 6, 19, 0)).await;
         let texts = e.chat.texts();
         let december: Vec<&String> = texts
             .iter()
@@ -6739,8 +7122,414 @@ mod tests {
         assert!(december[0].starts_with("🔒") && !december[0].contains("wiki.test"));
         let extra: Vec<&String> = texts.iter().filter(|t| t.contains("10:00")).collect();
         assert!(
-            extra.iter().all(|t| t.contains("only the link")),
+            extra
+                .iter()
+                .all(|t| !t.contains("Decisions") && !t.contains("summary")),
             "{extra:?}"
+        );
+    }
+
+    // ── Plenum pages (docs/PLENUM-PAGES.md) ─────────────────────────────────────
+
+    fn admin() -> Sender {
+        Sender {
+            id: "@admin:x".try_into().unwrap(),
+            name: "Admin".into(),
+        }
+    }
+
+    fn quiet() -> Plenum {
+        let mut p = plenum("house", "House plenum", "!house:x");
+        p.messages = Messages::Quiet;
+        p
+    }
+
+    /// The link message of a meeting, as the room shows it now.
+    async fn link_shown(e: &Engine<FakeWiki, FakeChat>, id: &str) -> String {
+        let event = e.state.lock().await.plenums["house"].meetings[id]
+            .link
+            .clone()
+            .expect("a link message")
+            .event;
+        e.chat.shown(&event).unwrap()
+    }
+
+    #[tokio::test]
+    async fn quiet_posts_only_the_link_and_edits_it() {
+        let t = setup(vec![quiet()]);
+        let e = &t.engine;
+        let a = e
+            .command(&room(), &anna(), cmd("!top Müll"), at(2026, 10, 20, 12, 0))
+            .await;
+        assert!(a.contains("Noted"), "answers still come: {a}");
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        assert_eq!(e.chat.kinds(), [Notice::Link]);
+        // moved: the message is edited, no new one
+        calendar(
+            e,
+            "house",
+            |l| {
+                for o in l.iter_mut().filter(|o| o.id == "house-series#2026-11-01") {
+                    *o = occ(&o.id.clone(), "2026-11-02 19:00");
+                }
+            },
+            at(2026, 10, 30, 9, 0),
+        )
+        .await;
+        e.tick(at(2026, 10, 30, 9, 0)).await;
+        e.tick(at(2026, 10, 30, 9, 1)).await;
+        assert_eq!(e.chat.kinds(), [Notice::Link]);
+        let shown = link_shown(e, "house-series#2026-11-01").await;
+        assert!(
+            shown.contains("Monday, 2 November") && shown.contains("moved from"),
+            "{shown}"
+        );
+        // no reminder, nothing after the meeting, no PDF; the page has its result all the same
+        for (d, h, m) in [(2, 18, 30), (2, 19, 0), (3, 9, 0), (3, 9, 1), (3, 10, 0)] {
+            e.tick(at(2026, 11, d, h, m)).await;
+        }
+        assert_eq!(e.chat.kinds(), [Notice::Link]);
+        assert!(e.chat.files.lock().unwrap().is_empty());
+        let doc = e.wiki.by_title("House plenum 2026-11-02").unwrap();
+        assert!(page::has_box(&doc.text), "{}", doc.text);
+        assert!(
+            e.state.lock().await.plenums["house"].meetings["house-series#2026-11-01"]
+                .close
+                .done
+        );
+        // the next page: one more link; its cancellation edits it
+        e.tick(at(2026, 12, 3, 19, 0)).await;
+        assert_eq!(e.chat.kinds(), [Notice::Link, Notice::Link]);
+        calendar(
+            e,
+            "house",
+            |l| l.retain(|o| o.id != "house-series#2026-12-06"),
+            at(2026, 12, 4, 9, 0),
+        )
+        .await;
+        e.tick(at(2026, 12, 4, 9, 0)).await;
+        assert_eq!(e.chat.kinds(), [Notice::Link, Notice::Link]);
+        let shown = link_shown(e, "house-series#2026-12-06").await;
+        assert!(shown.contains("cancelled"), "{shown}");
+        // a setting changed in an admin's direct chat: not said in a quiet room
+        let dm: OwnedRoomId = "!dm:x".try_into().unwrap();
+        let a = e
+            .command_in(
+                &dm,
+                &admin(),
+                crate::commands::parse_for("!plenum set house reminder 60", &["house"]).unwrap(),
+                at(2026, 12, 4, 10, 0),
+                Scope::AdminDm,
+            )
+            .await;
+        assert!(a.contains("changed"), "{a}");
+        assert_eq!(e.chat.kinds(), [Notice::Link, Notice::Link]);
+        // switched to all: nothing stale comes now
+        let a = e
+            .command(
+                &room(),
+                &anna(),
+                cmd("!plenum set messages all"),
+                at(2026, 12, 4, 10, 1),
+            )
+            .await;
+        assert!(a.contains("quiet → **all**"), "{a}");
+        e.tick(at(2026, 12, 4, 10, 2)).await;
+        assert_eq!(e.chat.kinds(), [Notice::Link, Notice::Link]);
+        assert!(e.chat.pinged.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_tags_every_message_and_quiet_passes_only_the_link() {
+        for messages in [Messages::All, Messages::Quiet] {
+            for notice in [
+                Notice::Link,
+                Notice::Moved,
+                Notice::Reminder,
+                Notice::Cancelled,
+                Notice::Summary,
+                Notice::Pdf,
+                Notice::Setting,
+            ] {
+                assert_eq!(
+                    sends(messages, notice),
+                    messages == Messages::All || notice == Notice::Link
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_topic_from_a_confidential_meeting_keeps_the_next_one_confidential() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        let now = at(2026, 10, 20, 12, 0);
+        e.command(&room(), &anna(), cmd("!minutes confidential"), now)
+            .await;
+        e.command(
+            &room(),
+            &anna(),
+            cmd("!top Mietschulden\nDetails nur hier."),
+            now,
+        )
+        .await;
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        e.tick(at(2026, 11, 2, 9, 0)).await;
+        e.tick(at(2026, 11, 2, 9, 1)).await;
+        e.tick(at(2026, 12, 3, 19, 0)).await;
+        let december = e.wiki.by_title("House plenum 2026-12-06").expect("made");
+        assert!(
+            december.text.contains("### Mietschulden"),
+            "{}",
+            december.text
+        );
+        let announced = e.chat.texts().last().unwrap().clone();
+        assert!(
+            announced.starts_with("🔒") && !announced.contains("wiki.test"),
+            "{announced}"
+        );
+        let st = e.state.lock().await;
+        assert_eq!(
+            st.plenums["house"].meetings["house-series#2026-12-06"].publication,
+            Some(Publication::Confidential)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_pages_topics_move_on_once_its_time_is_over() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        e.command(
+            &room(),
+            &anna(),
+            cmd("!top Garten"),
+            at(2026, 10, 29, 20, 0),
+        )
+        .await;
+        calendar(
+            e,
+            "house",
+            |l| l.retain(|o| o.id != "house-series#2026-11-01"),
+            at(2026, 10, 30, 9, 0),
+        )
+        .await;
+        e.tick(at(2026, 10, 30, 9, 0)).await;
+        e.tick(at(2026, 10, 30, 9, 1)).await;
+        assert!(e
+            .wiki
+            .by_title("House plenum 2026-11-01 (cancelled)")
+            .is_some());
+        let told = e.chat.texts().len();
+        e.tick(at(2026, 11, 1, 22, 0)).await; // over
+        {
+            let st = e.state.lock().await;
+            let ps = &st.plenums["house"];
+            assert!(ps.meetings["house-series#2026-11-01"].close.done);
+            assert_eq!(ps.open_topics.len(), 1);
+        }
+        assert_eq!(e.chat.texts().len(), told, "nothing more is said");
+        e.tick(at(2026, 12, 3, 19, 0)).await;
+        let december = e.wiki.by_title("House plenum 2026-12-06").expect("made");
+        assert!(december.text.contains("### Garten"), "{}", december.text);
+        // the cancelled page keeps its title
+        assert!(e
+            .wiki
+            .by_title("House plenum 2026-11-01 (cancelled)")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn the_next_page_opens_when_the_last_meeting_is_over() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        let a = e
+            .command(
+                &room(),
+                &anna(),
+                cmd("!plenum set page_days 40"),
+                at(2026, 10, 1, 9, 0),
+            )
+            .await;
+        assert!(a.contains("3 → **40**"), "{a}");
+        e.tick(at(2026, 10, 5, 9, 0)).await; // October's meeting is over: November's page
+        assert!(e.wiki.by_title("House plenum 2026-11-01").is_some());
+        e.tick(at(2026, 10, 30, 9, 0)).await; // December is within 40 days, but not yet
+        assert!(e.wiki.by_title("House plenum 2026-12-06").is_none());
+        e.tick(at(2026, 11, 2, 9, 0)).await; // November's closing time
+        assert!(e.wiki.by_title("House plenum 2026-12-06").is_some());
+        // a topic from the chat goes to the page that is open
+        let a = e
+            .command(&room(), &anna(), cmd("!top Hof"), at(2026, 11, 2, 9, 5))
+            .await;
+        assert!(a.contains("house-plenum-2026-12-06"), "{a}");
+    }
+
+    #[tokio::test]
+    async fn a_topic_pushed_into_a_page_made_already_is_there_once() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        // a meeting the next noon: its page opens a day before, while November's is open
+        calendar(
+            e,
+            "house",
+            |l| l.push(occ("extra", "2026-11-02 12:00")),
+            at(2026, 10, 20, 0, 0),
+        )
+        .await;
+        e.command(
+            &room(),
+            &anna(),
+            cmd("!top Fahrräder"),
+            at(2026, 10, 20, 12, 0),
+        )
+        .await;
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        e.tick(at(2026, 11, 1, 12, 0)).await;
+        assert!(e.wiki.by_title("House plenum 2026-11-02").is_some());
+        let a = e
+            .command(
+                &admin_room_sender(),
+                &admin(),
+                cmd("!minutes done"),
+                at(2026, 11, 1, 21, 5),
+            )
+            .await;
+        assert!(a.contains("is closed in a moment"), "{a}");
+        for m in 6..12 {
+            e.tick(at(2026, 11, 1, 21, m)).await;
+        }
+        let next = e.wiki.by_title("House plenum 2026-11-02").unwrap();
+        assert_eq!(
+            next.text.matches("### Fahrräder").count(),
+            1,
+            "{}",
+            next.text
+        );
+        let titles: Vec<String> = page::topics(&next.text).iter().map(|t| t.title()).collect();
+        assert_eq!(titles, ["Fahrräder"]);
+        assert!(e.state.lock().await.plenums["house"].open_topics.is_empty());
+    }
+
+    fn admin_room_sender() -> OwnedRoomId {
+        room()
+    }
+
+    #[tokio::test]
+    async fn the_result_box_is_written_once_and_given_up_when_it_does_not_stay() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        e.tick(at(2026, 11, 2, 9, 0)).await; // written
+        *e.chat.fail.lock().unwrap() = true; // the room fails: the close repeats
+        for m in 1..4 {
+            e.tick(at(2026, 11, 2, 9, m)).await;
+        }
+        let doc = e.wiki.by_title("House plenum 2026-11-01").unwrap();
+        assert_eq!(doc.text.matches(page::BOX_TITLE).count(), 1, "{}", doc.text);
+        *e.chat.fail.lock().unwrap() = false;
+        e.tick(at(2026, 11, 2, 9, 5)).await;
+        assert!(e.chat.texts().last().unwrap().contains("are closed"));
+
+        // in December the box is lost every time (a race with a browser): given up
+        e.tick(at(2026, 12, 3, 19, 0)).await;
+        for m in 0..=BOX_ATTEMPTS {
+            e.tick(at(2026, 12, 7, 9, m)).await;
+            edit_doc(e, "House plenum 2026-12-06", |t| {
+                *t = page::without_box(t).replace("\n\n\n", "\n")
+            });
+        }
+        e.tick(at(2026, 12, 7, 9, 30)).await;
+        assert!(e.chat.texts().last().unwrap().contains("6 December 2026"));
+        assert!(
+            e.state.lock().await.plenums["house"].meetings["house-series#2026-12-06"]
+                .close
+                .done
+        );
+    }
+
+    #[tokio::test]
+    async fn room_settings_follow_the_organizers_and_the_house() {
+        let mut p = plenum("house", "House plenum", "!house:x");
+        p.organizers = HashSet::from(["@cara:x".try_into().unwrap()]);
+        let t = setup(vec![p]);
+        let e = &t.engine;
+        let now = at(2026, 10, 20, 12, 0);
+        let a = e
+            .command(&room(), &anna(), cmd("!plenum set messages quiet"), now)
+            .await;
+        assert!(a.contains("Only the plenum's organizers"), "{a}");
+        let cara = Sender {
+            id: "@cara:x".try_into().unwrap(),
+            name: "Cara".into(),
+        };
+        let a = e
+            .command(&room(), &cara, cmd("!plenum set messages quiet"), now)
+            .await;
+        assert!(
+            a.contains("Cara changed `messages` of House plenum: all → **quiet**"),
+            "{a}"
+        );
+        let a = e
+            .command(&room(), &anna(), cmd("!plenum settings"), now)
+            .await;
+        assert!(
+            a.contains("`messages`: **quiet** (set in this room)"),
+            "{a}"
+        );
+        assert!(a.contains("Last change: Cara"), "{a}");
+        let a = e
+            .command(&room(), &cara, cmd("!plenum set messages quiet"), now)
+            .await;
+        assert!(a.contains("already"), "{a}");
+        let a = e
+            .command(&room(), &cara, cmd("!plenum set page_days 100"), now)
+            .await;
+        assert!(a.contains("1 to 60"), "{a}");
+        let a = e
+            .command(&room(), &cara, cmd("!plenum reset messages"), now)
+            .await;
+        assert!(a.contains("(the default again)"), "{a}");
+        // the settings are kept in a file of their own
+        let saved = std::fs::read_to_string(t._dir.path().join("settings.json")).unwrap();
+        assert!(saved.contains("\"by\": \"Cara\""), "{saved}");
+        assert!(!std::fs::read_to_string(t._dir.path().join("state.json"))
+            .unwrap()
+            .contains("Cara"));
+
+        // fixed by the house: the room cannot change them
+        let mut fixed = plenum("house", "House plenum", "!house:x");
+        fixed.room_settings = false;
+        let t = setup(vec![fixed]);
+        let a = t
+            .engine
+            .command(&room(), &anna(), cmd("!plenum set reminder 60"), now)
+            .await;
+        assert!(a.contains("set centrally"), "{a}");
+    }
+
+    #[tokio::test]
+    async fn a_setting_from_an_admin_is_said_in_a_room_that_hears_everything() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        let dm: OwnedRoomId = "!dm:x".try_into().unwrap();
+        let a = e
+            .command_in(
+                &dm,
+                &admin(),
+                crate::commands::parse_for("!plenum set house reminder 60", &["house"]).unwrap(),
+                at(2026, 10, 20, 12, 0),
+                Scope::AdminDm,
+            )
+            .await;
+        assert!(a.contains("30 → **60**"), "{a}");
+        assert_eq!(e.chat.kinds(), [Notice::Setting]);
+        // and the reminder comes an hour before
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        e.tick(at(2026, 11, 1, 18, 0)).await;
+        assert_eq!(
+            e.chat.kinds(),
+            [Notice::Setting, Notice::Link, Notice::Reminder]
         );
     }
 }

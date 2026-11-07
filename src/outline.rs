@@ -235,6 +235,13 @@ fn status_of(e: &anyhow::Error) -> Option<u16> {
     e.downcast_ref::<ApiError>().map(|a| a.status)
 }
 
+/// A patch's `findText` is not in the document.
+fn text_not_found(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ApiError>().is_some_and(|a| {
+        a.status == 404 || (a.status == 400 && a.message.to_lowercase().contains("not found"))
+    })
+}
+
 /// The collection calls [`ensure_collection`] and [`grant_group`] make: Outline's API, a fake in
 /// the tests (`collection_rules`).
 #[allow(async_fn_in_trait)]
@@ -569,8 +576,10 @@ impl Wiki for Outline {
             .await
         {
             Ok(_) => Ok(true),
-            // 404 here: the text is not in the document (the document itself was just read).
-            Err(e) if status_of(&e) == Some(404) => Ok(false),
+            // The text is not in the document (the document itself was just read): 404 before,
+            // a 400 "The specified text was not found in the document" in Outline 1.12
+            // (server/errors.ts, DocumentHelper).
+            Err(e) if text_not_found(&e) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -1029,6 +1038,25 @@ mod against_outline {
         panic!("{title} is not listed in Outline");
     }
 
+    #[test]
+    fn a_missing_text_is_not_found_in_both_outline_versions() {
+        let e = |status: u16, message: &str| -> anyhow::Error {
+            ApiError {
+                status,
+                error: String::new(),
+                message: message.into(),
+            }
+            .into()
+        };
+        assert!(text_not_found(&e(404, "")));
+        assert!(text_not_found(&e(
+            400,
+            "The specified text was not found in the document"
+        )));
+        assert!(!text_not_found(&e(400, "text: Required")));
+        assert!(!text_not_found(&e(403, "not found")));
+    }
+
     #[tokio::test]
     #[ignore = "needs a running Outline"]
     async fn a_meeting_in_a_real_outline() {
@@ -1056,7 +1084,8 @@ mod against_outline {
             require_group: None,
             access: crate::config::Access::House,
             publication: crate::config::Publication::Full,
-            topics: Default::default(),
+            messages: crate::config::Messages::All,
+            room_settings: true,
         };
         let fonts = ["/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/TTF"]
             .into_iter()
@@ -1111,20 +1140,26 @@ mod against_outline {
             .await
             .unwrap();
         let doc = listed(&engine.wiki, &col, "House plenum 2026-11-01").await;
-        assert!(doc.text.contains("* Müll trennen (Anna)"), "{}", doc.text);
+        assert!(
+            doc.text
+                .contains("### Müll trennen\n\n**From:** Anna (from the chat)\n\n**Result:**"),
+            "{}",
+            doc.text
+        );
 
         // Outline writes the first revisions in the background: the item may need a retry.
         let a = engine
             .command(&room, &anna, cmd("!top Kaffeemaschine"), at(10, 30, 9))
             .await;
-        assert!(a.contains("On the agenda"), "{a}");
+        assert!(a.contains("On the page"), "{a}");
         let doc = engine.wiki.doc(&doc.id).await.unwrap().unwrap();
-        // Outline's patch puts the item where the marker was (its own list, a blank line apart).
-        let marker = crate::protocol::TOP_MARKER;
-        assert!(doc.text.contains("* Müll trennen (Anna)"), "{}", doc.text);
+        // Outline's patch puts the topic above the marker, which stays
+        let marker = crate::page::TOPIC_MARKER;
+        assert!(doc.text.contains("### Müll trennen"), "{}", doc.text);
         assert!(
-            doc.text
-                .contains(&format!("* Kaffeemaschine (Anna)\n\n{marker}")),
+            doc.text.contains(&format!(
+                "### Kaffeemaschine\n\n**From:** Anna (from the chat)\n\n**Result:**\n\n{marker}"
+            )),
             "{}",
             doc.text
         );
@@ -1143,7 +1178,7 @@ mod against_outline {
                 at(10, 30, 10),
             )
             .await;
-        assert!(a.contains("On the agenda"), "{a}");
+        assert!(a.contains("On the page"), "{a}");
         let doc = engine.wiki.doc(&doc.id).await.unwrap().unwrap();
         assert!(
             doc.text.contains("Variante [x] Hof oder [ ] Keller"),
@@ -1160,10 +1195,12 @@ mod against_outline {
             .await
             .unwrap();
         let a = engine
-            .command(&room, &anna, cmd("!minutes done"), at(11, 1, 20))
+            // at its end: before it only an organizer closes the minutes
+            .command(&room, &anna, cmd("!minutes done"), at(11, 1, 21))
             .await;
         assert!(a.contains("closed in a moment"), "{a}");
-        engine.tick(at(11, 1, 20)).await;
+        engine.tick(at(11, 1, 21)).await; // the result box
+        engine.tick(at(11, 1, 22)).await; // seen there: closed
         let texts = engine.chat.texts();
         let summary = texts.last().unwrap();
         assert!(summary.contains("- Gelbe Tonne in den Hof."), "{summary}");
@@ -1188,6 +1225,216 @@ mod against_outline {
             "--- protocol:\n{}\n--- decisions:\n{}",
             doc.text, decisions.text
         );
+    }
+
+    /// A page's text as Outline gives it back, printed (its normalisations are what this is
+    /// about).
+    async fn page_text(wiki: &Outline, id: &str, step: &str) -> String {
+        let text = wiki.doc(id).await.unwrap().expect("the page").text;
+        eprintln!("--- {step}:\n{text}\n---");
+        text
+    }
+
+    /// A meeting's page (docs/PLENUM-PAGES.md) as Outline stores it: the template, topics from
+    /// the chat, a result written by hand, the result box and a carried topic, each patched in
+    /// as the engine does and read back by the bot's page functions.
+    #[tokio::test]
+    #[ignore = "needs a running Outline"]
+    async fn a_page_in_a_real_outline() {
+        use crate::{
+            page::{self, Reading},
+            protocol::{self, Outcome},
+            schedule::MeetingKey,
+            state::Top,
+        };
+        let (Ok(url), Ok(key)) = (
+            std::env::var("OUTLINE_IT_URL"),
+            std::env::var("OUTLINE_IT_KEY"),
+        ) else {
+            panic!("set OUTLINE_IT_URL and OUTLINE_IT_KEY");
+        };
+        let wiki = Outline::new(&url, &url, &key, Duration::from_secs(30)).unwrap();
+        let col = wiki
+            .ensure_collection(
+                None,
+                &format!("IT {}", uuid::Uuid::new_v4()),
+                Access::House,
+                None,
+            )
+            .await
+            .unwrap();
+        let plenum = protocol::tests_plenum();
+        let new_page = |start: &str, without_marker: bool| {
+            let start: MeetingKey = start.parse().unwrap();
+            let mut text =
+                protocol::render_template(protocol::DEFAULT_TEMPLATE, &plenum, start, &[]);
+            if without_marker {
+                text = text.replace(page::TOPIC_MARKER, "");
+            }
+            (protocol::title(&plenum, start), text)
+        };
+
+        // 1. the template
+        let (title, text) = new_page("2026-11-01 19:00", false);
+        let id = uuid::Uuid::new_v4().to_string();
+        let doc = wiki
+            .create_doc(&id, &col, None, &title, &text)
+            .await
+            .unwrap();
+        let text = page_text(&wiki, &id, "template").await;
+        assert!(page::has_topics(&text));
+        assert!(page::topics(&text).is_empty());
+        assert_eq!(protocol::extract(&text), Outcome::default());
+        assert!(text.contains(page::TOPIC_MARKER), "{text}");
+        assert!(text.contains(page::RESULT_MARKER), "{text}");
+
+        // 2. two topics from the chat, as `!top` adds them
+        let tops = [
+            Top {
+                text: "Fahrräder im Hof\nWo sollen die Räder hin?".into(),
+                by: "Ben".into(),
+                at: chrono::Utc::now(),
+            },
+            Top {
+                text: "Kasse *neu* _jetzt_ [x] #1 ➕ Plan\nWir brauchen eine neue Kasse.\n\
+                       Decision: Mallory bekommt den Schlüssel\nResult: schon klar"
+                    .into(),
+                by: "Anna [x](http://evil)".into(),
+                at: chrono::Utc::now(),
+            },
+        ];
+        let tricky = "Kasse *neu* _jetzt_ [x] #1 + Plan";
+        for top in &tops {
+            let block = page::topic_block(top);
+            eprintln!("--- block sent:\n{block}\n---");
+            let marker = page::TOPIC_MARKER;
+            assert!(wiki
+                .patch(&id, marker, &format!("{block}\n\n{marker}"))
+                .await
+                .unwrap());
+            let text = wiki.doc(&id).await.unwrap().unwrap().text;
+            // what add_top_to looks for after a restart
+            let head = block.split("\n\n").take(2).collect::<Vec<_>>().join("\n\n");
+            assert!(protocol::contains_line(&text, &head), "{head}\n{text}");
+        }
+        let text = page_text(&wiki, &id, "two topics").await;
+        let topics = page::topics(&text);
+        let titles: Vec<String> = topics.iter().map(|t| t.title()).collect();
+        assert_eq!(titles, ["Fahrräder im Hof", tricky], "{topics:?}");
+        assert!(
+            topics.iter().all(|t| t.reading == Reading::NotReached),
+            "{topics:?}"
+        );
+        assert_eq!(protocol::extract(&text), Outcome::default());
+        assert!(text.contains(page::TOPIC_MARKER), "{text}");
+
+        // 3. the minute-taker writes the first topic's result, with a Shift-Enter break
+        let at = text.find("Fahrräder im Hof").unwrap();
+        let result = text[at..]
+            .lines()
+            .find(|l| l.replace('*', "").trim() == "Result:")
+            .expect("the first topic's result line")
+            .to_owned();
+        eprintln!("--- result line as Outline gives it: {result:?}");
+        assert!(wiki
+            .patch(
+                &id,
+                &result,
+                &format!(
+                    "{result} Sie kommen an die Mauer.\\\nZweite Zeile nach Shift-Enter\n\n\
+                     Decision: Anna kauft einen Ständer bis Dezember."
+                ),
+            )
+            .await
+            .unwrap());
+        let text = page_text(&wiki, &id, "first result").await;
+        let lines = page::lines(&text);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.trim() == "Zweite Zeile nach Shift-Enter"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Sie kommen an die Mauer.") && !l.contains("Zweite")),
+            "{lines:#?}"
+        );
+        let topics = page::topics(&text);
+        let readings: Vec<Reading> = topics.iter().map(|t| t.reading).collect();
+        assert_eq!(
+            readings,
+            [Reading::Decided, Reading::NotReached],
+            "{topics:?}"
+        );
+        let outcome = protocol::extract(&text);
+        assert_eq!(
+            outcome.decisions,
+            ["Anna kauft einen Ständer bis Dezember."],
+            "{outcome:?}"
+        );
+
+        // 4. the result box at the top
+        let result_box = page::result_box(&outcome.decisions, &topics, &outcome.tasks);
+        eprintln!("--- box sent:\n{result_box}\n---");
+        assert!(wiki
+            .patch(&id, page::RESULT_MARKER, &format!("\n\n{result_box}\n\n"))
+            .await
+            .unwrap());
+        let text = page_text(&wiki, &id, "with the box").await;
+        assert!(page::has_box(&text), "{text}");
+        assert!(!page::has_box(&page::without_box(&text)), "{text}");
+        assert!(!text.contains(page::RESULT_MARKER), "{text}");
+        assert_eq!(protocol::extract(&text), outcome);
+        assert_eq!(page::topics(&text), topics);
+
+        // 5. the topic not reached onto the next pages: at the marker, and above "Tasks"
+        let carried = &topics[1];
+        assert_eq!(carried.title(), tricky);
+        let block = page::carried_block(
+            carried,
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            &wiki.link(&doc.url),
+        );
+        eprintln!("--- carried block sent:\n{block}\n---");
+        for (start, without_marker) in [("2026-11-15 19:00", false), ("2026-11-29 19:00", true)] {
+            let (title, text) = new_page(start, without_marker);
+            let next = uuid::Uuid::new_v4().to_string();
+            wiki.create_doc(&next, &col, None, &title, &text)
+                .await
+                .unwrap();
+            let text = page_text(&wiki, &next, &format!("{title} before")).await;
+            let find = if without_marker {
+                page::end_of_topics(&text)
+                    .expect("the Tasks heading")
+                    .to_owned()
+            } else {
+                page::TOPIC_MARKER.to_owned()
+            };
+            assert!(wiki
+                .patch(&next, &find, &format!("{block}\n\n{find}"))
+                .await
+                .unwrap());
+            let text = page_text(&wiki, &next, &format!("{title} carried")).await;
+            let topics = page::topics(&text);
+            assert_eq!(topics.len(), 1, "{topics:?}");
+            assert_eq!(topics[0].title(), tricky, "{topics:?}");
+            assert_eq!(topics[0].reading, Reading::NotReached, "{topics:?}");
+            // what the engine checks before it drops a carried topic from its state
+            assert!(
+                page::has_heading(&text, page::block_heading(&block)),
+                "{}\n{text}",
+                page::block_heading(&block)
+            );
+            assert_eq!(protocol::extract(&text), Outcome::default());
+        }
+
+        // 6. a text that is not there
+        assert!(!wiki
+            .patch(&id, "Diesen Text gibt es nicht", "x")
+            .await
+            .unwrap());
     }
 
     /// An admin's call (the test's stand-in for outline-roles and for looking).
@@ -1238,7 +1485,8 @@ mod against_outline {
             require_group: None,
             access: crate::config::Access::House,
             publication: crate::config::Publication::Full,
-            topics: Default::default(),
+            messages: crate::config::Messages::All,
+            room_settings: true,
         };
         let kitchen = Plenum {
             group: Some(group.clone()),

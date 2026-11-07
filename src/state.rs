@@ -44,10 +44,10 @@ pub struct State {
     /// (`stay_until`; [`crate::stay`]). Left out when empty, so an older image reads the file.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub stays: crate::stay::Memory,
-    /// The topics (docs/TOPICS.md): `topics.json` beside the state, a file of its own so an
-    /// older image (a rollback) neither drops nor overwrites them.
+    /// The rooms' own settings (`store/settings.json` beside the state, a file of its own so
+    /// an older image after a rollback neither drops nor overwrites them).
     #[serde(skip)]
-    pub book: crate::topics::Book,
+    pub settings: crate::plenum_settings::Store,
 }
 
 /// One link request the bot took up ([`crate::link_delivery`]). Holds no code: the code is
@@ -157,9 +157,38 @@ pub struct PlenumState {
     /// Agenda items sent before the next protocol existed; they go into it.
     #[serde(default)]
     pub pending_tops: Vec<Top>,
+    /// Topics of a closed or cancelled page that were not reached, waiting for the next page
+    /// (they go into it when it is made, or at once if it is made already, and are dropped
+    /// from here then).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_topics: Vec<CarriedTopic>,
     /// By the calendar occurrence's ID.
     #[serde(default)]
     pub meetings: BTreeMap<String, Meeting>,
+}
+
+/// A topic carried onto the next page (docs/PLENUM-PAGES.md §4.4).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CarriedTopic {
+    /// The block's heading line (a page that has it has the topic already).
+    pub heading: String,
+    /// The Markdown that goes into the page.
+    pub block: String,
+    /// The meeting it comes from, and what of that one went into the room: a meeting that
+    /// receives it shares no more than that.
+    pub from: MeetingKey,
+    pub publication: Publication,
+}
+
+/// The message with a page's link (`messages quiet` edits it when the meeting moves or is
+/// cancelled).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct LinkMessage {
+    pub event: String,
+    pub text: String,
+    /// Edits sent (each its own transaction).
+    #[serde(default)]
+    pub edits: u32,
 }
 
 /// A task or a decision from a closed protocol: its text, the meeting's day and protocol.
@@ -227,10 +256,13 @@ pub struct Meeting {
     /// Who set `publication`: they may take it back.
     #[serde(default)]
     pub publication_by: Option<String>,
+    /// The link message, once posted (with `post`; an older image's has none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkMessage>,
 }
 
 /// A message that is sent once: its transaction ID, then whether it went out.
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct Step {
     #[serde(default)]
     pub txn: Option<String>,
@@ -247,7 +279,7 @@ impl Step {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct Close {
     /// Someone said `!minutes done`: close at the next tick, whatever the time.
     #[serde(default)]
@@ -257,6 +289,14 @@ pub struct Close {
     /// The open tasks went into the next protocol made already (`carry_tasks_on`).
     #[serde(default)]
     pub tasks_carried: bool,
+    /// The topics not reached were read into `open_topics`.
+    #[serde(default)]
+    pub topics_read: bool,
+    /// The result box is in the page (seen there at a tick after it was written), or given up.
+    #[serde(default)]
+    pub result_box: bool,
+    #[serde(default)]
+    pub box_attempts: u32,
     /// The PDF attached to the protocol (its URL path).
     #[serde(default)]
     pub pdf_url: Option<String>,
@@ -308,21 +348,20 @@ impl PlenumState {
     }
 }
 
-/// Where the topics are kept, beside the state.
-pub fn book_path(state: &Path) -> std::path::PathBuf {
-    state.with_file_name("topics.json")
+/// Where the rooms' settings are kept, beside the state.
+pub fn settings_path(state: &Path) -> std::path::PathBuf {
+    state.with_file_name("settings.json")
 }
 
 impl State {
     pub async fn load(path: &Path) -> Result<Self> {
         let mut st: Self = mxbot_common::persist::load_json_or_default(path).await?;
-        st.book = crate::topics::Book::load(&book_path(path)).await?;
+        st.settings = mxbot_common::persist::load_json_or_default(&settings_path(path)).await?;
         Ok(st)
     }
 
-    /// The topics first: a step saved before its side effect finds its own record in both.
     pub async fn save(&self, path: &Path) -> Result<()> {
-        self.book.save(&book_path(path)).await?;
+        mxbot_common::persist::save_json_atomic(&settings_path(path), &self.settings).await?;
         mxbot_common::persist::save_json_atomic(path, self).await
     }
 }

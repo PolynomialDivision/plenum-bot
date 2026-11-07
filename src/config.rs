@@ -35,80 +35,74 @@ pub struct Config {
     pub members: MembersConfig,
     #[serde(rename = "plenum", default)]
     pub plenums: Vec<PlenumConfig>,
-    /// Topics (docs/TOPICS.md): a table of its own, so an older image (a rollback) ignores it.
+    /// A top-level table: an image from before ignores it (`[defaults]` and `[[plenum]]`
+    /// refuse keys they do not know, which would stop it after a rollback).
     #[serde(default)]
-    pub topics: TopicsConfig,
+    pub pages: PagesConfig,
 }
 
-/// `[topics]`: numbered topics, their messages, the agenda in the announcement, the outcomes
-/// (docs/TOPICS.md). The house's values; `[topics.plenum.<key>]` changes them for one plenum,
-/// and with `room_settings` the plenum's room may change some of them (plenum_settings.rs).
+/// What the bot posts in a plenum's room by itself (docs/PLENUM-PAGES.md §5). Answers to a
+/// command are not affected.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Messages {
+    /// Only the link to a meeting's new page; a move or a cancellation edits that message.
+    Quiet,
+    /// The link, the reminder, cancellations and moves, the summary and the PDF.
+    #[default]
+    All,
+}
+
+impl Messages {
+    pub fn from_word(word: &str) -> Option<Self> {
+        match word.to_lowercase().as_str() {
+            "quiet" => Some(Self::Quiet),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Quiet => "quiet",
+            Self::All => "all",
+        }
+    }
+}
+
+/// `[pages]`: the house's values; `[pages.plenum.<key>]` one plenum's.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields, default)]
-pub struct TopicsConfig {
-    pub enabled: bool,
+pub struct PagesConfig {
+    pub messages: Messages,
     /// The people of a plenum may change its settings in its room (`!plenum set`).
     pub room_settings: bool,
-    /// A topic not reached goes onto the next agenda.
-    pub carry_over: bool,
-    /// The outcome mentions who gave the topic a 👍.
-    pub tell_interested: bool,
-    pub plenum: BTreeMap<String, TopicsPlenumConfig>,
+    pub plenum: BTreeMap<String, PagesPlenumConfig>,
 }
 
-impl Default for TopicsConfig {
+impl Default for PagesConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            messages: Messages::All,
             room_settings: true,
-            carry_over: true,
-            tell_interested: true,
             plenum: BTreeMap::new(),
         }
     }
 }
 
-/// `[topics.plenum.<key>]`: one plenum's values (unset: the house's).
+/// `[pages.plenum.<key>]` (unset: the house's).
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub struct TopicsPlenumConfig {
-    pub enabled: Option<bool>,
+pub struct PagesPlenumConfig {
+    pub messages: Option<Messages>,
     pub room_settings: Option<bool>,
-    pub carry_over: Option<bool>,
-    pub tell_interested: Option<bool>,
 }
 
-/// How a plenum's topics behave (house-infra's values; the room's come on top).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TopicRules {
-    pub enabled: bool,
-    pub room_settings: bool,
-    pub carry_over: bool,
-    pub tell_interested: bool,
-}
+/// The longest `prepare_days` (a page opens at most this many days before its meeting).
+pub const PREPARE_DAYS_MAX: u32 = 60;
 
-impl Default for TopicRules {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            room_settings: true,
-            carry_over: true,
-            tell_interested: true,
-        }
-    }
-}
-
-impl TopicsConfig {
-    fn rules(&self, key: &str) -> TopicRules {
-        let own = self.plenum.get(key).cloned().unwrap_or_default();
-        TopicRules {
-            enabled: own.enabled.unwrap_or(self.enabled),
-            room_settings: own.room_settings.unwrap_or(self.room_settings),
-            carry_over: own.carry_over.unwrap_or(self.carry_over),
-            tell_interested: own.tell_interested.unwrap_or(self.tell_interested),
-        }
-    }
-}
+/// The latest reminder, in minutes before the start (a day).
+pub const REMIND_MINUTES_MAX: u32 = 1440;
 
 /// The longest `[members] handover_days` and `handover_max_days`: a year.
 pub const HANDOVER_DAYS_MAX: u32 = 365;
@@ -470,8 +464,10 @@ pub struct Plenum {
     pub access: Access,
     /// For a meeting nobody set it for.
     pub publication: Publication,
-    /// `[topics]` for this plenum.
-    pub topics: TopicRules,
+    /// `[pages]`: what the bot posts by itself (the room's setting comes on top).
+    pub messages: Messages,
+    /// The room may change its settings (`!plenum set`).
+    pub room_settings: bool,
 }
 
 impl Plenum {
@@ -637,16 +633,25 @@ impl Config {
                 require_group,
                 access: p.access,
                 publication: p.publication.unwrap_or(self.defaults.publication),
-                topics: self.topics.rules(&p.key),
+                messages: (self.pages.plenum.get(&p.key))
+                    .and_then(|o| o.messages)
+                    .unwrap_or(self.pages.messages),
+                room_settings: (self.pages.plenum.get(&p.key))
+                    .and_then(|o| o.room_settings)
+                    .unwrap_or(self.pages.room_settings),
             });
+            let last = out.last().expect("pushed");
+            if !(1..=PREPARE_DAYS_MAX).contains(&last.prepare_days) {
+                bail!("{at}: prepare_days is 1 to {PREPARE_DAYS_MAX}");
+            }
+            if last.remind_minutes > REMIND_MINUTES_MAX {
+                bail!("{at}: remind_minutes is 0 to {REMIND_MINUTES_MAX}");
+            }
         }
-        if let Some(unknown) = self
-            .topics
-            .plenum
-            .keys()
-            .find(|k| !out.iter().any(|p| &p.key == *k))
+        if let Some(unknown) =
+            (self.pages.plenum.keys()).find(|k| !out.iter().any(|p| &p.key == *k))
         {
-            bail!("[topics.plenum.{unknown}]: there is no plenum with that key");
+            bail!("[pages.plenum.{unknown}]: there is no plenum with that key");
         }
         Ok(out)
     }

@@ -13,8 +13,6 @@ use anyhow::{Context, Result};
 use genpdf::{elements, fonts, style, Alignment, Element};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-use crate::protocol::TOP_MARKER;
-
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Span {
     text: String,
@@ -63,11 +61,21 @@ impl Frame {
 
 /// Outline's Markdown without what only Outline understands.
 fn outline_cleanup(markdown: &str) -> String {
+    let mut help = false;
     markdown
         .lines()
         .filter(|l| {
             let t = l.trim();
-            t != "\\" && t != TOP_MARKER && !(t.starts_with(":::") && !t.contains(' '))
+            // the template's help (an info notice) is not part of the minutes
+            if help {
+                help = t != ":::";
+                return false;
+            }
+            if t == ":::info" {
+                help = true;
+                return false;
+            }
+            t != "\\" && !crate::page::is_marker(t) && !(t.starts_with(":::") && !t.contains(' '))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -516,7 +524,7 @@ mod tests {
 
     #[test]
     fn outline_markdown_becomes_blocks() {
-        let md = "## Agenda\n\n* Müll (Ben)\n* Kaffee\n\n➕ New items from the chat (!top) go here.\n\n\\\n\n:::info\nHinweis\n:::\n\n- [ ] Anna: Kompost\n- [x] erledigt\n\n| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let md = "## Agenda\n\n* Müll (Ben)\n* Kaffee\n\n➕ New items from the chat (!top) go here.\n\n\\\n\n:::tip\nHinweis\n:::\n\n:::info\nThe template's help\n:::\n\n- [ ] Anna: Kompost\n- [x] erledigt\n\n| A | B |\n|---|---|\n| 1 | 2 |\n";
         let blocks = parse(md);
         assert_eq!(blocks[0], Block::Heading(2, spans("Agenda")));
         let Block::List {

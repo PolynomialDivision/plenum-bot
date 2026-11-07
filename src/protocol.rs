@@ -14,32 +14,35 @@ use mxbot_common::matrix_sdk::ruma::OwnedUserId;
 pub const TOP_MARKER: &str = "➕ New items from the chat (!top) go here.";
 
 /// The template a plenum starts with when its collection has none (`<Name>: Template`). The
-/// placeholders in double braces are filled in for every meeting.
+/// placeholders in double braces are filled in for every meeting. One page per meeting is its
+/// preparation and its minutes (docs/PLENUM-PAGES.md §4.2): each topic a heading under
+/// "Topics", its result after "Result:".
 pub const DEFAULT_TEMPLATE: &str = "\
-**{{plenum}}** on {{weekday}}, {{date}} at {{time}}
+**{{plenum}}** · {{weekday}}, {{date}}, {{time}}
+
+➕ The bot writes the result here after the plenum (please leave this line).
 
 | Facilitation | Minutes | Present |
 |---|---|---|
 |  |  |  |
 
-## Agenda
+## Topics
 
-➕ New items from the chat (!top) go here.
+:::info
+- **A new topic:** type ### and a space, then its title (or the small heading from the + menu).
+- Below it: what it is about; what should come of it (information, a discussion or a decision); your proposal, if you have one.
+- Thoughts and questions: as points under the topic, with your name.
+- As its last line: Result: (filled in at the plenum; a decision on a line of its own that starts with the word Decision and a colon).
+- A topic whose result stays empty comes onto the next page. Not needed any more? Delete it.
+- From the chat: !top and your topic.
+:::
 
-## Minutes
+➕ Topics from the chat are added above this line (please leave it).
 
-Each topic from the chat has its section below (### #12 …): write under it what was \
-discussed. Other items get a heading (###) of their own.
+## Tasks
 
-➕ Sections for the topics go here (plenum-bot).
-
-## Decisions and tasks
-
-Decisions and tasks about a topic go into its section above; here go the others. \
-A line that starts with \"Decision:\" goes into the list of decisions after the plenum. \
-Tasks as a checklist (type \"[]\" at the start of a line in Outline): who does what by when; \
-type \"@\" and pick the person, they are told in the wiki and in the plenum's chat. What \
-stays open here is in the next minutes again.
+A task is a checklist item (type [] and a space): who does what by when; type @ and pick the \
+person, Outline shows them a notice. What stays open comes onto the next page.
 
 {{open_tasks}}
 ";
@@ -48,10 +51,12 @@ stays open here is in the next minutes again.
 /// them at its end, under [`OPEN_TASKS_HEADING`].
 pub const OPEN_TASKS_PLACEHOLDER: &str = "{{open_tasks}}";
 
-pub const OPEN_TASKS_HEADING: &str = "## Open tasks from the last plenum";
+pub const OPEN_TASKS_HEADING: &str = "### Open tasks from the last plenum";
 
-/// The labels of decision and task lines (any case).
+/// The labels of decision and task lines (any case; "Beschluss" for a template in German).
 const DECISION_LABEL: &str = "decision";
+/// Both labels of a decision line ("Beschluss" for a template in German).
+pub(crate) const DECISION_LABELS: [&str; 2] = [DECISION_LABEL, "beschluss"];
 const TASK_LABEL: &str = "task";
 
 /// The open tasks as a checklist (each with the day it comes from): ticked off they are done,
@@ -63,7 +68,12 @@ pub fn open_tasks_block(tasks: &[Carried]) -> String {
     let mut block = format!("{OPEN_TASKS_HEADING}\n\n");
     for t in tasks {
         let text = t.text.replace('[', "(").replace(']', ")");
-        block.push_str(&format!("- [ ] {text} (since {})\n", describe_day(t.date)));
+        // a task open for a second time keeps its first day
+        if text.trim_end().ends_with(')') && text.contains("(since ") {
+            block.push_str(&format!("- [ ] {text}\n"));
+        } else {
+            block.push_str(&format!("- [ ] {text} (since {})\n", describe_day(t.date)));
+        }
     }
     block
 }
@@ -135,8 +145,6 @@ pub fn top_line(top: &Top) -> String {
         .join(" ")
         .replace('[', "(")
         .replace(']', ")")
-        // the bot's markers start so: an item never becomes one
-        .replace('➕', "+")
         .trim_start_matches(['#', '>', '*', '-', '+', '|', '_'])
         .trim()
         .chars()
@@ -145,7 +153,7 @@ pub fn top_line(top: &Top) -> String {
     if text.is_empty() {
         text = "…".to_owned();
     }
-    if [DECISION_LABEL, TASK_LABEL]
+    if [DECISION_LABELS[0], DECISION_LABELS[1], TASK_LABEL]
         .iter()
         .any(|label| after_label(&text, label).is_some())
     {
@@ -249,7 +257,9 @@ pub struct Outcome {
 pub fn extract(markdown: &str) -> Outcome {
     let mut out = Outcome::default();
     let mut agenda = false;
-    for raw in markdown.lines() {
+    // the result box repeats the decisions; a Shift-Enter break splits a line, and what follows
+    // it belongs to the decision or task it continues
+    for raw in joined_lines(&crate::page::without_box(markdown)) {
         let line = raw.trim();
         if line.starts_with('#') {
             agenda = is_agenda_heading(line);
@@ -260,10 +270,15 @@ pub fn extract(markdown: &str) -> Outcome {
         }
         let (checkbox, rest) = strip_list_marker(line);
         let rest = rest.trim();
-        if let Some(text) = after_label(rest, DECISION_LABEL) {
-            if !text.is_empty() {
-                out.decisions.push(text);
-            }
+        // also right after "Result:" ("Result: Decision: we buy one")
+        if let Some(text) = crate::page::decision_in(rest) {
+            out.decisions.push(text);
+            continue;
+        }
+        if DECISION_LABELS
+            .iter()
+            .any(|label| after_label(rest, label).is_some())
+        {
             continue;
         }
         if let Some(text) = after_label(rest, TASK_LABEL) {
@@ -282,9 +297,37 @@ pub fn extract(markdown: &str) -> Outcome {
     out
 }
 
+/// The page's lines ([`crate::page::lines`]), with the pieces after a Shift-Enter break joined
+/// back onto a decision or task line they continue.
+fn joined_lines(markdown: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in markdown.lines() {
+        let pieces = crate::page::lines(raw);
+        let mut joining = false;
+        for piece in pieces {
+            let (checkbox, rest) = strip_list_marker(piece.trim());
+            let starts = checkbox.is_some()
+                || piece.trim_start().starts_with('#')
+                || after_label(rest.trim(), TASK_LABEL).is_some()
+                || crate::page::decision_in(&piece).is_some();
+            match out.last_mut() {
+                Some(last) if joining && !starts && !piece.trim().is_empty() => {
+                    last.push(' ');
+                    last.push_str(piece.trim());
+                }
+                _ => {
+                    joining = starts;
+                    out.push(piece);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `(checkbox, rest)`: `Some(done)` for a checklist item, `None` otherwise; `rest` is the
 /// line without its list marker.
-fn strip_list_marker(line: &str) -> (Option<bool>, &str) {
+pub(crate) fn strip_list_marker(line: &str) -> (Option<bool>, &str) {
     let mut rest = line;
     for marker in ["* ", "- ", "+ "] {
         if let Some(r) = rest.strip_prefix(marker) {
@@ -311,7 +354,7 @@ fn strip_list_marker(line: &str) -> (Option<bool>, &str) {
 
 /// The text after "<label>:" at the start of `line` (any case, the label maybe in ** or _),
 /// cleaned of emphasis.
-fn after_label(line: &str, label: &str) -> Option<String> {
+pub(crate) fn after_label(line: &str, label: &str) -> Option<String> {
     let plain = line.trim_start_matches(['*', '_']);
     if !plain
         .get(..label.len())
@@ -326,15 +369,8 @@ fn after_label(line: &str, label: &str) -> Option<String> {
     Some(clean(after))
 }
 
-/// Whether `line` starts like a decision or a task ("Decision:", "Task:", any case).
-pub fn starts_like_decision_or_task(line: &str) -> bool {
-    [DECISION_LABEL, TASK_LABEL]
-        .iter()
-        .any(|label| after_label(line, label).is_some())
-}
-
 /// Without emphasis markers and Outline's escapes, trimmed.
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     let mut s = text.replace("**", "").replace("__", "");
     s = s.replace("\\", "");
     s.trim().trim_matches(['*', '_']).trim().to_owned()
@@ -383,54 +419,63 @@ pub fn example_doc_text(plenum: &Plenum) -> String {
         "_An example of finished minutes, to copy from. The real ones are under “{protocols}”; \
          the bot makes them from the template before each meeting._
 
-**{name}** on Sunday, 1 November 2026 at 19:00
+**{name}** · Sunday, 1 November 2026, 19:00
+
+:::success
+**Result of the plenum** (filled in by the bot when the minutes were closed)
+
+- ✅ Decided: we ask the landlord for a second yellow bin.
+- ✅ Decided: we buy the compost bin from the house cash box.
+- ⏭️ On the next page: Bike cellar (not reached)
+- 📌 Tasks: Ben: write to the landlord about the second bin by Friday; Cara: buy the compost bin by next Sunday
+:::
 
 | Facilitation | Minutes | Present |
 |---|---|---|
 | Anna | Ben | Anna, Ben, Cara, Dan |
 
-## Agenda
+## Topics
 
-* #3 Bins in the yard (Ben) · to decide
-* #4 Compost bin (Cara) · to decide
-* #5 Garden day (Dan) · to talk about
+### Bins in the yard
 
-## Minutes
+**From:** Ben
 
-### #3 Bins in the yard
+The yellow bin is often full by Thursday. A second one would fit next to the door. Goal: a decision.
 
-> Ben, to decide
-> Proposal: we ask the landlord for a second yellow bin.
+- Dan: or we flatten the boxes better?
 
-The yellow bin is often full by Thursday. A second one would fit next to the door.
+**Result:** A second one is needed all the same.
 
 Decision: we ask the landlord for a second yellow bin.
 
-- [ ] Ben: write to the landlord about the second bin by Friday
+### Compost bin
 
-### #4 Compost bin
+**From:** Cara
 
-> Cara, to decide
+Cara found one for 40 €. Proposal: we buy it from the house cash box.
 
-Cara found one for 40 €. Everyone agrees, Dan would rather have a bigger one next year.
+**Result:** Everyone agrees, Dan would rather have a bigger one next year.
 
 Decision: we buy the compost bin from the house cash box.
 
+### Bike cellar
+
+**From:** Anna (from the chat)
+
+It is too full; old bikes could go. Goal: a discussion.
+
+**Result:**
+
+## Tasks
+
+- [ ] Ben: write to the landlord about the second bin by Friday
 - [ ] Cara: buy the compost bin by next Sunday
-
-### #5 Garden day
-
-> Dan, to talk about
-
-## Decisions and tasks
-
 - [x] Dan: put up the new cleaning rota
 
-_The bot made the agenda and the sections (the quoted lines); the minutes went under them. \
-After the meeting the two lines starting with “Decision:” go into the list of decisions, and \
-each topic's thread in the chat hears what came of it. #5's section stayed empty: not reached, \
-it is on the next agenda. Ben's and Cara's tasks are still open, so they come along to the next \
-minutes; Dan's is ticked off and done._
+_The result box at the top is what the bot wrote when the minutes were closed. The two lines \
+starting with “Decision:” went into the list of decisions. “Bike cellar” has an empty result: \
+it came onto the next page by itself. Ben's and Cara's tasks are still open, so they come along \
+too; Dan's is ticked off and done._
 ",
         name = plenum.name,
         protocols = plenum.protocols_title(),
@@ -475,7 +520,6 @@ pub fn overview_text(
     tasks: &[Carried],
     decisions: &[Carried],
     links: &OverviewLinks<'_>,
-    topics: Option<&str>,
 ) -> String {
     let esc = |s: &str| s.replace('[', "\\[").replace(']', "\\]");
     let mut t = format!(
@@ -494,11 +538,11 @@ pub fn overview_text(
         };
         match protocol {
             Some(link) => t.push_str(&format!(
-                "* {}: [agenda and minutes]({link}){chat}\n",
+                "* {}: [its page]({link}), for topics and minutes{chat}\n",
                 describe_meeting(*key)
             )),
             None => t.push_str(&format!(
-                "* {} (the agenda comes {} before){chat}\n",
+                "* {} (its page opens {} before, once the meeting before is over){chat}\n",
                 describe_meeting(*key),
                 days(plenum.prepare_days)
             )),
@@ -512,42 +556,37 @@ pub fn overview_text(
         "\nThe meetings are in the calendar {calendar}: add, move or cancel them there, or \
          make a series. This page, the agendas and the reminders follow it.\n"
     ));
-    match topics {
-        // with topics: how they work, the ones waiting, the room's settings (topics.rs)
-        Some(block) => t.push_str(block),
-        None => t.push_str(
-            "\n## Bringing in a topic\n\nWrite `!top <topic>` in the chat, reply to a message \
-             with `!top`, or write it into the agenda of the next meeting.\n",
-        ),
-    }
+    t.push_str(
+        "\n## Bringing in a topic\n\nOpen the next meeting's page above and add a heading \
+         with your topic under \"Topics\", with a few lines below it: what it is about and what \
+         should come of it. Or write `!top <topic>` in the plenum's chat (the first line is the \
+         title, the next ones what it is about), or reply to a message with `!top`; the bot \
+         puts it on the page.\n",
+    );
     t.push_str(&format!(
         "\n## How the minutes work\n\n\
-         1. **Before the meeting.** {before} before it, the bot makes the minutes from the \
-         [template]({template}) and posts the link in the chat. Topics from the chat are on \
-         the agenda already.\n\
-         2. **During the meeting.** Someone writes the minutes into that document. Each topic \
-         from the chat has its section (`### #12 …`): write what was said, `Decision:` lines \
-         and tasks under it. A topic whose section stays empty counts as not reached and comes \
-         back next time. Other items get a heading (type `###` and a space) of their own.\n\
+         1. **Before the meeting.** Up to {before} before it, once the meeting before is \
+         over, the bot opens its page from the [template]({template}). Everyone adds topics and \
+         prepares them there: what it is about, a proposal, arguments as points with your name.\n\
+         2. **During the meeting.** The page is the working copy: under each topic, its result \
+         goes after \"Result:\".\n\
          3. **Decisions.** Start a line with the word `Decision` and a colon, then what was \
          decided, for example `Decision: the bins go out on Sunday evening`. After the meeting \
-         every such line goes into the [list of decisions]({decisions}). Lines on the agenda \
-         are no decisions yet.\n\
+         every such line goes into the [list of decisions]({decisions}).\n\
          4. **Tasks.** Make them a checklist: type `[]` and a space at the start of a line, \
          then who does what by when, for example `@Anna: order the compost bin by Friday` \
-         (type `@` and pick the person: the wiki tells them, and when the minutes close the \
-         bot mentions them in the plenum's chat). A task that is not ticked off comes along \
-         to the next minutes and shows here under \"Open tasks\"; tick it off when it is \
-         done.\n\
+         (type `@` and pick the person: the wiki tells them). A task that is not ticked off \
+         comes along to the next page and shows here under \"Open tasks\"; tick it off when it \
+         is done.\n\
          5. **After the meeting.** {after} after its end (or at once when someone writes \
-         `!minutes done` in the chat), the bot closes the minutes: the decisions go into the \
-         list, the minutes are attached as a PDF and posted in the chat with a short \
-         summary.\n\
-         6. **Confidential meetings.** `!minutes confidential` in the chat keeps everything \
-         from the minutes out of the chat (no link, no summary, no PDF), `!minutes link` \
-         posts only the link; `!minutes full` is the summary again. It is for the meeting \
-         that is on or comes next, or the one on a day: `!minutes confidential 14.11.`. The \
-         minutes are made, closed and filed here all the same.\n",
+         `!minutes done` in the chat), the bot closes the page: a short result at its top, the \
+         decisions into the list, the page as a PDF. A topic whose result stayed empty comes \
+         onto the next page by itself.\n\
+         6. **The chat.** Depending on the plenum's settings (`!plenum settings`) the bot posts \
+         only the link to each new page, or also a reminder and a summary. `!minutes \
+         confidential` keeps everything from a meeting's page out of the chat, `!minutes link` \
+         gives only the link; `!minutes full` the summary again (`!minutes confidential 14.11.` \
+         for another day).\n",
         before = days(plenum.prepare_days),
         after = hours(plenum.close_after_hours),
         template = links.template,
@@ -613,18 +652,19 @@ pub fn cancellation(
         describe_meeting(key)
     );
     if publication != Publication::Confidential {
-        text.push_str(&format!(" The minutes stay in the wiki: {link}"));
+        text.push_str(&format!(
+            " Its topics move to the next page; this one stays in the wiki: {link}"
+        ));
     }
     text
 }
 
-/// The announcement a few days before (again after a move: `moved_from`). A confidential
-/// meeting's says when it is and nothing from the wiki: no link, no number of items.
+/// The message with the page's link, when the page is open (again after a move:
+/// `moved_from`). A confidential meeting's says when it is and nothing from the wiki.
 pub fn announcement(
     plenum: &Plenum,
     key: MeetingKey,
     link: &str,
-    tops: usize,
     moved_from: Option<MeetingKey>,
     publication: Publication,
 ) -> String {
@@ -633,31 +673,38 @@ pub fn announcement(
         .unwrap_or_default();
     if publication == Publication::Confidential {
         return format!(
-            "🔒 **{}** on {}{moved}: confidential\n\nThe minutes are made in the wiki as \
-             usual; nothing from them comes into the chat. Add a topic: `!top <topic>`, or \
-             reply to a message with `!top`.",
+            "🔒 **{}** on {}{moved}: confidential\n\nThe page is made in the wiki as usual; \
+             nothing from it comes into the chat.",
             plenum.name,
             describe_meeting(key)
         );
     }
+    format!(
+        "📝 **{}** on {}{moved}: the page for its topics and minutes is open. Add your topics \
+         there, or write `!top <topic>` here.\n\n{link}",
+        plenum.name,
+        describe_meeting(key)
+    )
+}
+
+/// The link message of a meeting that left the calendar (`messages quiet` edits the message
+/// to this instead of posting the cancellation).
+pub fn cancelled_link(
+    plenum: &Plenum,
+    key: MeetingKey,
+    link: &str,
+    publication: Publication,
+) -> String {
     let mut text = format!(
-        "📋 **{}** on {}{moved}\n\nAgenda and minutes: {link}\n\nAdd a topic: `!top <topic>`, \
-         reply to a message with `!top`, or write it into the document.",
+        "❌ ~~**{}** on {}~~: cancelled.",
         plenum.name,
         describe_meeting(key)
     );
-    match tops {
-        0 => {}
-        1 => text.push_str("\n\n1 item from the chat is in it already."),
-        n => text.push_str(&format!("\n\n{n} items from the chat are in it already.")),
+    if publication != Publication::Confidential {
+        text.push_str(&format!(
+            " Its topics move to the next page; this one stays in the wiki: {link}"
+        ));
     }
-    text.push_str(match publication {
-        Publication::Link => "\n\nAfter the meeting only the link comes here, no summary.",
-        _ => {
-            "\n\nAfter the meeting a summary comes here; `!minutes link` (only the link) or \
-             `!minutes confidential` (nothing) changes that for this meeting."
-        }
-    });
     text
 }
 
@@ -676,7 +723,7 @@ pub fn reminder(
         key.0.format("%H:%M")
     );
     if publication != Publication::Confidential {
-        text.push_str(&format!("\n\nMinutes: {link}"));
+        text.push_str(&format!("\n\nThe page: {link}"));
     }
     text
 }
@@ -863,7 +910,8 @@ mod tests {
             require_group: None,
             access: crate::config::Access::House,
             publication: crate::config::Publication::Full,
-            topics: Default::default(),
+            messages: crate::config::Messages::All,
+            room_settings: true,
         }
     }
 
@@ -883,10 +931,14 @@ mod tests {
     fn the_template_is_filled_in() {
         let text = render_template(DEFAULT_TEMPLATE, &plenum(), key(), &[]);
         assert!(
-            text.starts_with("**House plenum** on Sunday, 1 November 2026 at 19:00"),
+            text.starts_with("**House plenum** · Sunday, 1 November 2026, 19:00"),
             "{text}"
         );
-        assert!(text.contains(TOP_MARKER));
+        assert!(text.contains(crate::page::TOPIC_MARKER));
+        assert!(text.contains(crate::page::RESULT_MARKER));
+        // a page with topics and none in it yet
+        assert!(crate::page::has_topics(&text));
+        assert!(crate::page::topics(&text).is_empty(), "{text}");
         assert!(!text.contains("{{"));
         assert!(!text.contains(OPEN_TASKS_HEADING));
         assert_eq!(title(&plenum(), key()), "House plenum 2026-11-01");
@@ -1031,6 +1083,17 @@ mod tests {
     }
 
     #[test]
+    fn a_shift_enter_break_continues_a_decision_or_a_task() {
+        let doc = "Decision: bins go out on Sunday,\\nthe paper on Monday.\n- [ ] Ben: ask\\nby Friday\nResult: ok\\nDecision: second\n";
+        let o = extract(doc);
+        assert_eq!(
+            o.decisions,
+            ["bins go out on Sunday, the paper on Monday.", "second"]
+        );
+        assert_eq!(o.tasks, ["Ben: ask by Friday"]);
+    }
+
+    #[test]
     fn decisions_and_tasks_are_read_back() {
         let doc = "\
 ## Minutes
@@ -1040,7 +1103,7 @@ mod tests {
 Decision: The bins stay in the yard from now on.
 **Decision:** We buy a compost bin.
 * **Decision**: Ben asks the landlord.
-* Beschluss: no decision (German labels are not read)
+* Beschluss: a decision too (a template in German)
 Decision:
 Decisions were taken quickly.
 
@@ -1057,7 +1120,8 @@ Decisions were taken quickly.
             vec![
                 "The bins stay in the yard from now on.",
                 "We buy a compost bin.",
-                "Ben asks the landlord."
+                "Ben asks the landlord.",
+                "a decision too (a template in German)"
             ]
         );
         assert_eq!(
@@ -1132,9 +1196,10 @@ Decisions were taken quickly.
         let link = "https://wiki.test/doc/house-plenum-2026-11-01";
         let moved = Some("2026-10-31 19:00".parse().unwrap());
         let texts = [
-            announcement(&plenum(), key(), link, 2, moved, Publication::Confidential),
+            announcement(&plenum(), key(), link, moved, Publication::Confidential),
             reminder(&plenum(), key(), link, false, Publication::Confidential),
             cancellation(&plenum(), key(), link, Publication::Confidential),
+            cancelled_link(&plenum(), key(), link, Publication::Confidential),
             closed_note(
                 &plenum(),
                 key(),
@@ -1148,21 +1213,24 @@ Decisions were taken quickly.
             assert!(t.contains("House plenum"), "{t}");
         }
         assert!(texts[0].contains("Sunday, 1 November 2026 at 19:00 (moved from Saturday"));
-        assert!(texts[0].contains("confidential") && texts[0].contains("!top"));
-        assert!(texts[3].contains("are closed") && texts[3].contains("confidential"));
+        assert!(texts[0].contains("confidential"));
+        assert!(texts[4].contains("are closed") && texts[4].contains("confidential"));
 
         // link only: the link, never a decision or a task
-        let a = announcement(&plenum(), key(), link, 2, None, Publication::Link);
-        assert!(a.contains(link) && a.contains("2 items") && a.contains("only the link"));
+        let a = announcement(&plenum(), key(), link, None, Publication::Link);
+        assert!(a.contains(link) && a.contains("page"), "{a}");
         assert!(reminder(&plenum(), key(), link, true, Publication::Link).contains(link));
         let closed = closed_note(&plenum(), key(), link, Publication::Link, PdfNote::Failed);
         assert!(closed.contains(link) && closed.contains("PDF could not be made"));
 
         // full: as always, and how to share less
-        let a = announcement(&plenum(), key(), link, 0, None, Publication::Full);
-        assert!(a.contains(&format!("Agenda and minutes: {link}")));
-        assert!(a.contains("`!minutes confidential`"), "{a}");
+        let a = announcement(&plenum(), key(), link, None, Publication::Full);
+        assert!(
+            a.ends_with(&format!("`!top <topic>` here.\n\n{link}")),
+            "{a}"
+        );
         assert!(cancellation(&plenum(), key(), link, Publication::Full).contains(link));
+        assert!(cancelled_link(&plenum(), key(), link, Publication::Full).contains(link));
     }
 
     #[test]
@@ -1216,12 +1284,11 @@ Decisions were taken quickly.
             &[carried("Ben: cleaning rota")],
             &[carried("Decision [one]")],
             &links,
-            None,
         );
-        assert!(t.contains("[agenda and minutes](https://wiki.test/doc/p)\n"));
+        assert!(t.contains("[its page](https://wiki.test/doc/p), for topics and minutes\n"));
         assert!(
             t.contains(
-                "(the agenda comes 3 days before) · confidential: nothing of it in the chat"
+                "(its page opens 3 days before, once the meeting before is over) · confidential: nothing of it in the chat"
             ),
             "{t}"
         );
@@ -1242,7 +1309,7 @@ Decisions were taken quickly.
         // how the minutes work, with the plenum's own times and links
         assert!(
             t.contains("## How the minutes work")
-                && t.contains("3 days before it, the bot makes the minutes from the [template](https://wiki.test/doc/tpl)")
+                && t.contains("Up to 3 days before it, once the meeting before is over, the bot opens its page from the [template](https://wiki.test/doc/tpl)")
                 && t.contains("12 hours after its end")
                 && t.contains("[list of decisions](https://wiki.test/doc/dec)")
                 && t.contains("[House plenum: Example minutes](https://wiki.test/doc/example)"),

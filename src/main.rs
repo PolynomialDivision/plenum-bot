@@ -20,13 +20,13 @@ mod engine;
 mod link_delivery;
 mod linking;
 mod outline;
+mod page;
 mod pdf;
 mod plenum_settings;
 mod protocol;
 mod schedule;
 mod state;
 mod stay;
-mod topics;
 
 use std::{
     sync::Arc,
@@ -42,23 +42,16 @@ use mxbot_common::{
         attachment::AttachmentConfig,
         deserialized_responses::EncryptionInfo,
         room::RoomMember,
-        room::{IncludeRelations, RelationsOptions},
         ruma::{
-            api::Direction,
             events::{
-                reaction::{OriginalSyncReactionEvent, ReactionEventContent},
-                relation::{Annotation, InReplyTo, RelationType, Reply},
-                room::{
-                    message::{
-                        MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
-                        RoomMessageEventContent,
-                    },
-                    redaction::OriginalSyncRoomRedactionEvent,
+                room::message::{
+                    MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
+                    RoomMessageEventContent,
                 },
                 AnySyncMessageLikeEvent, AnySyncTimelineEvent, Mentions, SyncMessageLikeEvent,
             },
             OwnedEventId, OwnedRoomAliasId, OwnedRoomId, OwnedTransactionId, OwnedUserId,
-            RoomAliasId, RoomId, UInt, UserId,
+            RoomAliasId, RoomId, UserId,
         },
         Client, Room, RoomMemberships, RoomState,
     },
@@ -70,7 +63,7 @@ use mxbot_common::{
 use tracing::{error, info, warn};
 
 use crate::{
-    engine::{Chat, Engine, Inbound, Origin, Place, Scope, Sender},
+    engine::{Chat, Engine, Notice, Scope, Sender},
     link_delivery::LinkChat,
     linking::LinkDesk,
     outline::Outline,
@@ -127,9 +120,10 @@ fn is_admin(m: &RoomMember) -> bool {
     }
 }
 
+// The engine decides what is sent (`engine::sends`); the notice only says what a message is.
 impl Chat for MatrixChat {
-    async fn send(&self, room: &RoomId, markdown: &str, txn: &str) -> Result<()> {
-        self.send_mentioning(room, markdown, &[], txn).await
+    async fn send(&self, room: &RoomId, markdown: &str, notice: Notice, txn: &str) -> Result<()> {
+        self.send_mentioning(room, markdown, &[], notice, txn).await
     }
 
     async fn send_mentioning(
@@ -137,6 +131,7 @@ impl Chat for MatrixChat {
         room: &RoomId,
         markdown: &str,
         users: &[OwnedUserId],
+        _notice: Notice,
         txn: &str,
     ) -> Result<()> {
         let room = self.room(room)?;
@@ -146,7 +141,39 @@ impl Chat for MatrixChat {
         Ok(())
     }
 
-    async fn send_file(&self, room: &RoomId, name: &str, bytes: Vec<u8>, txn: &str) -> Result<()> {
+    async fn post(
+        &self,
+        room: &RoomId,
+        markdown: &str,
+        _notice: Notice,
+        txn: &str,
+    ) -> Result<String> {
+        let room = self.room(room)?;
+        let txn: OwnedTransactionId = txn.into();
+        let event =
+            mxbot_common::send::send_with_retry_txn(&room, message(markdown, &[]), &txn).await?;
+        Ok(event.to_string())
+    }
+
+    async fn edit(&self, room: &RoomId, event: &str, markdown: &str, txn: &str) -> Result<()> {
+        let room = self.room(room)?;
+        let event = OwnedEventId::try_from(event)?;
+        // nobody is pinged by the edit
+        let content = message(markdown, &[])
+            .make_replacement(ReplacementMetadata::new(event, Some(Mentions::new())));
+        let txn: OwnedTransactionId = txn.into();
+        mxbot_common::send::send_with_retry_txn(&room, content, &txn).await?;
+        Ok(())
+    }
+
+    async fn send_file(
+        &self,
+        room: &RoomId,
+        name: &str,
+        bytes: Vec<u8>,
+        _notice: Notice,
+        txn: &str,
+    ) -> Result<()> {
         let room = self.room(room)?;
         let txn: OwnedTransactionId = txn.into();
         room.send_attachment(
@@ -228,93 +255,6 @@ impl Chat for MatrixChat {
     async fn resolve_alias(&self, alias: &str) -> Result<OwnedRoomId> {
         let alias = RoomAliasId::parse(alias).with_context(|| format!("{alias:?} is no alias"))?;
         Ok(self.client.resolve_room_alias(&alias).await?.room_id)
-    }
-
-    async fn post(
-        &self,
-        room: &RoomId,
-        markdown: &str,
-        users: &[OwnedUserId],
-        place: Place<'_>,
-        txn: &str,
-    ) -> Result<String> {
-        let room = self.room(room)?;
-        let mut content = message(markdown, users);
-        match place {
-            Place::Room => {}
-            Place::ReplyTo(event) => {
-                let event = OwnedEventId::try_from(event)?;
-                content.relates_to = Some(Relation::Reply(Reply::new(InReplyTo::new(event))));
-            }
-            Place::Thread(root) => {
-                let root = OwnedEventId::try_from(root)?;
-                content = mxbot_common::send::in_thread(content, root.clone(), root);
-            }
-        }
-        let txn: OwnedTransactionId = txn.into();
-        let event = mxbot_common::send::send_with_retry_txn(&room, content, &txn).await?;
-        Ok(event.to_string())
-    }
-
-    async fn edit(
-        &self,
-        room: &RoomId,
-        event: &str,
-        markdown: &str,
-        users: &[OwnedUserId],
-        txn: &str,
-    ) -> Result<()> {
-        let room = self.room(room)?;
-        let event = OwnedEventId::try_from(event)?;
-        // the original's mentions: nobody is pinged again by the edit
-        let content = message(markdown, users).make_replacement(ReplacementMetadata::new(
-            event,
-            Some(Mentions::with_user_ids(users.iter().cloned())),
-        ));
-        let txn: OwnedTransactionId = txn.into();
-        mxbot_common::send::send_with_retry_txn(&room, content, &txn).await?;
-        Ok(())
-    }
-
-    async fn react(&self, room: &RoomId, event: &str, key: &str, txn: &str) -> Result<()> {
-        let room = self.room(room)?;
-        let event = OwnedEventId::try_from(event)?;
-        let content = ReactionEventContent::new(Annotation::new(event, key.to_owned()));
-        let txn: OwnedTransactionId = txn.into();
-        mxbot_common::send::send_with_retry_txn(&room, content, &txn).await?;
-        Ok(())
-    }
-
-    async fn reactions(&self, room: &RoomId, event: &str) -> Result<Vec<(OwnedUserId, String)>> {
-        let room = self.room(room)?;
-        let event = OwnedEventId::try_from(event)?;
-        let mut out = Vec::new();
-        let mut from = None;
-        // at most 1000 (a topic with more is counted as far as that)
-        for _ in 0..10 {
-            let opts = RelationsOptions {
-                from: from.clone(),
-                // oldest first: a flood of new ones cannot push the author's 🤝 out
-                dir: Direction::Forward,
-                limit: Some(UInt::from(100u32)),
-                include_relations: IncludeRelations::RelationsOfType(RelationType::Annotation),
-                ..Default::default()
-            };
-            let page = room.relations(event.clone(), opts).await?;
-            for ev in &page.chunk {
-                if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Reaction(
-                    SyncMessageLikeEvent::Original(r),
-                ))) = ev.raw().deserialize()
-                {
-                    out.push((r.sender, r.content.relates_to.key));
-                }
-            }
-            match page.next_batch_token {
-                Some(token) => from = Some(token),
-                None => break,
-            }
-        }
-        Ok(out)
     }
 }
 
@@ -506,7 +446,6 @@ async fn main() -> Result<()> {
 
     let own_room = Arc::new(OwnRoom::of(&bot.user_id));
     install_handler(&bot, &engine, &link_desk, &own_room);
-    install_topic_handlers(&bot, &engine);
     info!("Starting sync...");
     bot.initial_sync().await;
     match own_room.id(&bot.client).await {
@@ -828,7 +767,7 @@ async fn replied_topic(
     ev: &OriginalSyncRoomMessageEvent,
     body: &str,
     keys: &[&str],
-) -> Option<(String, String, OwnedUserId, OwnedEventId)> {
+) -> Option<(String, String)> {
     let mut words = body.split_whitespace();
     if words.next().map(str::to_lowercase).as_deref() != Some("!top") {
         return None;
@@ -870,7 +809,7 @@ async fn replied_topic(
         Some(k) => format!("!top {k} {topic}"),
         None => format!("!top {topic}"),
     };
-    Some((command, author, original.sender, original.event_id))
+    Some((command, author))
 }
 
 fn install_handler(
@@ -899,61 +838,19 @@ fn install_handler(
                 if dispatch == Dispatch::Handled {
                     return;
                 }
-                let in_plenum_room = rooms.contains(room.room_id());
-                // A fresh Matrix store syncs the rooms' history: none of it is news.
-                if mxbot_common::events::is_replayed(ev.origin_server_ts) {
-                    return;
-                }
-                // For the topics (topic_flow.rs): an edit, a message in a thread; only noted.
-                if in_plenum_room {
-                    match &ev.content.relates_to {
-                        Some(Relation::Replacement(r)) => {
-                            if let MessageType::Text(t) = &r.new_content.msgtype {
-                                engine.note(Inbound::Edit {
-                                    room: room.room_id().to_owned(),
-                                    original: r.event_id.to_string(),
-                                    sender: ev.sender.clone(),
-                                    body: t.body.clone(),
-                                });
-                            }
-                            return; // an edit is no command
-                        }
-                        Some(Relation::Thread(thread)) => {
-                            // only a proposal matters (and only the author's: the engine)
-                            if let MessageType::Text(t) = &ev.content.msgtype {
-                                if topics::proposal_in(&t.body).is_some() {
-                                    engine.note(Inbound::Thread {
-                                        room: room.room_id().to_owned(),
-                                        root: thread.event_id.to_string(),
-                                        event: ev.event_id.to_string(),
-                                        sender: ev.sender.clone(),
-                                        body: mxbot_common::format::strip_reply_fallback(&t.body)
-                                            .to_owned(),
-                                    });
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
                 let MessageType::Text(text) = &ev.content.msgtype else {
                     return;
                 };
-                // Old commands are no orders (an old `!minutes done` would close the meeting
-                // that is open now); a topic is one even after the bot was down a while.
+                // A fresh Matrix store syncs the rooms' history: old commands are no orders
+                // (an old `!minutes done` would close the meeting that is open now).
                 let now = chrono::Utc::now();
-                let old =
-                    now.timestamp_millis() - i64::from(ev.origin_server_ts.0) > COMMAND_MAX_AGE_MS;
-                let is_top = mxbot_common::format::strip_reply_fallback(&text.body)
-                    .trim_start()
-                    .get(..4)
-                    .is_some_and(|h| h.eq_ignore_ascii_case("!top"));
-                if old && !(in_plenum_room && is_top) {
+                if now.timestamp_millis() - i64::from(ev.origin_server_ts.0) > COMMAND_MAX_AGE_MS {
                     info!(event = %ev.event_id, "An old message from the history, left alone");
                     return;
                 }
                 // `!link` from an account on another server, in a direct chat (anywhere else it
                 // only says where). The code is in the answer only, never in the log.
+                let in_plenum_room = rooms.contains(room.room_id());
                 let direct = !in_plenum_room && room.active_members_count() == 2;
                 let sent = ev
                     .origin_server_ts
@@ -996,30 +893,19 @@ fn install_handler(
                 } else {
                     None
                 };
-                let (body, author, from_user, from_event) = match &replied {
-                    Some((command, author, user, event)) => (
-                        command.as_str(),
-                        Some(author.clone()),
-                        Some(user.clone()),
-                        Some(event.to_string()),
-                    ),
-                    None => (body, None, None, None),
+                let (body, author) = match &replied {
+                    Some((command, author)) => (command.as_str(), Some(author.clone())),
+                    None => (body, None),
                 };
                 let Some(command) = commands::parse_for(body, &keys) else {
                     return;
                 };
-                if old && !matches!(command, commands::Command::Top { .. }) {
-                    return;
-                }
-                let name = mxbot_common::format::fetch_names(&room, &[ev.sender.as_str()])
-                    .await
-                    .remove(ev.sender.as_str())
-                    .unwrap_or_else(|| ev.sender.localpart().to_owned());
-                let origin = Origin {
-                    event: Some(ev.event_id.to_string()),
-                    from: author,
-                    from_user,
-                    from_event,
+                let name = match author {
+                    Some(a) => a,
+                    None => mxbot_common::format::fetch_names(&room, &[ev.sender.as_str()])
+                        .await
+                        .remove(ev.sender.as_str())
+                        .unwrap_or_else(|| ev.sender.localpart().to_owned()),
                 };
                 let sender = Sender {
                     id: ev.sender.clone(),
@@ -1031,11 +917,8 @@ fn install_handler(
                     Scope::Room
                 };
                 let answer = engine
-                    .command_from(room.room_id(), &sender, command, now, scope, &origin)
+                    .command_in(room.room_id(), &sender, command, now, scope)
                     .await;
-                if answer.is_empty() {
-                    return; // a topic's message was the answer
-                }
                 let content = message(&answer, &[]);
                 if let Err(e) = mxbot_common::send::send_with_retry(&room, content).await {
                     error!("Answering in {} failed: {e}", room.room_id());
@@ -1043,63 +926,6 @@ fn install_handler(
             }
         },
     );
-}
-
-/// Reactions and redactions in the plenums' rooms, for the topics (topic_flow.rs): only noted,
-/// the next tick counts them from the homeserver.
-fn install_topic_handlers(bot: &Bot, engine: &Arc<PlenumEngine>) {
-    let rooms = engine.rooms();
-    let me = bot.user_id.clone();
-    {
-        let engine = Arc::clone(engine);
-        let rooms = rooms.clone();
-        let me = me.clone();
-        bot.client
-            .clone()
-            .add_event_handler(move |ev: OriginalSyncReactionEvent, room: Room| {
-                let engine = Arc::clone(&engine);
-                let rooms = rooms.clone();
-                let me = me.clone();
-                async move {
-                    if ev.sender == me
-                        || room.state() != RoomState::Joined
-                        || !rooms.contains(room.room_id())
-                        || mxbot_common::events::is_replayed(ev.origin_server_ts)
-                    {
-                        return;
-                    }
-                    engine.note(Inbound::Reaction {
-                        room: room.room_id().to_owned(),
-                        target: ev.content.relates_to.event_id.to_string(),
-                    });
-                }
-            });
-    }
-    let engine = Arc::clone(engine);
-    bot.client
-        .clone()
-        .add_event_handler(move |ev: OriginalSyncRoomRedactionEvent, room: Room| {
-            let engine = Arc::clone(&engine);
-            let rooms = rooms.clone();
-            let me = me.clone();
-            async move {
-                if ev.sender == me
-                    || room.state() != RoomState::Joined
-                    || !rooms.contains(room.room_id())
-                    || mxbot_common::events::is_replayed(ev.origin_server_ts)
-                {
-                    return;
-                }
-                let Some(redacts) = ev.content.redacts.as_ref().or(ev.redacts.as_ref()) else {
-                    return;
-                };
-                engine.note(Inbound::Redaction {
-                    room: room.room_id().to_owned(),
-                    redacts: redacts.to_string(),
-                    sender: ev.sender.clone(),
-                });
-            }
-        });
 }
 
 /// The bot's own room, known by its room ID: the alias `#<bot localpart>:<bot server>` (`make
