@@ -284,8 +284,11 @@ made already (meetings close together). Pages from the template of before 2026-1
 line "➕ New items from the chat (!top) go here." for chat items; it is still found.
 
 A plenum's collection and documents are found again by their IDs: when its name changes, they
-are renamed, not made anew; a document nobody changed since the bot made it gets the new text
-too. A private collection is only ever found by its ID, never taken over by its name.
+are renamed, not made anew. A document that still has the bot's text gets the bot's newest
+one: nobody changed it since the bot made it, it has the text the bot wrote last (its
+fingerprint in the state), or one of the bot's earlier versions (`src/former.rs`: the old
+template and example minutes). Compared by letters and digits only, as Outline gives the text
+back in its own Markdown. A person's change keeps the document theirs. A private collection is only ever found by its ID, never taken over by its name.
 
 **The house group** (2026-10-31, for subtenants): Outline 1.12.0 self-hosted has no guest role
 (its Community plan refuses it), so a subtenant in the wiki is a member or viewer, and both read

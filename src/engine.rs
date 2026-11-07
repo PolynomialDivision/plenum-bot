@@ -55,7 +55,7 @@ use crate::{
     calendar::Occurrence,
     commands::{Command, When},
     config::{self, Access, Messages, PdfConfig, Plenum, Publication},
-    page, plenum_settings,
+    former, page, plenum_settings,
     protocol::{self, PdfNote},
     schedule::{self, MeetingKey},
     state::{Carried, CarriedTopic, LinkMessage, Meeting, State, Top},
@@ -1131,7 +1131,9 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 &collection,
                 &p.rules_title(),
                 &protocol::rules_doc_text(p),
+                &[],
                 ps.rules_doc_id.as_deref(),
+                &mut ps.written,
             )
             .await?;
         ps.urls.insert("rules".into(), rules.url);
@@ -1141,7 +1143,9 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 &collection,
                 &p.protocols_title(),
                 &protocol::protocols_doc_text(p),
+                &[],
                 ps.protocols_doc_id.as_deref(),
+                &mut ps.written,
             )
             .await?;
         ps.urls.insert("protocols".into(), protocols.url);
@@ -1151,7 +1155,9 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 &collection,
                 &p.example_title(),
                 &protocol::example_doc_text(p),
+                &former::examples(p),
                 ps.example_doc_id.as_deref(),
+                &mut ps.written,
             )
             .await?;
         ps.urls.insert("example".into(), example.url);
@@ -1161,7 +1167,9 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 &collection,
                 &p.overview_title(),
                 "",
+                &[],
                 ps.overview_doc_id.as_deref(),
+                &mut ps.written,
             )
             .await?;
         if ps.overview_doc_id.as_deref() != Some(overview.id.as_str()) {
@@ -1174,7 +1182,9 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 &collection,
                 &p.template_title(),
                 protocol::DEFAULT_TEMPLATE,
+                &former::templates(),
                 ps.template_doc_id.as_deref(),
+                &mut ps.written,
             )
             .await?;
         ps.template_doc_id = Some(template.id.clone());
@@ -1184,7 +1194,9 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 &collection,
                 &p.decisions_title(),
                 &protocol::decisions_doc_text(p),
+                &[],
                 ps.decisions_doc_id.as_deref(),
+                &mut ps.written,
             )
             .await?;
         ps.decisions_doc_id = Some(decisions.id.clone());
@@ -1194,47 +1206,73 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
 
     /// The document `known` (if it still exists and is in the collection), else the one with
     /// `title`, else a new one. A known one with another title (the plenum's name or the
-    /// bot's language changed) gets `title`, and `text` too if nobody changed it since the
-    /// bot made it.
+    /// bot's language changed) gets `title`. One that still has the bot's text gets `text`
+    /// (a better explanation reaches every area): nobody changed it since the bot made it,
+    /// it has the text the bot last wrote (`written`), or one the bot wrote in an earlier
+    /// version (`earlier`). Empty `text`: the bot writes the document elsewhere.
     async fn ensure_doc(
         &self,
         collection: &str,
         title: &str,
         text: &str,
+        earlier: &[String],
         known: Option<&str>,
+        written: &mut BTreeMap<String, u64>,
     ) -> Result<Doc> {
+        let mut found = None;
         if let Some(id) = known {
-            if let Some(mut d) = self.wiki.doc(id).await? {
+            if let Some(d) = self.wiki.doc(id).await? {
                 if d.collection_id.as_deref().is_none_or(|c| c == collection) {
-                    // Nobody changed it since the bot made it: it gets the bot's newest text
-                    // (a better explanation reaches every area).
-                    if d.untouched && !text.is_empty() && d.text.trim() != text.trim() {
-                        info!(title = %title, "The bot's text of an untouched document, renewed");
-                        self.wiki.replace(&d.id, text).await?;
-                        d.text = text.to_owned();
-                    }
-                    if d.title != title {
-                        info!(from = %d.title, to = %title, "Renaming the document");
-                        self.wiki.rename(&d.id, title).await?;
-                        d.title = title.to_owned();
-                    }
-                    return Ok(d);
+                    found = Some(d);
                 }
             }
         }
-        if let Some(d) = self.wiki.find_doc(collection, title).await? {
-            return Ok(d);
+        if found.is_none() {
+            found = self.wiki.find_doc(collection, title).await?;
         }
-        info!(%title, "Creating the document");
-        self.wiki
-            .create_doc(
-                &uuid::Uuid::new_v4().to_string(),
-                collection,
-                None,
-                title,
-                text,
-            )
-            .await
+        let Some(mut d) = found else {
+            info!(%title, "Creating the document");
+            let d = self
+                .wiki
+                .create_doc(
+                    &uuid::Uuid::new_v4().to_string(),
+                    collection,
+                    None,
+                    title,
+                    text,
+                )
+                .await?;
+            if !text.is_empty() {
+                written.insert(d.id.clone(), former::fingerprint(&d.text));
+            }
+            return Ok(d);
+        };
+        if !text.is_empty() {
+            let has = former::fingerprint(&d.text);
+            let bots = d.untouched
+                || written.get(&d.id) == Some(&has)
+                || earlier.iter().any(|t| former::fingerprint(t) == has);
+            if bots && has != former::fingerprint(text) {
+                match self.wiki.replace(&d.id, text).await {
+                    Ok(()) => {
+                        info!(%title, "The bot's text of a document nobody changed, renewed");
+                        d.text = text.to_owned();
+                    }
+                    // the old text stays (an archived document: Outline 403); tried again
+                    // the next time
+                    Err(e) => warn!(%title, "Renewing the bot's text: {e:#}"),
+                }
+            }
+            if bots {
+                written.insert(d.id.clone(), former::fingerprint(&d.text));
+            }
+        }
+        if d.title != title {
+            info!(from = %d.title, to = %title, "Renaming the document");
+            self.wiki.rename(&d.id, title).await?;
+            d.title = title.to_owned();
+        }
+        Ok(d)
     }
 
     async fn prepare(&self, st: &mut State, p: &Plenum, key: &str) -> Result<()> {
@@ -3490,6 +3528,8 @@ pub(crate) mod fakes {
         pub pins: StdMutex<Vec<(String, String, String)>>,
         pub pin_calls: StdMutex<u32>,
         pub no_pins: StdMutex<bool>,
+        /// documents.update refused (an archived document)
+        pub no_replace: StdMutex<bool>,
     }
 
     impl FakeWiki {
@@ -3608,6 +3648,9 @@ pub(crate) mod fakes {
         }
         async fn replace(&self, id: &str, text: &str) -> Result<()> {
             self.check()?;
+            if *self.no_replace.lock().unwrap() {
+                anyhow::bail!("Outline 403 authorization_error");
+            }
             let mut docs = self.docs.lock().unwrap();
             let (d, _) = docs
                 .iter_mut()
@@ -4512,6 +4555,109 @@ mod tests {
             "{}",
             dec.text
         );
+    }
+
+    /// A document as the old bot left it: its text in Outline's own Markdown, changed since it
+    /// was made (by the bot's own renewal).
+    fn as_the_old_bot_left_it(e: &Engine<FakeWiki, FakeChat>, title: &str, text: &str) {
+        let mut docs = e.wiki.docs.lock().unwrap();
+        let (d, _) = docs
+            .iter_mut()
+            .find(|(d, del)| d.title == title && !del)
+            .unwrap();
+        d.text = text.replace("[]", "\\[\\]").replace("\n\n", "\n\n\n");
+        d.untouched = false;
+    }
+
+    #[tokio::test]
+    async fn the_bots_former_template_and_example_get_the_new_texts() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 1, 12, 0)).await; // the area, no page yet
+        let p = protocol::tests_plenum();
+        as_the_old_bot_left_it(e, "House plenum: Template", &former::templates()[1]);
+        as_the_old_bot_left_it(e, "House plenum: Example minutes", &former::examples(&p)[0]);
+        // state.json of the old bot: no fingerprints
+        e.state
+            .lock()
+            .await
+            .plenums
+            .get_mut("house")
+            .unwrap()
+            .written
+            .clear();
+        e.tick(at(2026, 10, 1, 13, 1)).await; // the area checked again
+        let tpl = e.wiki.by_title("House plenum: Template").unwrap();
+        assert_eq!(tpl.text, protocol::DEFAULT_TEMPLATE);
+        let eg = e.wiki.by_title("House plenum: Example minutes").unwrap();
+        assert_eq!(eg.text, protocol::example_doc_text(&p));
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        let nov = e.wiki.by_title("House plenum 2026-11-01").unwrap();
+        assert!(nov.text.contains("## Topics"), "{}", nov.text);
+    }
+
+    #[tokio::test]
+    async fn the_text_the_bot_wrote_last_is_renewed_too() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 1, 12, 0)).await;
+        // the bot renewed it once (no longer untouched) with a text that has changed since
+        let id = e.wiki.by_title("House plenum: Rules").unwrap().id;
+        as_the_old_bot_left_it(
+            e,
+            "House plenum: Rules",
+            "What applies: the bot's text of a version to come",
+        );
+        e.state
+            .lock()
+            .await
+            .plenums
+            .get_mut("house")
+            .unwrap()
+            .written
+            .insert(
+                id,
+                former::fingerprint("What applies: the bot's text of a version to come"),
+            );
+        e.tick(at(2026, 10, 1, 13, 1)).await;
+        let rules = e.wiki.by_title("House plenum: Rules").unwrap();
+        assert_eq!(
+            rules.text,
+            protocol::rules_doc_text(&protocol::tests_plenum())
+        );
+        // and a person's change after that stays
+        edit_doc(e, "House plenum: Rules", |t| {
+            t.push_str("\nQuiet after 22:00.\n")
+        });
+        let writes = *e.wiki.writes.lock().unwrap();
+        e.tick(at(2026, 10, 1, 14, 2)).await;
+        assert!(e
+            .wiki
+            .by_title("House plenum: Rules")
+            .unwrap()
+            .text
+            .contains("Quiet after 22:00."));
+        assert_eq!(*e.wiki.writes.lock().unwrap(), writes, "nothing written");
+    }
+
+    #[tokio::test]
+    async fn a_renewal_the_wiki_refuses_does_not_stop_the_page() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:x")]);
+        let e = &t.engine;
+        e.tick(at(2026, 10, 1, 12, 0)).await;
+        as_the_old_bot_left_it(e, "House plenum: Template", &former::templates()[1]);
+        *e.wiki.no_replace.lock().unwrap() = true; // archived in the wiki: Outline 403
+        e.tick(at(2026, 10, 29, 19, 0)).await;
+        let nov = e.wiki.by_title("House plenum 2026-11-01").unwrap();
+        assert!(
+            nov.text.contains("## Agenda"),
+            "the old template: {}",
+            nov.text
+        );
+        *e.wiki.no_replace.lock().unwrap() = false;
+        e.tick(at(2026, 10, 29, 20, 1)).await;
+        let tpl = e.wiki.by_title("House plenum: Template").unwrap();
+        assert_eq!(tpl.text, protocol::DEFAULT_TEMPLATE, "tried again");
     }
 
     fn edit_doc(e: &Engine<FakeWiki, FakeChat>, title: &str, f: impl FnOnce(&mut String)) {

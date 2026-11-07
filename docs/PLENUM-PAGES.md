@@ -12,7 +12,7 @@ the room but the page's link.
 
 | Area | Base (ab826dd, deployed) | Room topics (8a0f700, never deployed) |
 |---|---|---|
-| Page | "<Name> YYYY-MM-DD" under "<Name>: Minutes", made `prepare_days` (3) before from the wiki document "<Name>: Template" (people may edit it; an untouched one follows the bot's default) | the same plus a `### #12` section per topic |
+| Page | "<Name> YYYY-MM-DD" under "<Name>: Minutes", made `prepare_days` (3) before from the wiki document "<Name>: Template" (people may edit it; one with the bot's text follows the bot's default) | the same plus a `### #12` section per topic |
 | Topics | `!top <text>` puts a line at a marker under "## Agenda" (or waits in `pending_tops`) | numbered topics, a bot message each, thread, reactions, edits, outcomes, `topics.json` |
 | Results | `Decision:` lines, open checkboxes = tasks; at close: decisions list, PDF, summary, open tasks into the next page | + an outcome per topic in its thread, carry-over |
 | Room | announcement, reminder, cancellation/move, summary + PDF, answers | + topic messages, 👍/🤝, edits, outcomes, setting changes |
@@ -285,8 +285,12 @@ and `[[plenum]]` refuse unknown keys, and so does `[pages]` in an image that kno
   src/plenum_settings.rs (smaller), the tag and gate, `Chat::post`/`edit` for the link message.
 - Fixed on the way: a patch whose text is missing (400 in Outline 1.12) is "not there" instead of
   an error; Shift-Enter lines in the extraction.
-- Migration: nothing of 8a0f700 was deployed. Untouched templates follow the new default,
-  edited ones keep theirs (no "Topics" heading: no topics, as before). The old marker of pages
+- Migration: nothing of 8a0f700 was deployed. Templates and example minutes with the bot's
+  text follow the new default, edited ones keep theirs (no "Topics" heading: no topics, as
+  before). "The bot's text" is not only Outline's untouched (updatedAt = createdAt): the old
+  bot's own renewal of 2026-10-23 had ended that, and on the rollout of 2026-11-07 no template
+  was renewed; the bot now also knows its earlier texts (`src/former.rs`) and keeps a
+  fingerprint of what it wrote (`written` in the state). The old marker of pages
   and templates is still found. `pending_tops` become topic blocks.
 
 ## 8. Reaching the wiki from outside
@@ -379,4 +383,4 @@ in Outline; the wiki stays VPN-only. Built: `page_after_days` (§4.1), pins (§6
 | Code | the dedup could drop a per-meeting publication (and cancel a meeting still in the calendar) | an occurrence with state of its own is never dropped |
 | Code | the re-key moved a meeting already under way | only meetings still to come |
 | Code | two tests could not fail | assert the move message; count every pins call |
-
+| Rollout 2026-11-07 | no template renewed (the old bot's renewal of 2026-10-23 had made them "changed"): the first pages had the old shape | earlier texts recognised (`src/former.rs`), the bot's last text fingerprinted; letters and digits only (Outline's Markdown checked on 1.12.0); a renewal Outline refuses only logged |

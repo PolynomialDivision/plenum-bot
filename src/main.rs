@@ -17,6 +17,7 @@ mod calendar;
 mod commands;
 mod config;
 mod engine;
+mod former;
 mod link_delivery;
 mod linking;
 mod outline;

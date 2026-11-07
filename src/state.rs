@@ -124,6 +124,11 @@ pub struct PlenumState {
     /// decisions, template.
     #[serde(default)]
     pub urls: BTreeMap<String, String>,
+    /// The fingerprint (`former::fingerprint`) of the bot's text in each of its documents
+    /// (by document ID): a document that still has it is the bot's, renewed when the bot's
+    /// text changes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub written: BTreeMap<String, u64>,
     /// The overview's text as last written (it is only written when it changes).
     #[serde(default)]
     pub overview_text: Option<String>,
