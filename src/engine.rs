@@ -61,6 +61,9 @@ use crate::{
     stay,
 };
 
+mod topic_flow;
+pub use topic_flow::{Inbound, Origin, Place};
+
 /// A document as the bot needs it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Doc {
@@ -150,6 +153,30 @@ pub trait Chat {
     async fn message_person(&self, user: &UserId, markdown: &str, key: &str) -> Result<()>;
     /// The room an alias (`#name:server`) points to.
     async fn resolve_alias(&self, alias: &str) -> Result<OwnedRoomId>;
+    /// Post Markdown at `place`, pinging `users`; its event ID. A resend with the same
+    /// transaction ID is dropped (as [`Self::send`]).
+    async fn post(
+        &self,
+        room: &RoomId,
+        markdown: &str,
+        users: &[OwnedUserId],
+        place: Place<'_>,
+        txn: &str,
+    ) -> Result<String>;
+    /// Replace the text of the bot's own message `event`; `users` are the ones it pinged
+    /// (nobody is pinged again).
+    async fn edit(
+        &self,
+        room: &RoomId,
+        event: &str,
+        markdown: &str,
+        users: &[OwnedUserId],
+        txn: &str,
+    ) -> Result<()>;
+    /// React to `event` with `key` (a button).
+    async fn react(&self, room: &RoomId, event: &str, key: &str, txn: &str) -> Result<()>;
+    /// The reactions under `event` as the homeserver has them now: (who, key).
+    async fn reactions(&self, room: &RoomId, event: &str) -> Result<Vec<(OwnedUserId, String)>>;
 }
 
 /// Where a command comes from: what the overview may show there.
@@ -214,6 +241,8 @@ pub struct Engine<W, C> {
     /// The plenums whose area was checked since the start: a restart (a deploy with a new
     /// name, say) checks every area at once, not only an hour after the last check.
     areas_checked: std::sync::Mutex<HashSet<String>>,
+    /// What came in from Matrix for the topics since the last tick (topic_flow.rs).
+    inbox: std::sync::Mutex<Vec<Inbound>>,
 }
 
 /// Who sent a command.
@@ -269,6 +298,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             state: Mutex::new(state),
             state_path,
             areas_checked: std::sync::Mutex::new(HashSet::new()),
+            inbox: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -297,13 +327,27 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     /// Everything that is due. Errors are logged per meeting; the others go on.
     pub async fn tick(&self, now: DateTime<Utc>) {
         let mut st = self.state.lock().await;
-        for p in &self.plenums {
+        let inbound = self.take_inbox();
+        self.handle_inbound(&mut st, &inbound, now);
+        // saved before anything is sent because of it (a withdrawal, a proposal)
+        if !inbound.is_empty() {
+            self.save_or_log(&st).await;
+        }
+        for base in &self.plenums {
+            // with the settings its room made (plenum_settings.rs)
+            let p = &self.effective(base, &st);
+            self.migrate_pending(&mut st, p);
             self.follow_calendar(&mut st, p, now).await;
             self.tick_plenum(&mut st, p, now).await;
+            self.tick_topics(&mut st, p, now).await;
             if let Err(e) = self.tick_area(&mut st, p, now).await {
                 warn!(plenum = %p.key, "Wiki area: {e:#}");
             }
             st.plenums.entry(p.key.clone()).or_default().prune();
+        }
+        // every plenum's topics, also with topics off or a plenum gone from the config
+        for area in st.book.plenums.values_mut() {
+            area.prune(now);
         }
         self.save_or_log(&st).await;
     }
@@ -357,12 +401,35 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             example: example.as_deref(),
             calendar: self.calendar_url.as_deref(),
         };
+        let topics = p.topics.enabled.then(|| {
+            let area = st.book.plenums.get(&p.key);
+            let open: Vec<&crate::topics::Topic> =
+                area.map(|a| a.open().collect()).unwrap_or_default();
+            let changed: Vec<(String, String)> = area
+                .map(|a| {
+                    a.settings
+                        .keys()
+                        .filter(|name| {
+                            p.topics.room_settings && crate::plenum_settings::is_setting(name)
+                        })
+                        .map(|name| {
+                            (
+                                name.clone(),
+                                crate::plenum_settings::current(p, &a.settings, name),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            crate::topics::overview_block(&open, &changed, area.map_or(&[][..], |a| &a.changes))
+        });
         Some(protocol::overview_text(
             p,
             &next,
             &ps.open_tasks,
             &ps.decisions,
             &links,
+            topics.as_deref(),
         ))
     }
 
@@ -479,13 +546,25 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let link = self.link_of(m);
         let shared = publication(p, m);
         self.save(st).await?;
-        self.chat
-            .send(
-                &p.room,
-                &protocol::cancellation(p, start, &link, shared),
-                &txn,
-            )
-            .await?;
+        let mut text = protocol::cancellation(p, start, &link, shared);
+        let there: Vec<String> = st
+            .book
+            .plenums
+            .get(&p.key)
+            .map(|a| {
+                a.open()
+                    .filter(|t| t.placed.as_deref() == Some(id))
+                    .map(|t| format!("#{}", t.number))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !there.is_empty() && p.topics.enabled {
+            text.push_str(&format!(
+                "\n\nIts topics ({}) move to the next plenum.",
+                there.join(", ")
+            ));
+        }
+        self.chat.send(&p.room, &text, &txn).await?;
         meeting(st, p, id).cancel_notice.done = true;
         self.save(st).await
     }
@@ -839,6 +918,8 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             .iter()
             .map(protocol::top_line)
             .collect();
+        // the topics that went into a new protocol (topic_flow.rs)
+        let mut placed = Vec::new();
         let doc = match self.wiki.doc(&doc_id).await? {
             // Created before a restart: items sent since then go in like any chat item.
             Some(d) => {
@@ -858,12 +939,26 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                     text = protocol::insert_top(&text, line);
                 }
                 let parent = ps.protocols_doc_id.clone();
+                if p.topics.enabled {
+                    placed = self.due_for(st, p, key);
+                    text = self.with_topics(st, p, &placed, text);
+                }
                 info!(plenum = %p.key, meeting = %key, "Creating the protocol");
                 self.wiki
                     .create_doc(&doc_id, &collection, parent.as_deref(), &title, &text)
                     .await?
             }
         };
+        for n in placed {
+            if let Some(t) = st
+                .book
+                .plenums
+                .get_mut(&p.key)
+                .and_then(|a| a.topics.get_mut(&n))
+            {
+                t.placed = Some(key.to_owned());
+            }
+        }
         let ps = st.plenums.get_mut(&p.key).expect("set up");
         ps.pending_tops.clear();
         let m = ps.meetings.get_mut(key).expect("inserted");
@@ -930,23 +1025,47 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let moved_from = m.moved_from;
         let shared = publication(p, m);
         self.save(st).await?;
-        // The number of items is only known in the document now; count the list lines.
-        let tops = if shared == Publication::Confidential {
-            0
+        if p.topics.enabled {
+            // The agenda in it, and its event kept: it follows the agenda (topic_flow.rs).
+            let head = protocol::announcement(p, start, &link, 0, moved_from, shared);
+            let text = self.announcement_with_agenda(st, p, key, &head, shared);
+            let event = self
+                .chat
+                .post(&p.room, &text, &[], Place::Room, &txn)
+                .await?;
+            st.book
+                .plenums
+                .entry(p.key.clone())
+                .or_default()
+                .announcements
+                .insert(
+                    key.to_owned(),
+                    crate::topics::Posted {
+                        event,
+                        text,
+                        edits: 0,
+                        moved_from,
+                    },
+                );
         } else {
-            self.wiki
-                .doc(&doc_id)
-                .await?
-                .map(|d| count_tops(&d.text))
-                .unwrap_or(0)
-        };
-        self.chat
-            .send(
-                &p.room,
-                &protocol::announcement(p, start, &link, tops, moved_from, shared),
-                &txn,
-            )
-            .await?;
+            // The number of items is only known in the document now; count the list lines.
+            let tops = if shared == Publication::Confidential {
+                0
+            } else {
+                self.wiki
+                    .doc(&doc_id)
+                    .await?
+                    .map(|d| count_tops(&d.text))
+                    .unwrap_or(0)
+            };
+            self.chat
+                .send(
+                    &p.room,
+                    &protocol::announcement(p, start, &link, tops, moved_from, shared),
+                    &txn,
+                )
+                .await?;
+        }
         let m = meeting(st, p, key);
         m.announce.done = true;
         m.announce_again = false;
@@ -1305,6 +1424,22 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         now: DateTime<Utc>,
         scope: Scope,
     ) -> String {
+        self.command_from(room, sender, cmd, now, scope, &Origin::default())
+            .await
+    }
+
+    /// [`Self::command_in`] for a message `origin` says more about (its event, and whose
+    /// message a `!top` reply answers). An empty answer: nothing to say (a topic's message
+    /// was the answer).
+    pub async fn command_from(
+        &self,
+        room: &RoomId,
+        sender: &Sender,
+        cmd: Command,
+        now: DateTime<Utc>,
+        scope: Scope,
+        origin: &Origin,
+    ) -> String {
         const ORGANIZERS_ONLY: &str = "⛔ Only the organizers may do that here.";
         // the rooms' held removals: an admin in their direct chat with the bot only
         match (&cmd, scope) {
@@ -1322,9 +1457,74 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             Command::Help => help(),
             Command::Overview(key) => self.list(&mut st, room, key.as_deref(), now, scope),
             Command::Top { key, text } => match self.pick(room, key.as_deref()) {
-                Ok(p) => self.add_top(&mut st, p, sender, &text, now).await,
+                Ok(base) => {
+                    let p = &self.effective(base, &st);
+                    if p.topics.enabled {
+                        self.new_topic(&mut st, p, sender, origin, &text, now).await
+                    } else {
+                        // as before topics: the item by the author of the message it answers
+                        let named = Sender {
+                            id: sender.id.clone(),
+                            name: origin.from.clone().unwrap_or_else(|| sender.name.clone()),
+                        };
+                        self.add_top(&mut st, p, &named, &text, now).await
+                    }
+                }
                 Err(e) => e,
             },
+            Command::Topics(key) => match self.pick(room, key.as_deref()) {
+                Ok(base) => {
+                    let p = &self.effective(base, &st);
+                    if p.topics.enabled {
+                        self.topics_list(&mut st, p, now)
+                    } else {
+                        "Please add the topic: `!top <topic>`".to_owned()
+                    }
+                }
+                Err(e) => e,
+            },
+            Command::TopicAction {
+                key,
+                number,
+                action,
+            } => match self.pick(room, key.as_deref()) {
+                Ok(base) => {
+                    let p = &self.effective(base, &st);
+                    if p.topics.enabled {
+                        self.topic_action(&mut st, p, sender, number, action, now)
+                            .await
+                    } else {
+                        format!(
+                            "Topics are switched off for {} (`!plenum settings`); #{number} \
+                             waits until they are on again.",
+                            p.name
+                        )
+                    }
+                }
+                Err(e) => e,
+            },
+            Command::Settings(key) => match self.pick_for_settings(room, key.as_deref(), scope) {
+                Ok(p) => self.settings_text(&st, p, &sender.id, room),
+                Err(e) => e,
+            },
+            Command::Set { key, name, value } => {
+                match self.pick_for_settings(room, key.as_deref(), scope) {
+                    Ok(p) => {
+                        self.change_setting(&mut st, p, sender, room, &name, Some(&value), now)
+                            .await
+                    }
+                    Err(e) => e,
+                }
+            }
+            Command::Reset { key, name } => {
+                match self.pick_for_settings(room, key.as_deref(), scope) {
+                    Ok(p) => {
+                        self.change_setting(&mut st, p, sender, room, &name, None, now)
+                            .await
+                    }
+                    Err(e) => e,
+                }
+            }
             Command::Close(key) => match self.pick(room, key.as_deref()) {
                 Ok(p) if !self.may_organize(p, &sender.id) => ORGANIZERS_ONLY.to_owned(),
                 Ok(p) => self.request_close(&mut st, p, &sender.id, now),
@@ -1479,6 +1679,12 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 0 => {}
                 1 => line.push_str("\n1 item waits for the next minutes."),
                 n => line.push_str(&format!("\n{n} items wait for the next minutes.")),
+            }
+            let open = st.book.plenums.get(&p.key).map_or(0, |a| a.open().count());
+            match open {
+                0 => {}
+                1 => line.push_str("\n1 open topic (`!top` lists it)."),
+                n => line.push_str(&format!("\n{n} open topics (`!top` lists them).")),
             }
             out.push(line);
         }
@@ -2774,18 +2980,26 @@ fn count_tops(markdown: &str) -> usize {
 
 pub fn help() -> String {
     "📋 **Plenum bot**\n\n\
-     `!plenum`: when is the next plenum, where are the minutes\n\
-     `!top <topic>`: an item for the agenda\n\
+     `!top <topic>`: bring in a topic (or reply to a message with `!top`). Start with \
+     `decide:` for one to decide; a line `Proposal: …` is your proposal.\n\
+     Under the topic's message: tap 👍 to hear what came of it; reply in its thread to \
+     discuss it.\n\
+     `!top`: the topics so far\n\
+     `!top #12 withdraw|later|done|again|decide|talk` (also zurückziehen, später, erledigt, \
+     nochmal, entscheiden, besprechen): change your topic (its author, the plenum's \
+     organizers, the bot admins)\n\
+     `!plenum`: the next plenum and its minutes\n\
+     `!plenum settings`: this plenum's settings (`!plenum set <name> <value>`, \
+     `!plenum reset <name>`)\n\
      `!minutes done`: close the minutes now (decisions, PDF, summary)\n\
-     `!minutes confidential`, `!minutes link`, `!minutes full`: nothing from the minutes in \
-     the chat, only the link, or the summary (as usual), for the meeting that is on or comes \
-     next; for another add its day: `!minutes confidential 14.11.`\n\
+     `!minutes confidential|link|full`: nothing of the minutes in the chat, only the link, or \
+     the summary (as usual), for the meeting that is on or comes next; another one by its \
+     day: `!minutes link 14.11.`\n\n\
      The meetings are in the plenum's Nextcloud calendar: add, move or cancel them there, or \
-     make a series; the bot follows it.\n\n\
-     A topic also works like this: reply to a message with `!top`.\n\
-     With several plenums in a room, add the key: `!top kitchen-floor-1 dishwasher`.\n\
-     In the minutes, every line that starts with \"Decision:\" goes into the list of decisions \
-     after the plenum (except on the agenda)."
+     make a series; the bot follows it. Several plenums in one room: add the key, \
+     `!top kitchen-floor-1 dishwasher`.\n\
+     In the minutes: write under each topic's heading (`### #12 …`); a line starting with \
+     \"Decision:\" is a decision (it goes into the list of decisions after the plenum)."
         .to_owned()
 }
 
@@ -3009,6 +3223,29 @@ pub(crate) mod fakes {
         pub dms: StdMutex<Vec<(String, String, String)>>,
         /// (alias, room)
         pub aliases: StdMutex<Vec<(String, String)>>,
+        /// (room, text, users, place, txn, event) of every post
+        pub posts: StdMutex<Vec<Post>>,
+        /// (room, event, text) of every edit
+        pub edits: StdMutex<Vec<(String, String, String)>>,
+        /// (room, event, key) of the bot's reactions
+        pub reacted: StdMutex<Vec<(String, String, String)>>,
+        /// the reactions under an event: (who, key)
+        pub reactions: StdMutex<HashMap<String, Vec<(String, String)>>>,
+        /// the transaction IDs of the edits (a resend is dropped, as by a homeserver)
+        pub edit_txns: StdMutex<Vec<String>>,
+        /// posts into threads fail (the rest works)
+        pub fail_threads: StdMutex<bool>,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Post {
+        pub room: String,
+        pub text: String,
+        pub users: Vec<String>,
+        /// "room", "reply:<event>", "thread:<event>"
+        pub place: String,
+        pub txn: String,
+        pub event: String,
     }
 
     impl FakeChat {
@@ -3153,6 +3390,97 @@ pub(crate) mod fakes {
                 .context("M_NOT_FOUND")?;
             Ok(room.as_str().try_into()?)
         }
+        async fn post(
+            &self,
+            room: &RoomId,
+            markdown: &str,
+            users: &[OwnedUserId],
+            place: Place<'_>,
+            txn: &str,
+        ) -> Result<String> {
+            if *self.fail.lock().unwrap()
+                || (*self.fail_threads.lock().unwrap() && matches!(place, Place::Thread(_)))
+            {
+                anyhow::bail!("matrix down");
+            }
+            let mut posts = self.posts.lock().unwrap();
+            // like a homeserver: a resend with the same transaction ID is the same event
+            if let Some(p) = posts.iter().find(|p| p.txn == txn) {
+                return Ok(p.event.clone());
+            }
+            let event = format!("$ev{}", posts.len() + 1);
+            posts.push(Post {
+                room: room.to_string(),
+                text: markdown.to_owned(),
+                users: users.iter().map(|u| u.to_string()).collect(),
+                place: match place {
+                    Place::Room => "room".to_owned(),
+                    Place::ReplyTo(e) => format!("reply:{e}"),
+                    Place::Thread(e) => format!("thread:{e}"),
+                },
+                txn: txn.to_owned(),
+                event: event.clone(),
+            });
+            drop(posts);
+            self.sent
+                .lock()
+                .unwrap()
+                .push((room.to_string(), markdown.to_owned(), txn.to_owned()));
+            Ok(event)
+        }
+        async fn edit(
+            &self,
+            room: &RoomId,
+            event: &str,
+            markdown: &str,
+            _users: &[OwnedUserId],
+            txn: &str,
+        ) -> Result<()> {
+            if *self.fail.lock().unwrap() {
+                anyhow::bail!("matrix down");
+            }
+            let mut seen = self.edit_txns.lock().unwrap();
+            if seen.iter().any(|t| t == txn) {
+                return Ok(()); // the homeserver drops it
+            }
+            seen.push(txn.to_owned());
+            self.edits.lock().unwrap().push((
+                room.to_string(),
+                event.to_owned(),
+                markdown.to_owned(),
+            ));
+            Ok(())
+        }
+        async fn react(&self, room: &RoomId, event: &str, key: &str, _txn: &str) -> Result<()> {
+            if *self.fail.lock().unwrap() {
+                anyhow::bail!("matrix down");
+            }
+            self.reacted
+                .lock()
+                .unwrap()
+                .push((room.to_string(), event.to_owned(), key.to_owned()));
+            Ok(())
+        }
+        async fn reactions(
+            &self,
+            _room: &RoomId,
+            event: &str,
+        ) -> Result<Vec<(OwnedUserId, String)>> {
+            if *self.fail.lock().unwrap() {
+                anyhow::bail!("matrix down");
+            }
+            Ok(self
+                .reactions
+                .lock()
+                .unwrap()
+                .get(event)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|(u, k)| Some((u.as_str().try_into().ok()?, k.clone())))
+                        .collect()
+                })
+                .unwrap_or_default())
+        }
     }
 }
 
@@ -3179,6 +3507,10 @@ mod tests {
             require_group: None,
             access: Access::House,
             publication: Publication::Full,
+            topics: crate::config::TopicRules {
+                enabled: false,
+                ..Default::default()
+            },
         }
     }
 

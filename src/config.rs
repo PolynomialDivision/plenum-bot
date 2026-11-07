@@ -3,7 +3,7 @@
 //! `[directory]` (who is in which group), `[members]` (the rooms' members follow the groups)
 //! and one `[[plenum]]` table per plenum.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{bail, Context, Result};
 use chrono_tz::Tz;
@@ -35,6 +35,79 @@ pub struct Config {
     pub members: MembersConfig,
     #[serde(rename = "plenum", default)]
     pub plenums: Vec<PlenumConfig>,
+    /// Topics (docs/TOPICS.md): a table of its own, so an older image (a rollback) ignores it.
+    #[serde(default)]
+    pub topics: TopicsConfig,
+}
+
+/// `[topics]`: numbered topics, their messages, the agenda in the announcement, the outcomes
+/// (docs/TOPICS.md). The house's values; `[topics.plenum.<key>]` changes them for one plenum,
+/// and with `room_settings` the plenum's room may change some of them (plenum_settings.rs).
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields, default)]
+pub struct TopicsConfig {
+    pub enabled: bool,
+    /// The people of a plenum may change its settings in its room (`!plenum set`).
+    pub room_settings: bool,
+    /// A topic not reached goes onto the next agenda.
+    pub carry_over: bool,
+    /// The outcome mentions who gave the topic a 👍.
+    pub tell_interested: bool,
+    pub plenum: BTreeMap<String, TopicsPlenumConfig>,
+}
+
+impl Default for TopicsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            room_settings: true,
+            carry_over: true,
+            tell_interested: true,
+            plenum: BTreeMap::new(),
+        }
+    }
+}
+
+/// `[topics.plenum.<key>]`: one plenum's values (unset: the house's).
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TopicsPlenumConfig {
+    pub enabled: Option<bool>,
+    pub room_settings: Option<bool>,
+    pub carry_over: Option<bool>,
+    pub tell_interested: Option<bool>,
+}
+
+/// How a plenum's topics behave (house-infra's values; the room's come on top).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TopicRules {
+    pub enabled: bool,
+    pub room_settings: bool,
+    pub carry_over: bool,
+    pub tell_interested: bool,
+}
+
+impl Default for TopicRules {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            room_settings: true,
+            carry_over: true,
+            tell_interested: true,
+        }
+    }
+}
+
+impl TopicsConfig {
+    fn rules(&self, key: &str) -> TopicRules {
+        let own = self.plenum.get(key).cloned().unwrap_or_default();
+        TopicRules {
+            enabled: own.enabled.unwrap_or(self.enabled),
+            room_settings: own.room_settings.unwrap_or(self.room_settings),
+            carry_over: own.carry_over.unwrap_or(self.carry_over),
+            tell_interested: own.tell_interested.unwrap_or(self.tell_interested),
+        }
+    }
 }
 
 /// The longest `[members] handover_days` and `handover_max_days`: a year.
@@ -397,6 +470,8 @@ pub struct Plenum {
     pub access: Access,
     /// For a meeting nobody set it for.
     pub publication: Publication,
+    /// `[topics]` for this plenum.
+    pub topics: TopicRules,
 }
 
 impl Plenum {
@@ -562,7 +637,16 @@ impl Config {
                 require_group,
                 access: p.access,
                 publication: p.publication.unwrap_or(self.defaults.publication),
+                topics: self.topics.rules(&p.key),
             });
+        }
+        if let Some(unknown) = self
+            .topics
+            .plenum
+            .keys()
+            .find(|k| !out.iter().any(|p| &p.key == *k))
+        {
+            bail!("[topics.plenum.{unknown}]: there is no plenum with that key");
         }
         Ok(out)
     }

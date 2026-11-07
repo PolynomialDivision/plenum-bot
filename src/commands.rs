@@ -34,8 +34,62 @@ pub enum Command {
         room: String,
         digest: String,
     },
+    /// `!top` alone (maybe with a key): the topics for the next meeting.
+    Topics(Option<String>),
+    /// `!top #12 withdraw|later|done|again|decide|talk` (maybe with a key).
+    TopicAction {
+        key: Option<String>,
+        number: u32,
+        action: TopicAction,
+    },
+    /// `!plenum settings [key]`
+    Settings(Option<String>),
+    /// `!plenum set [key] <name> <value>`
+    Set {
+        key: Option<String>,
+        name: String,
+        value: String,
+    },
+    /// `!plenum reset [key] <name>`
+    Reset {
+        key: Option<String>,
+        name: String,
+    },
     /// A command of the bot with a mistake in it; the text says what is wrong.
     Invalid(String),
+}
+
+/// What `!top #12 <action>` does to topic #12.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopicAction {
+    Withdraw,
+    Later,
+    Done,
+    Again,
+    Decide,
+    Talk,
+}
+
+impl TopicAction {
+    fn from_word(w: &str) -> Option<Self> {
+        Some(match w.to_lowercase().as_str() {
+            "withdraw" | "zurückziehen" | "zurueckziehen" => Self::Withdraw,
+            "later" | "später" | "spaeter" => Self::Later,
+            "done" | "erledigt" => Self::Done,
+            "again" | "nochmal" => Self::Again,
+            "decide" | "entscheiden" => Self::Decide,
+            "talk" | "besprechen" => Self::Talk,
+            _ => return None,
+        })
+    }
+}
+
+/// `#12` (or `12`) as a topic number.
+fn topic_number(w: &str) -> Option<u32> {
+    let d = w.strip_prefix('#').unwrap_or(w);
+    (!d.is_empty() && d.len() <= 6 && d.chars().all(|c| c.is_ascii_digit()))
+        .then(|| d.parse().ok())
+        .flatten()
 }
 
 /// A meeting by its day (the year may be left out: the next such day) and maybe its time.
@@ -157,9 +211,20 @@ pub fn parse_for(body: &str, keys: &[&str]) -> Option<Command> {
                 _ => (None, rest),
             };
             if text.is_empty() {
-                return Some(Command::Invalid(
-                    "Please add the topic: `!top <topic>`".to_owned(),
-                ));
+                return Some(Command::Topics(key));
+            }
+            // `!top #12 later`: exactly a number and an action (a topic may start with "#3 …")
+            let tw: Vec<&str> = text.split_whitespace().collect();
+            if let [n, w] = tw.as_slice() {
+                // a phone's autocorrect adds a dot or a capital
+                let w = w.trim_end_matches(['.', '!', ',', ';', '?']);
+                if let (Some(number), Some(action)) = (topic_number(n), TopicAction::from_word(w)) {
+                    return Some(Command::TopicAction {
+                        key,
+                        number,
+                        action,
+                    });
+                }
             }
             Some(Command::Top {
                 key,
@@ -189,6 +254,45 @@ pub fn parse_for(body: &str, keys: &[&str]) -> Option<Command> {
             match sub.as_deref() {
                 None => Some(Command::Overview(None)),
                 Some("help") => Some(Command::Help),
+                Some("settings") => {
+                    let (key, rest) = split_key(&words[1..]);
+                    if rest.is_empty() {
+                        Some(Command::Settings(key))
+                    } else {
+                        Some(Command::Invalid(format!(
+                            "To change one: `!plenum set {}`. `!plenum settings` alone lists them.",
+                            rest.join(" ")
+                        )))
+                    }
+                }
+                Some("set") => {
+                    let (key, rest) = split_key(&words[1..]);
+                    match rest.as_slice() {
+                        [name, value @ ..] if !value.is_empty() => Some(Command::Set {
+                            key,
+                            name: name.to_lowercase(),
+                            value: value.join(" "),
+                        }),
+                        _ => Some(Command::Invalid(
+                            "Like this: `!plenum set <name> <value>`, e.g. `!plenum set agenda_days 2`. \
+                             `!plenum settings` shows them all."
+                                .to_owned(),
+                        )),
+                    }
+                }
+                Some("reset") => {
+                    let (key, rest) = split_key(&words[1..]);
+                    match rest.as_slice() {
+                        [name] => Some(Command::Reset {
+                            key,
+                            name: name.to_lowercase(),
+                        }),
+                        _ => Some(Command::Invalid(
+                            "Like this: `!plenum reset <name>`. `!plenum settings` shows them all."
+                                .to_owned(),
+                        )),
+                    }
+                }
                 // The dates are the calendar's: moved, cancelled and added there.
                 Some("cancel") | Some("add") | Some("move") => Some(Command::Invalid(
                     "The meetings are in the plenum's Nextcloud calendar: add, move or cancel \
@@ -261,9 +365,75 @@ mod tests {
                 text: "dishwasher broken".into()
             })
         );
-        assert!(matches!(p("!top"), Some(Command::Invalid(_))));
-        assert!(matches!(
+        assert_eq!(p("!top"), Some(Command::Topics(None)));
+        assert_eq!(
             p("!top kitchen-floor-1"),
+            Some(Command::Topics(Some("kitchen-floor-1".into())))
+        );
+    }
+
+    #[test]
+    fn topic_actions_and_settings() {
+        assert_eq!(
+            p("!top #12 later"),
+            Some(Command::TopicAction {
+                key: None,
+                number: 12,
+                action: TopicAction::Later
+            })
+        );
+        assert_eq!(
+            p("!top kitchen-floor-1 #3 Erledigt"),
+            Some(Command::TopicAction {
+                key: Some("kitchen-floor-1".into()),
+                number: 3,
+                action: TopicAction::Done
+            })
+        );
+        // a topic that starts with a number is a topic
+        assert_eq!(
+            p("!top #3 floor bathroom"),
+            Some(Command::Top {
+                key: None,
+                text: "#3 floor bathroom".into()
+            })
+        );
+        assert!(matches!(p("!top #x done"), Some(Command::Top { .. })));
+        // as a phone writes it
+        assert_eq!(
+            p("!top 12 Later."),
+            Some(Command::TopicAction {
+                key: None,
+                number: 12,
+                action: TopicAction::Later
+            })
+        );
+        assert!(matches!(
+            p("!top #12 withdraw please"),
+            Some(Command::Top { .. })
+        ));
+        assert!(matches!(
+            p("!plenum settings agenda_days 2"),
+            Some(Command::Invalid(t)) if t.contains("!plenum set agenda_days 2")
+        ));
+        assert_eq!(p("!plenum settings"), Some(Command::Settings(None)));
+        assert_eq!(
+            p("!plenum set kitchen-floor-3 agenda_days 2"),
+            Some(Command::Set {
+                key: Some("kitchen-floor-3".into()),
+                name: "agenda_days".into(),
+                value: "2".into()
+            })
+        );
+        assert_eq!(
+            p("!plenum reset Reminder"),
+            Some(Command::Reset {
+                key: None,
+                name: "reminder".into()
+            })
+        );
+        assert!(matches!(
+            p("!plenum set agenda_days"),
             Some(Command::Invalid(_))
         ));
     }

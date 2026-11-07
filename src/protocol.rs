@@ -28,10 +28,14 @@ pub const DEFAULT_TEMPLATE: &str = "\
 
 ## Minutes
 
-A heading (###) for each item, and below it what was discussed.
+Each topic from the chat has its section below (### #12 …): write under it what was \
+discussed. Other items get a heading (###) of their own.
+
+➕ Sections for the topics go here (plenum-bot).
 
 ## Decisions and tasks
 
+Decisions and tasks about a topic go into its section above; here go the others. \
 A line that starts with \"Decision:\" goes into the list of decisions after the plenum. \
 Tasks as a checklist (type \"[]\" at the start of a line in Outline): who does what by when; \
 type \"@\" and pick the person, they are told in the wiki and in the plenum's chat. What \
@@ -131,6 +135,8 @@ pub fn top_line(top: &Top) -> String {
         .join(" ")
         .replace('[', "(")
         .replace(']', ")")
+        // the bot's markers start so: an item never becomes one
+        .replace('➕', "+")
         .trim_start_matches(['#', '>', '*', '-', '+', '|', '_'])
         .trim()
         .chars()
@@ -320,6 +326,13 @@ fn after_label(line: &str, label: &str) -> Option<String> {
     Some(clean(after))
 }
 
+/// Whether `line` starts like a decision or a task ("Decision:", "Task:", any case).
+pub fn starts_like_decision_or_task(line: &str) -> bool {
+    [DECISION_LABEL, TASK_LABEL]
+        .iter()
+        .any(|label| after_label(line, label).is_some())
+}
+
 /// Without emphasis markers and Outline's escapes, trimmed.
 fn clean(text: &str) -> String {
     let mut s = text.replace("**", "").replace("__", "");
@@ -378,32 +391,46 @@ pub fn example_doc_text(plenum: &Plenum) -> String {
 
 ## Agenda
 
-* Bins in the yard (Ben)
-* Compost bin (Cara)
+* #3 Bins in the yard (Ben) · to decide
+* #4 Compost bin (Cara) · to decide
+* #5 Garden day (Dan) · to talk about
 
 ## Minutes
 
-### Bins in the yard
+### #3 Bins in the yard
+
+> Ben, to decide
+> Proposal: we ask the landlord for a second yellow bin.
 
 The yellow bin is often full by Thursday. A second one would fit next to the door.
 
 Decision: we ask the landlord for a second yellow bin.
 
-### Compost bin
+- [ ] Ben: write to the landlord about the second bin by Friday
+
+### #4 Compost bin
+
+> Cara, to decide
 
 Cara found one for 40 €. Everyone agrees, Dan would rather have a bigger one next year.
 
 Decision: we buy the compost bin from the house cash box.
 
+- [ ] Cara: buy the compost bin by next Sunday
+
+### #5 Garden day
+
+> Dan, to talk about
+
 ## Decisions and tasks
 
-- [ ] Ben: write to the landlord about the second bin by Friday
-- [ ] Cara: buy the compost bin by next Sunday
 - [x] Dan: put up the new cleaning rota
 
-_After the meeting the two lines starting with “Decision:” go into the list of decisions. Ben's \
-and Cara's tasks are still open, so they come along to the next minutes; Dan's is ticked off \
-and done._
+_The bot made the agenda and the sections (the quoted lines); the minutes went under them. \
+After the meeting the two lines starting with “Decision:” go into the list of decisions, and \
+each topic's thread in the chat hears what came of it. #5's section stayed empty: not reached, \
+it is on the next agenda. Ben's and Cara's tasks are still open, so they come along to the next \
+minutes; Dan's is ticked off and done._
 ",
         name = plenum.name,
         protocols = plenum.protocols_title(),
@@ -448,6 +475,7 @@ pub fn overview_text(
     tasks: &[Carried],
     decisions: &[Carried],
     links: &OverviewLinks<'_>,
+    topics: Option<&str>,
 ) -> String {
     let esc = |s: &str| s.replace('[', "\\[").replace(']', "\\]");
     let mut t = format!(
@@ -484,17 +512,23 @@ pub fn overview_text(
         "\nThe meetings are in the calendar {calendar}: add, move or cancel them there, or \
          make a series. This page, the agendas and the reminders follow it.\n"
     ));
-    t.push_str(
-        "\n## Bringing in a topic\n\nWrite `!top <topic>` in the chat, reply to a message \
-         with `!top`, or write it into the agenda of the next meeting.\n",
-    );
+    match topics {
+        // with topics: how they work, the ones waiting, the room's settings (topics.rs)
+        Some(block) => t.push_str(block),
+        None => t.push_str(
+            "\n## Bringing in a topic\n\nWrite `!top <topic>` in the chat, reply to a message \
+             with `!top`, or write it into the agenda of the next meeting.\n",
+        ),
+    }
     t.push_str(&format!(
         "\n## How the minutes work\n\n\
          1. **Before the meeting.** {before} before it, the bot makes the minutes from the \
          [template]({template}) and posts the link in the chat. Topics from the chat are on \
          the agenda already.\n\
-         2. **During the meeting.** Someone writes the minutes into that document: a heading \
-         (type `###` and a space) for each topic, and below it what was said.\n\
+         2. **During the meeting.** Someone writes the minutes into that document. Each topic \
+         from the chat has its section (`### #12 …`): write what was said, `Decision:` lines \
+         and tasks under it. A topic whose section stays empty counts as not reached and comes \
+         back next time. Other items get a heading (type `###` and a space) of their own.\n\
          3. **Decisions.** Start a line with the word `Decision` and a colon, then what was \
          decided, for example `Decision: the bins go out on Sunday evening`. After the meeting \
          every such line goes into the [list of decisions]({decisions}). Lines on the agenda \
@@ -806,11 +840,14 @@ pub enum PdfNote {
 }
 
 #[cfg(test)]
+pub use tests::plenum as tests_plenum;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    fn plenum() -> Plenum {
+    pub fn plenum() -> Plenum {
         Plenum {
             key: "house".into(),
             name: "House plenum".into(),
@@ -826,6 +863,7 @@ mod tests {
             require_group: None,
             access: crate::config::Access::House,
             publication: crate::config::Publication::Full,
+            topics: Default::default(),
         }
     }
 
@@ -1178,6 +1216,7 @@ Decisions were taken quickly.
             &[carried("Ben: cleaning rota")],
             &[carried("Decision [one]")],
             &links,
+            None,
         );
         assert!(t.contains("[agenda and minutes](https://wiki.test/doc/p)\n"));
         assert!(

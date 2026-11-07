@@ -164,12 +164,17 @@ container's `TZ`.
 | | |
 |---|---|
 | `!plenum` | next date and the protocol's link |
-| `!top <topic>` | an item for the agenda (waits for the protocol if it does not exist yet) |
+| `!top <topic>` | a topic for the next meeting (with topics: numbered, a message of its own; see "Topics") |
+| `!top decide: <topic>` | a topic to decide; further lines are its description, a line `Proposal: …` its proposal |
+| `!top` | the topics for the next meeting and later ones |
+| `!top #12 withdraw\|later\|done\|again\|decide\|talk` | change topic #12 (its author, the `organizers`, the admins) |
+| `!plenum settings` | the plenum's settings, where each comes from |
+| `!plenum set <name> <value>`, `!plenum reset <name>` | change one for this plenum (the `organizers`, without them everyone in the room; the admins) |
 | `!minutes done` | close the protocol now (decisions, PDF, summary). While the meeting is on only `organizers` and the admins; after its end everyone (or `organizers` only, if set) |
 | `!minutes confidential` | nothing from this meeting's minutes comes into the chat (see below) |
 | `!minutes link` | only the link to them |
 | `!minutes full` | the summary again, as usual |
-| `!top` as a reply | the message it answers is the topic (by its author) |
+| `!top` as a reply | the message it answers is the topic (with topics: its first line, brought in by whoever replied) |
 | `!plenum help` | this list |
 
 In an admin's direct chat with the bot: `!plenum` (every plenum), `!members` (the held
@@ -178,7 +183,67 @@ or are overdue), `!members confirm <plenum key|room> <digest>`. In a direct chat
 server: `!link <username>`.
 
 Several plenums in one room: the key goes along, `!top kitchen-floor-1 dishwasher`. Commands
-older than 15 minutes (a fresh Matrix store syncs the rooms' history) are left alone.
+older than 15 minutes (a fresh Matrix store syncs the rooms' history) are left alone, except `!top <topic>` with topics (taken once, by its message, after the bot was down; history a fresh store brings along is never taken).
+
+## Topics
+
+docs/TOPICS.md has the design, the alternatives and what the review found; this is what the
+bot does. `[topics]` (house-infra) switches it per plenum (`enabled`, default on), lets the
+rooms change their settings (`room_settings`), and sets `carry_over` and `tell_interested`;
+without `enabled` `!top` is an agenda line as before.
+
+- **A topic** is what `!top` brings in: numbered per plenum (`#12`, never reused), with a
+  message of the bot's own in the room (a reply to the `!top`, mentioning its author). That
+  message is the topic's thread root, the target of 👍 (interest: these people hear the
+  outcome) and its record: the bot edits it when the topic changes (kind, proposal, date,
+  outcome). It puts 👍 and 🤝 under it; the author's (or an organizer's) 🤝 makes it a topic
+  to decide, as `!top decide: …` does. The proposal is the author's: lines from `Proposal:`
+  (or `Vorschlag:`) in the `!top`, or a thread message of the author's starting so (its edits
+  count). Other thread messages are only read by people. A reply-`!top` takes the first line
+  of the message it answers, brought in by whoever replied (nothing more of it is copied);
+  that message's sender may withdraw it too, and deleting it withdraws the topic.
+- **The agenda.** When the minutes are made (`prepare_days` before), each topic for that
+  meeting gets an agenda line (`* #12 Title (Anna) · to decide`) and a section of its own
+  under "Minutes" (`### #12 Title`, what the author wrote quoted, the link to the
+  discussion), at `➕ Sections for the topics go here (plenum-bot).` (the default template
+  has it; otherwise above the next `##` after "Minutes", or at the end). Later topics go in at
+  the same markers. The announcement lists the topics (decisions first) and is edited as they
+  come, go or change; a topic to decide placed after it went out is "short notice". Nothing
+  from people can become a heading, checkbox, decision or task in the minutes: every line is
+  flattened and quoted.
+- **The outcome.** After the close, each topic's section is read: `Decision:` lines →
+  decided, other text → talked about (both: done; the thread hears it, mentioning the author
+  and, with `tell_interested`, who 👍'd and is still in the room, at most 20), only what the
+  bot wrote → not reached (with `carry_over` onto the next agenda, without it unclear; the
+  thread hears it without mentions), heading gone → unclear (nothing said; `!top #12
+  again`). Minutes with no topic section written but decisions elsewhere: every topic unclear,
+  nobody told. What the thread hears
+  follows the meeting's `publication` (`link`: the link instead of the decisions,
+  `confidential`: "dealt with"). One step per topic with its transaction ID and at most 3
+  attempts, after the summary.
+- **Changes.** Rights are checked at each action: the author (the account, or another
+  account the directory's fresh read gives the same person), the `organizers`, the admins;
+  a plenum without `organizers` does not let everyone act on others' topics. Edits count
+  only from the original's sender, deletions of the `!top` message (or of the topic's
+  message) from those who may act (deleting the `!top` withdraws the topic, clears its texts
+  and its title); everything is looked up by room and event. `!top #12 …` also takes German
+  words (`zurückziehen`, `später`, `erledigt`, `nochmal`, `entscheiden`, `besprechen`).
+  A cancelled meeting hands its topics to the next one (the cancellation notice says so).
+- **Matrix events.** Reactions, redactions, edits and thread messages in the plenums' rooms
+  are only noted by their handlers (no lock, no network); the next tick reads them. A topic's
+  reactions are counted from the homeserver (`/relations`) when one came in, every hour and
+  before its outcome, never from the events alone. `!top` is taken also after the bot was
+  down longer than 15 minutes (other commands are not); a `!top` seen twice is one topic.
+- **Settings in the room** (plenum_settings.rs): `topics`, `agenda_days` (1–14),
+  `reminder` (0–1440 minutes), `carry_over`, `tell_interested`, over the house's values;
+  a room cannot switch on what house-infra switched off. Each change is said in the room
+  (from an admin's direct chat too) and listed in the wiki overview; at most 10 a day per
+  person and 30 a day per plenum (the bot admins are not limited).
+- **Stored** in `store/topics.json` (a file of its own beside state.json, so an older image
+  neither drops nor overwrites it): the topics, the room's settings and their last changes,
+  the announcements' event IDs. Texts are cleared 30 days after a topic ends, the topic is
+  dropped after 180 days (for every plenum, also with topics off); who reacted is never
+  stored. Limits: 10 topics per person a day, 15 open per person, 60 open per plenum. The old `pending_tops` become topics once (without a message of their own).
 
 ## What goes into the chat
 

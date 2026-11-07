@@ -44,6 +44,10 @@ pub struct State {
     /// (`stay_until`; [`crate::stay`]). Left out when empty, so an older image reads the file.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub stays: crate::stay::Memory,
+    /// The topics (docs/TOPICS.md): `topics.json` beside the state, a file of its own so an
+    /// older image (a rollback) neither drops nor overwrites them.
+    #[serde(skip)]
+    pub book: crate::topics::Book,
 }
 
 /// One link request the bot took up ([`crate::link_delivery`]). Holds no code: the code is
@@ -226,7 +230,7 @@ pub struct Meeting {
 }
 
 /// A message that is sent once: its transaction ID, then whether it went out.
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct Step {
     #[serde(default)]
     pub txn: Option<String>,
@@ -243,7 +247,7 @@ impl Step {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct Close {
     /// Someone said `!minutes done`: close at the next tick, whatever the time.
     #[serde(default)]
@@ -304,12 +308,21 @@ impl PlenumState {
     }
 }
 
+/// Where the topics are kept, beside the state.
+pub fn book_path(state: &Path) -> std::path::PathBuf {
+    state.with_file_name("topics.json")
+}
+
 impl State {
     pub async fn load(path: &Path) -> Result<Self> {
-        mxbot_common::persist::load_json_or_default(path).await
+        let mut st: Self = mxbot_common::persist::load_json_or_default(path).await?;
+        st.book = crate::topics::Book::load(&book_path(path)).await?;
+        Ok(st)
     }
 
+    /// The topics first: a step saved before its side effect finds its own record in both.
     pub async fn save(&self, path: &Path) -> Result<()> {
+        self.book.save(&book_path(path)).await?;
         mxbot_common::persist::save_json_atomic(path, self).await
     }
 }
