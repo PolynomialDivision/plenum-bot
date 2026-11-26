@@ -1,0 +1,93 @@
+# plenum-bot config. In house-infra rendered from matrix.yml (matrix_bots.plenum-bot.plenum).
+
+[matrix]
+homeserver = "https://matrix.example.org"
+user_id = "@plenum-bot:example.org"
+device_id = "PLENUMBOT"
+# access_token: MATRIX_ACCESS_TOKEN in the environment
+
+[security]
+admin_users = ["@admin:example.org"]
+allowed_inviters = []
+allowed_rooms = ["!house:example.org"]
+
+[outline]
+url = "http://outline:3000"               # the API, without /api
+public_url = "https://wiki.example.org"   # for links in the chat
+# api_key: OUTLINE_API_KEY in the environment
+
+# The dates: one Nextcloud calendar per plenum, owned by this account.
+[calendar]
+url = "https://cloud.example.org/remote.php/dav/calendars/plenum-bot/"
+username = "plenum-bot"
+# password: CALDAV_PASSWORD in the environment (an app password; password_env)
+house_group = "residents"                 # writes the house's, reads the groups' calendars
+readers = ["calendar-bot"]                # read every calendar that is not private
+web_url = "https://cloud.example.org/apps/calendar"
+
+[defaults]
+timezone = "Europe/Berlin"
+prepare_days = 3        # protocol created and announced this many days before
+remind_minutes = 30     # 0 = no reminder
+duration_minutes = 120
+close_after_hours = 12  # closed this long after the end (or with !minutes done)
+publication = "full"    # what of a meeting's minutes goes into the chat: full | link | confidential
+                        # (a meeting's own, set with !minutes confidential, comes first)
+
+[pdf]
+enabled = true
+font_dir = "/usr/share/fonts/truetype/dejavu"
+post_to_room = true
+
+# Who is in a plenum's group (only needed for plenums with a group).
+[directory]
+provider = "authentik"
+api_url = "https://login.example.org/api/v3"
+# server_name = "example.org"         # house accounts: @<login>:<server>; default: the bot's own
+localpart_attribute = "matrix_localpart"
+matrix_ids_attribute = "matrix_ids"   # a person's other accounts: entered by an admin or proved with a code
+# preferred_attribute = "matrix_preferred"   # the account the person chose: invited
+# stale_after_minutes = 60                   # an older last good read changes no room
+# stay_until_attribute = "stay_until"        # the end of a stay ("YYYY-MM-DD"), for [members] stay_reminder_days
+# link_request_attribute = "matrix_link_request"  # requests from the settings: the bot invites
+#                                                 # the account and sends the code (needs MATRIX_LINK_KEY)
+# token: DIRECTORY_TOKEN in the environment (token_env)
+
+# The rooms of plenums with a group follow it: each member's chosen account is invited and
+# stays, their other accounts stay for a handover (all of them while they have not chosen);
+# never removed: these, and room admins.
+[members]
+enabled = true
+keep = ["@calendar-bot:example.org"]
+ask_to_choose = false   # write to members who have not chosen their account (needs choose_url)
+# where people choose their account and enter link codes (also named in the !link answer)
+choose_url = "https://login.example.org/if/flow/house-matrix-accounts/"
+handover_days = 7        # other accounts stay this long after the chosen one joined the room…
+handover_max_days = 30   # …and at most this long after the choice, joined or not (each 1–365)
+# people who live here for a while (a kitchen of their own, nothing of the house plenum): they
+# count like the house plenum's group in the kitchens' rooms (access members), never in the
+# house's or a private plenum's. Every group named must exist in the directory.
+# subtenant_groups = ["subtenants"]
+stay_reminder_days = 14  # the admins hear of a stay's end (`stay_until`) this long before and on the day (1–365)
+# link codes (!link <username>): MATRIX_LINK_KEY in the environment
+
+[[plenum]]
+key = "house"
+name = "House plenum"
+room = "!house:example.org"
+collection = "House plenum"
+
+[[plenum]]
+key = "kitchen-floor-0"
+name = "Kitchen plenum ground floor"
+room = "!kitchen:example.org"
+collection = "Kitchen ground floor"
+group = "kitchen-floor-0"   # its room and its editors follow this directory group
+access = "members"                # everyone reads, the group writes (house | members | private)
+# require_group = "residents"     # only who is in this group too counts; default for members
+#                                 # and private: the house plenum's group; "" for none. For
+#                                 # access members, the house plenum's group also lets in
+#                                 # [members] subtenant_groups
+prepare_days = 1
+organizers = ["@anna:example.org"]
+# publication = "link"            # this plenum's meetings share only the link by default
