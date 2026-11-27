@@ -48,6 +48,232 @@ pub struct State {
     /// an older image after a rollback neither drops nor overwrites them).
     #[serde(skip)]
     pub settings: crate::plenum_settings::Store,
+    /// What the bot keeps of minutes posted in the chat (`store/minutes.json`, a file of its
+    /// own for the same reason).
+    #[serde(skip)]
+    pub minutes: MinutesStore,
+}
+
+/// Filings kept per plenum (the oldest go; their copies stay in the wiki).
+const KEEP_FILINGS: usize = 60;
+
+/// Tasks closed from the chat kept per plenum (the newest).
+const KEEP_DONE: usize = 200;
+
+/// `store/minutes.json`: minutes taken from the chat (docs/CHAT-MINUTES.md).
+#[derive(Serialize, Deserialize, Default, Debug)]
+pub struct MinutesStore {
+    /// By plenum key.
+    #[serde(default)]
+    pub plenums: BTreeMap<String, PlenumMinutes>,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+pub struct PlenumMinutes {
+    /// By what they are filed under: a meeting's occurrence ID, or "day:2026-11-15".
+    #[serde(default)]
+    pub filings: BTreeMap<String, Filing>,
+    /// The minutes message the bot pinned in the room.
+    #[serde(default)]
+    pub pinned: Option<String>,
+    /// The pin the room did not let the bot make (logged once; tried again for another).
+    #[serde(default)]
+    pub pin_refused: Option<String>,
+    /// The latest minutes the bot posted from the wiki (`publication: full`): pinned like
+    /// chat minutes, whichever meeting is later.
+    #[serde(default)]
+    pub wiki_message: Option<WikiMessage>,
+    /// When messages were taken, for the limit per day.
+    #[serde(default)]
+    pub taken: Vec<DateTime<Utc>>,
+}
+
+/// A minutes message the bot posted.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct WikiMessage {
+    pub day: chrono::NaiveDate,
+    pub event: String,
+}
+
+/// The wiki copy of a meeting's (or a day's) chat minutes.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Filing {
+    pub day: chrono::NaiveDate,
+    /// Chosen and saved before the document is made.
+    pub doc_id: String,
+    #[serde(default)]
+    pub created: bool,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// `former::fingerprint` of the copy as the wiki gave it back after the bot's last write.
+    #[serde(default)]
+    pub written: Option<u64>,
+    /// `minutes::exact` of the text the bot sent last (the fingerprint alone misses a change
+    /// of punctuation).
+    #[serde(default)]
+    pub sent: Option<u64>,
+    /// Changed or deleted in the wiki: the bot writes no more into it.
+    #[serde(default)]
+    pub adopted: bool,
+    /// An edit came after the copy was adopted: the thread hears it once.
+    #[serde(default)]
+    pub adopted_due: bool,
+    #[serde(default)]
+    pub adopted_told: Step,
+    /// The messages, in the order they were posted.
+    #[serde(default)]
+    pub messages: Vec<Taken>,
+    /// What was last read from them.
+    #[serde(default)]
+    pub read: Read,
+    /// What of `read` is in the plenum's lists (decisions, open tasks, carried topics): set by
+    /// the meeting's close, and by every apply after it. None: nothing yet.
+    #[serde(default)]
+    pub applied: Option<Read>,
+    /// The link `applied` is filed under in the plenum's lists (the meeting's page, else the
+    /// copy).
+    #[serde(default)]
+    pub applied_link: Option<String>,
+    /// The decisions as last written into the decision list.
+    #[serde(default)]
+    pub listed: Option<Vec<String>>,
+    /// Late minutes: the link line appended to the closed page.
+    #[serde(default)]
+    pub noted_on_page: bool,
+    /// Something is still to do (a write, a reaction, a reply, an apply): tried every tick.
+    #[serde(default)]
+    pub pending: bool,
+}
+
+impl Filing {
+    pub fn new(day: chrono::NaiveDate) -> Self {
+        Self {
+            day,
+            doc_id: uuid::Uuid::new_v4().to_string(),
+            created: false,
+            url: None,
+            title: None,
+            written: None,
+            sent: None,
+            adopted: false,
+            adopted_due: false,
+            adopted_told: Step::default(),
+            messages: Vec::new(),
+            read: Read::default(),
+            applied: None,
+            applied_link: None,
+            listed: None,
+            noted_on_page: false,
+            pending: true,
+        }
+    }
+
+    /// The messages not withdrawn.
+    pub fn active(&self) -> impl Iterator<Item = &Taken> {
+        self.messages.iter().filter(|t| t.withdrawn.is_none())
+    }
+
+    pub fn has_active(&self) -> bool {
+        self.active().next().is_some()
+    }
+}
+
+/// A message taken as minutes.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Taken {
+    /// The message (an edit keeps this ID).
+    pub event: String,
+    /// The thread root to answer in.
+    pub thread: String,
+    pub sender: String,
+    pub sender_name: String,
+    /// Who answered it with `!minutes`, if not the sender.
+    #[serde(default)]
+    pub taken_by: Option<String>,
+    pub posted_at: DateTime<Utc>,
+    /// The text as last seen, and when that version was sent: an older edit never replaces a
+    /// newer one.
+    pub text: String,
+    pub text_at: DateTime<Utc>,
+    #[serde(default)]
+    pub withdrawn: Option<Withdrawn>,
+    #[serde(default)]
+    pub reaction: Step,
+    /// The reaction's event, to take it back when the message is withdrawn with `undo` (an
+    /// older file has none: that reaction stays).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction_event: Option<String>,
+    #[serde(default)]
+    pub receipt: Step,
+    /// The thread reply, to edit it.
+    #[serde(default)]
+    pub receipt_message: Option<LinkMessage>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Withdrawn {
+    /// Deleted in the room.
+    Deleted,
+    /// `!minutes undo`.
+    Undone,
+    /// Moved to another meeting (`!minutes <day>` as a reply).
+    Moved,
+}
+
+/// What was read from chat minutes (`minutes::read`).
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
+pub struct Read {
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    #[serde(default)]
+    pub tasks: Vec<String>,
+    #[serde(default)]
+    pub postponed: Vec<String>,
+    #[serde(default)]
+    pub done: Vec<String>,
+}
+
+impl Read {
+    /// Both, each entry once.
+    pub fn union(&self, other: &Read) -> Read {
+        let join = |a: &[String], b: &[String]| {
+            let mut out = a.to_vec();
+            for x in b {
+                if !out.contains(x) {
+                    out.push(x.clone());
+                }
+            }
+            out
+        };
+        Read {
+            decisions: join(&self.decisions, &other.decisions),
+            tasks: join(&self.tasks, &other.tasks),
+            postponed: join(&self.postponed, &other.postponed),
+            done: join(&self.done, &other.done),
+        }
+    }
+}
+
+impl PlenumMinutes {
+    /// The oldest filings beyond [`KEEP_FILINGS`] go (never one with work left), and takes
+    /// older than a day.
+    pub fn prune(&mut self, now: DateTime<Utc>) {
+        while self.filings.len() > KEEP_FILINGS {
+            let Some(oldest) = (self.filings.iter())
+                .filter(|(_, f)| !f.pending)
+                .min_by_key(|(_, f)| f.day)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.filings.remove(&oldest);
+        }
+        self.taken
+            .retain(|at| now - *at < chrono::Duration::days(1));
+    }
 }
 
 /// One link request the bot took up ([`crate::link_delivery`]). Holds no code: the code is
@@ -171,6 +397,13 @@ pub struct PlenumState {
     /// from here then).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_topics: Vec<CarriedTopic>,
+    /// Tasks a chat minutes' done line closed: an unticked checkbox of one on a later page
+    /// does not open it again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub done_tasks: Vec<String>,
+    /// "<Name>: Chat template", the fill-in template for chat minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_doc_id: Option<String>,
     /// By the calendar occurrence's ID.
     #[serde(default)]
     pub meetings: BTreeMap<String, Meeting>,
@@ -268,6 +501,12 @@ pub struct Meeting {
     /// The link message, once posted (with `post`; an older image's has none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<LinkMessage>,
+    /// The fill-in template for chat minutes, posted after the reminder.
+    #[serde(default)]
+    pub template: Step,
+    /// That message, to shorten it once the minutes are filed or the meeting is closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_message: Option<LinkMessage>,
 }
 
 /// A message that is sent once: its transaction ID, then whether it went out.
@@ -329,6 +568,12 @@ pub struct Close {
     pub summary: Step,
     #[serde(default)]
     pub done: bool,
+    /// Waiting for chat minutes: when the page was last read for a result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_checked: Option<DateTime<Utc>>,
+    /// The one reminder that no minutes came.
+    #[serde(default)]
+    pub nudge: Step,
 }
 
 impl PlenumState {
@@ -346,6 +591,9 @@ impl PlenumState {
             };
             self.meetings.remove(&oldest);
         }
+        if self.done_tasks.len() > KEEP_DONE {
+            self.done_tasks.drain(..self.done_tasks.len() - KEEP_DONE);
+        }
         if self.withheld_tasks.len() > KEEP_WITHHELD {
             self.withheld_tasks
                 .drain(..self.withheld_tasks.len() - KEEP_WITHHELD);
@@ -362,14 +610,21 @@ pub fn settings_path(state: &Path) -> std::path::PathBuf {
     state.with_file_name("settings.json")
 }
 
+/// Where the chat minutes are kept, beside the state.
+pub fn minutes_path(state: &Path) -> std::path::PathBuf {
+    state.with_file_name("minutes.json")
+}
+
 impl State {
     pub async fn load(path: &Path) -> Result<Self> {
         let mut st: Self = mxbot_common::persist::load_json_or_default(path).await?;
         st.settings = mxbot_common::persist::load_json_or_default(&settings_path(path)).await?;
+        st.minutes = mxbot_common::persist::load_json_or_default(&minutes_path(path)).await?;
         Ok(st)
     }
 
     pub async fn save(&self, path: &Path) -> Result<()> {
+        mxbot_common::persist::save_json_atomic(&minutes_path(path), &self.minutes).await?;
         mxbot_common::persist::save_json_atomic(&settings_path(path), &self.settings).await?;
         mxbot_common::persist::save_json_atomic(path, self).await
     }
@@ -443,6 +698,68 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains(r#""outcome":"gave_up""#), "{json}");
         assert_eq!(serde_json::from_str::<LinkDelivery>(&json).unwrap(), d);
+    }
+
+    #[tokio::test]
+    async fn the_chat_minutes_are_a_file_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        // a state from before: no minutes.json
+        std::fs::write(&path, r#"{"plenums":{"house":{"meetings":{}}}}"#).unwrap();
+        let mut st = State::load(&path).await.unwrap();
+        assert!(st.minutes.plenums.is_empty());
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+        let mut f = Filing::new(day);
+        f.messages.push(Taken {
+            event: "$e1".into(),
+            thread: "$e1".into(),
+            sender: "@anna:example.org".into(),
+            sender_name: "Anna".into(),
+            taken_by: None,
+            posted_at: "2026-11-16T10:00:00Z".parse().unwrap(),
+            text: "Minutes".into(),
+            text_at: "2026-11-16T10:00:00Z".parse().unwrap(),
+            withdrawn: None,
+            reaction: Step::default(),
+            reaction_event: None,
+            receipt: Step::default(),
+            receipt_message: None,
+        });
+        st.minutes
+            .plenums
+            .entry("house".into())
+            .or_default()
+            .filings
+            .insert("day:2026-11-15".into(), f);
+        st.save(&path).await.unwrap();
+        let state_json = std::fs::read_to_string(&path).unwrap();
+        assert!(!state_json.contains("filings"), "{state_json}");
+
+        // an older image: reads state.json only and writes it back
+        let old: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+        mxbot_common::persist::save_json_atomic(&path, &old)
+            .await
+            .unwrap();
+        let back = State::load(&path).await.unwrap();
+        let f = &back.minutes.plenums["house"].filings["day:2026-11-15"];
+        assert_eq!(f.messages[0].event, "$e1");
+        assert_eq!(f.day, day);
+    }
+
+    #[test]
+    fn a_state_from_before_chat_minutes_has_none_of_them() {
+        let json =
+            r#"{"plenums":{"house":{"meetings":{"m1":{"doc_id":"d1","close":{"done":true}}}}}}"#;
+        let st: State = serde_json::from_str(json).unwrap();
+        let ps = &st.plenums["house"];
+        assert!(ps.done_tasks.is_empty() && ps.chat_template_doc_id.is_none());
+        let m = &ps.meetings["m1"];
+        assert!(m.close.wait_checked.is_none() && !m.close.nudge.done && !m.template.done);
+        let back = serde_json::to_string(&st).unwrap();
+        assert!(
+            !back.contains("done_tasks") && !back.contains("wait_checked"),
+            "{back}"
+        );
     }
 
     #[test]

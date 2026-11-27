@@ -172,6 +172,8 @@ pub struct Topic {
     pub preparation: Vec<String>,
     /// Its decisions, cleaned.
     pub decisions: Vec<String>,
+    /// Its result: the text after "Result:" and the lines after it, empty ones left out.
+    pub result: Vec<String>,
 }
 
 impl Topic {
@@ -319,12 +321,57 @@ fn read(heading: String, body: &[&str]) -> Topic {
     while preparation.last().is_some_and(|l| l.trim().is_empty()) {
         preparation.pop();
     }
+    let mut result: Vec<String> = Vec::new();
+    if let Some(&r) = results.first() {
+        let same_line = result_label(body[r]).unwrap_or_default();
+        if !same_line.is_empty() {
+            result.push(same_line);
+        }
+        result.extend(
+            body[r + 1..]
+                .iter()
+                .filter(|l| !clean(l).is_empty())
+                .map(|l| (*l).to_owned()),
+        );
+    }
     Topic {
         heading,
         reading,
         preparation,
         decisions,
+        result,
     }
+}
+
+/// The page's people row (the template's "Facilitation | Minutes | Present" table): each
+/// header with its filled-in cell, from the first table before the topics.
+pub fn people(markdown: &str) -> Vec<(String, String)> {
+    let cells = |l: &str| -> Vec<String> {
+        l.trim()
+            .trim_matches('|')
+            .split('|')
+            .map(|c| clean(c).trim().to_owned())
+            .collect()
+    };
+    let rows: Vec<Vec<String>> = markdown
+        .lines()
+        .take_while(|l| !heading(l).is_some_and(|(_, t)| TOPICS.contains(&t.as_str())))
+        .skip_while(|l| !l.trim_start().starts_with('|'))
+        .take_while(|l| l.trim_start().starts_with('|'))
+        .map(cells)
+        .filter(|r| {
+            !r.iter()
+                .all(|c| c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
+        })
+        .collect();
+    let [head, row, ..] = rows.as_slice() else {
+        return Vec::new();
+    };
+    head.iter()
+        .zip(row)
+        .filter(|(h, c)| !h.is_empty() && !c.is_empty())
+        .map(|(h, c)| (h.clone(), c.clone()))
+        .collect()
 }
 
 /// Mentions as plain names (a copy by the bot must not notify anyone again).
@@ -568,9 +615,46 @@ pub fn without_box(markdown: &str) -> String {
     out.join("\n")
 }
 
+/// Chat minutes of the meeting, for its result box (docs/CHAT-MINUTES.md).
+pub struct ChatBox<'a> {
+    /// The copy's title and link.
+    pub title: &'a str,
+    pub link: &'a str,
+    /// The minutes' postponed lines: the topics they name move on, the others do not.
+    pub postponed: &'a [String],
+}
+
+/// Whether a postponed line of chat minutes names `topic`.
+pub fn postponed_names(postponed: &[String], topic: &Topic) -> bool {
+    postponed
+        .iter()
+        .any(|line| crate::minutes::same(line, &topic.title()))
+}
+
+/// A topic that chat minutes postponed and the page does not have: a block of its own for the
+/// next page.
+pub fn postponed_block(text: &str, from: NaiveDate, link: &str) -> String {
+    format!(
+        "### {}\n\n*{CARRIED_LINE} [plenum on {}]({link}). Postponed in the chat minutes.*\n\n**Result:**",
+        literal(&plain_mentions(text)),
+        describe_day(from)
+    )
+}
+
 /// The result box (§4.4): what was decided (by topic) and discussed, what moves on, the tasks.
 /// `decisions`: all of the page's, also those outside a topic.
 pub fn result_box(decisions: &[String], topics: &[Topic], tasks: &[String]) -> String {
+    result_box_with(decisions, topics, tasks, None)
+}
+
+/// [`result_box`] of a meeting with chat minutes: their link first; of the topics without a
+/// result only those a postponed line names move on, the others are in the chat minutes.
+pub fn result_box_with(
+    decisions: &[String],
+    topics: &[Topic],
+    tasks: &[String],
+    chat: Option<&ChatBox>,
+) -> String {
     let name = |t: &Topic| literal(&plain_mentions(&t.title()));
     let names = |r: Reading| -> Vec<String> {
         topics
@@ -580,6 +664,13 @@ pub fn result_box(decisions: &[String], topics: &[Topic], tasks: &[String]) -> S
             .collect()
     };
     let mut items: Vec<String> = Vec::new();
+    if let Some(c) = chat {
+        items.push(format!(
+            "📥 Chat minutes: [{}]({})",
+            literal(c.title),
+            c.link
+        ));
+    }
     let mut shown: Vec<&String> = Vec::new();
     for t in topics.iter().filter(|t| t.reading == Reading::Decided) {
         for d in &t.decisions {
@@ -594,15 +685,38 @@ pub fn result_box(decisions: &[String], topics: &[Topic], tasks: &[String]) -> S
     if !discussed.is_empty() {
         items.push(format!("💬 Discussed: {}", discussed.join(", ")));
     }
-    let mut moved: Vec<String> = names(Reading::NotReached)
-        .into_iter()
-        .map(|n| format!("{n} (not reached)"))
-        .collect();
-    moved.extend(
-        names(Reading::NoResult)
+    let mut moved: Vec<String> = Vec::new();
+    if let Some(c) = chat {
+        let open: Vec<&Topic> = topics.iter().filter(|t| t.reading.carried()).collect();
+        let (named, rest): (Vec<&Topic>, Vec<&Topic>) = open
             .into_iter()
-            .map(|n| format!("{n} (no result written)")),
-    );
+            .partition(|t| postponed_names(c.postponed, t));
+        moved.extend(named.iter().map(|t| format!("{} (postponed)", name(t))));
+        moved.extend(
+            (c.postponed.iter())
+                .filter(|line| {
+                    !topics
+                        .iter()
+                        .any(|t| postponed_names(&[(*line).clone()], t))
+                })
+                .map(|line| format!("{} (postponed)", literal(&plain_mentions(line)))),
+        );
+        if !rest.is_empty() {
+            let rest: Vec<String> = rest.iter().map(|t| name(t)).collect();
+            items.push(format!("📝 In the chat minutes: {}", rest.join(", ")));
+        }
+    } else {
+        moved.extend(
+            names(Reading::NotReached)
+                .into_iter()
+                .map(|n| format!("{n} (not reached)")),
+        );
+        moved.extend(
+            names(Reading::NoResult)
+                .into_iter()
+                .map(|n| format!("{n} (no result written)")),
+        );
+    }
     if !moved.is_empty() {
         items.push(format!("⏭️ On the next page: {}", moved.join(", ")));
     }
@@ -773,6 +887,7 @@ Notes only, no result line.
                 "*Carried over from the* [*plenum on 1 Nov*](x)*.*".into(),
             ],
             decisions: Vec::new(),
+            result: Vec::new(),
         };
         let b = carried_block(
             &topic,
@@ -919,12 +1034,29 @@ Notes only, no result line.
     }
 
     #[test]
+    fn a_topics_result_and_the_people_row() {
+        let page = "**House plenum**\n\n| Facilitation | Minutes | Present |\n|---|---|---|\n| Anna | Ben |  |\n\n## Topics\n\n### Bins\n\nToo many.\n\n**Result:** yellow ones\n\n* [ ] Ben: order them\n\n### Garden\n\nResult:\n\n## Tasks\n";
+        let t = topics(page);
+        assert_eq!(t[0].result, ["yellow ones", "* [ ] Ben: order them"]);
+        assert!(t[1].result.is_empty());
+        assert_eq!(
+            people(page),
+            [
+                ("Facilitation".to_owned(), "Anna".to_owned()),
+                ("Minutes".to_owned(), "Ben".to_owned())
+            ]
+        );
+        assert!(people("## Topics\n\n| a | b |\n|---|---|\n| 1 | 2 |").is_empty());
+    }
+
+    #[test]
     fn a_carried_decision_nobody_took_is_a_proposal_again() {
         let topic = Topic {
             heading: "Bins".into(),
             reading: Reading::Decided,
             preparation: vec!["Decision: yellow ones".into()],
             decisions: vec!["yellow ones".into()],
+            result: Vec::new(),
         };
         let b = carried_block(&topic, NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(), "x");
         assert!(b.contains("Proposal: yellow ones"), "{b}");

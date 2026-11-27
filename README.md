@@ -7,7 +7,8 @@ Afterwards it writes a short result at the page's top, carries the topics not re
 next page, copies every line starting with "Decision:" into the plenum's decision list,
 attaches a PDF and (if the plenum wants it) posts a summary. Searching happens in Outline.
 Several plenums (house, kitchens, a working group), each with its own room, collection and
-Nextcloud calendar. Design: docs/PLENUM-PAGES.md.
+Nextcloud calendar. Design: docs/PLENUM-PAGES.md. With `[minutes] from_chat` minutes posted as
+a message in the room are taken into the wiki too (docs/CHAT-MINUTES.md).
 
 A plenum may belong to a directory group (`group`): its room's members follow the group
 (`[directory]`, `[members]`; mxbot-common `membership`, house-infra docs/HOUSE-DIRECTORY.md),
@@ -172,6 +173,10 @@ container's `TZ`.
 | `!minutes link` | only the link to them |
 | `!minutes full` | the summary again, as usual |
 | `!top` as a reply | the message it answers is the topic (by its author) |
+| `!minutes` as a reply | the message it answers is the minutes (with `[minutes] from_chat`; below); `!minutes <day>`: of that day's meeting, also to move filed minutes |
+| `!minutes`, a line break, the minutes | the same in one message |
+| `!minutes undo` | as a reply, or for your latest: not the minutes after all (its sender, who filed it, the organizers, the admins) |
+| `!minutes template` | the fill-in template for minutes in the chat |
 | `!plenum settings` | the plenum's own settings: `messages`, `reminder`, `page_days`, `page_after` |
 | `!plenum set <name> <value>`, `!plenum reset <name>` | change one, back to the default (the `organizers`; without any, everyone in the room; admins always; 10 a day per person, 30 per plenum) |
 | `!plenum help` | this list |
@@ -182,7 +187,28 @@ or are overdue), `!members confirm <plenum key|room> <digest>`. In a direct chat
 server: `!link <username>`.
 
 Several plenums in one room: the key goes along, `!top kitchen-floor-1 dishwasher`. Commands
-older than 15 minutes (a fresh Matrix store syncs the rooms' history) are left alone.
+older than 15 minutes (a fresh Matrix store syncs the rooms' history) are left alone. `!minutes`
+alone (no reply) is the overview, as `!plenum`.
+
+## Minutes from the chat
+
+With `[minutes] from_chat = true` (off by default; docs/CHAT-MINUTES.md): a message whose first
+line starts with "Protokoll", "Plenumsprotokoll", "Minutes" or "Protocol" (short, with more
+lines after it), or one someone answers with `!minutes`, is copied into a document of its own
+below the meeting's page ("<page title>: Chat minutes"; a day in its first two lines picks the
+meeting, else the latest one that began in the last 21 days, else it is filed by its day). An
+edit of the message by its sender is followed, a deletion or `!minutes undo` withdraws it; a
+copy someone changed or deleted in the wiki is theirs and not written again. Lines that start
+with a label (Decision/Beschluss, Task/Aufgabe, Postponed/Vertagt, Done/Erledigt and a few more,
+in German and English; also checkboxes) go into the decision list and the open tasks; minutes
+without labels are filed as text. The bot reacts with 📥, answers once in the message's thread
+(edited when the message changes) and pins the latest minutes in the room. A meeting whose page
+has no result waits `wait_days` (7) for minutes from the chat instead of closing empty, with one
+reminder after `nudge_days` (2); minutes close it, and then only the topics a "Postponed:" line
+names move on. A fill-in template ("<Name>: Chat template" in the wiki, English, editable) is
+posted after the reminder and on `!minutes template`. With `publication: full`, minutes written
+on the page come into the room at close as one message instead of the summary (and are
+pinned). Kept in `store/minutes.json`.
 
 ## The page
 
@@ -237,6 +263,8 @@ messages`) says what the bot posts by itself:
 | reminder (`reminder` minutes before, 0 = none) | – | ✓ |
 | summary or closed note, PDF | – | ✓ (by the publication below) |
 | a setting changed from an admin's direct chat | – | ✓ |
+| `[minutes]`: no minutes came yet (once), the fill-in template after the reminder | – | ✓ |
+| `[minutes]`: 📥 and the thread reply to minutes posted in the room, the pin | ✓ | ✓ |
 
 Answers to commands are not affected. A message left out counts as done (no stale message after
 a switch to `all`). A link message an older image posted cannot be edited: in `quiet` a move then
@@ -257,7 +285,8 @@ what the room gets differs:
 |---|---|---|---|
 | announcement, reminder, cancellation | with the link | with the link | when, no link, no item count |
 | answer to `!top`, `!plenum` | with the link | with the link | without it |
-| when closed | summary: decisions, open tasks, mentions; the PDF | that it is closed, the link | that it is closed |
+| when closed | summary: decisions, open tasks, mentions; the PDF (with `[minutes] from_chat`: the minutes as one message, the PDF in the wiki only) | that it is closed, the link | that it is closed |
+| thread reply to chat minutes | with the link | with the link | without it |
 
 `!minutes confidential|link|full` is for the meeting whose page is open (it began and is not
 closed yet), else the next one; another one by its day, `!minutes confidential 14.11.` (also
@@ -278,7 +307,11 @@ decisions), "<Name>: Rules" (what holds now; people keep it), "<Name>: Template"
 template, created on first use, editable; `{{plenum}}`, `{{weekday}}`, `{{date}}`, `{{time}}`,
 `{{iso_date}}` are filled in, `{{open_tasks}}` takes the open tasks of the last protocol),
 "<Name>: Decisions" (the decisions, newest at the bottom) and "<Name>: Minutes" with one
-"<Name> YYYY-MM-DD" per meeting below it. The collection's access is checked every hour and
+"<Name> YYYY-MM-DD" per meeting below it. With `[minutes] from_chat` also "<Name>: Chat
+template" (the fill-in template for chat minutes, in a code block; `{{topics}}` and
+`{{open_tasks}}` take the open page's topics and the open tasks for a meeting shared in full),
+and below a meeting's page (else below "<Name>: Minutes") the copy of its chat minutes, which
+only the bot writes while nobody changed it. The collection's access is checked every hour and
 put back if changed. Open tasks of a closed protocol also go into the next one when that was
 made already (meetings close together). Pages from the template of before 2026-11-07 have the
 line "➕ New items from the chat (!top) go here." for chat items; it is still found.
@@ -338,6 +371,9 @@ OUTLINE_IT_URL=http://localhost:3000 OUTLINE_IT_KEY=ol_api_… cargo test -- --i
 ```
 
 The second runs a whole meeting against a real Outline (it creates a collection "IT <uuid>").
+`chat_minutes_in_a_real_outline` (also `--ignored`, the same two variables) makes the copy of
+chat minutes below a page, replaces it, checks its fingerprint after Outline's round trip, a
+change through the API and the trash, and the chat template's code block.
 `house_group_areas_in_a_real_outline` (also `--ignored`) sets up a house plenum, a kitchen and
 the finance group first open to the workspace, then with the house group, and checks each
 collection's access and groups; it needs an admin's key (`OUTLINE_IT_ADMIN_KEY`) and the

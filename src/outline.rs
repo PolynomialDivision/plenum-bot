@@ -92,6 +92,7 @@ impl From<ApiDoc> for Doc {
             // Every change sets updatedAt, a new title too; the revision count is no help
             // (Outline 1.11 counts it up in the background after creating, seen 2026-10-22).
             untouched: d.created_at.is_some() && d.updated_at == d.created_at,
+            archived: d.archived_at.is_some(),
             collection_id: d.collection_id,
             parent_id: d.parent_document_id,
         }
@@ -710,6 +711,14 @@ impl Wiki for Outline {
             format!("{}{path}", self.public)
         }
     }
+
+    async fn delete(&self, id: &str) -> Result<bool> {
+        match self.call_ok("documents.delete", json!({"id": id})).await {
+            Ok(()) => Ok(true),
+            Err(e) if status_of(&e) == Some(404) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// The collection rules ([`ensure_collection`], [`grant_group`]) against a fake Outline that
@@ -1282,6 +1291,129 @@ mod against_outline {
             "--- protocol:\n{}\n--- decisions:\n{}",
             doc.text, decisions.text
         );
+    }
+
+    /// The copy of chat minutes (docs/CHAT-MINUTES.md) as Outline stores it: made below a page,
+    /// replaced, its fingerprint the same after Outline's round trip for the samples, a change
+    /// through the API seen as not the bot's, deleted into the trash; and the chat template's
+    /// code block given back as it went in.
+    #[tokio::test]
+    #[ignore = "needs a running Outline"]
+    async fn chat_minutes_in_a_real_outline() {
+        use crate::{former::fingerprint, minutes, protocol, state::Taken};
+        let (Ok(url), Ok(key)) = (
+            std::env::var("OUTLINE_IT_URL"),
+            std::env::var("OUTLINE_IT_KEY"),
+        ) else {
+            panic!("set OUTLINE_IT_URL and OUTLINE_IT_KEY");
+        };
+        let wiki = Outline::new(&url, &url, &key, Duration::from_secs(30)).unwrap();
+        let col = wiki
+            .ensure_collection(
+                None,
+                &format!("IT {}", uuid::Uuid::new_v4()),
+                Access::House,
+                None,
+            )
+            .await
+            .unwrap();
+        let page = uuid::Uuid::new_v4().to_string();
+        wiki.create_doc(&page, &col, None, "House plenum 2026-11-15", "The page.")
+            .await
+            .unwrap();
+        let tz: chrono_tz::Tz = "Europe/Berlin".parse().unwrap();
+        let taken = |text: &str| Taken {
+            event: "$e".into(),
+            thread: "$e".into(),
+            sender: "@anna:example.org".into(),
+            sender_name: "Anna_B".into(),
+            taken_by: None,
+            posted_at: "2026-11-16T09:12:00Z".parse().unwrap(),
+            text: text.into(),
+            text_at: "2026-11-16T09:40:00Z".parse().unwrap(),
+            withdrawn: None,
+            reaction: Default::default(),
+            reaction_event: None,
+            receipt: Default::default(),
+            receipt_message: None,
+        };
+        let samples = [
+            "Protokoll Hausplenum 15.11.\nAnwesend: Anna, Ben, Cara\n\nFahrradkeller: zu voll, jedes Rad bekommt ein Namensschild.\nBeschluss: Räder ohne Schild kommen im Januar in die Werkstatt.\nAufgabe: Anna besorgt Schilder bis 30.11.\nVertagt: Werkzeugregal",
+            "Minutes\n- [ ] Ben: order the bins\n- [x] Cara: the rota\n- a point\n  - a deeper one",
+            "Minutes\nCode:\n```\nline one\n\nline [x] three\n```\nafter it",
+            "Minutes\n:::warning\nnot a notice\n:::\n@[Ben](mention://1/user/2) and ![a plan](https://example.org/p.png) and [odd](javascript:x)",
+        ];
+        let doc_id = uuid::Uuid::new_v4().to_string();
+        let first = minutes::copy_text(&[&taken(samples[0])], tz);
+        let made = wiki
+            .create_doc(
+                &doc_id,
+                &col,
+                Some(&page),
+                "House plenum 2026-11-15: Chat minutes",
+                &first,
+            )
+            .await
+            .unwrap();
+        assert_eq!(made.parent_id.as_deref(), Some(page.as_str()));
+        let back = wiki.doc(&doc_id).await.unwrap().expect("the copy");
+        eprintln!("--- made:\n{}\n---", back.text);
+        assert_eq!(
+            fingerprint(&made.text),
+            fingerprint(&back.text),
+            "create gives back what it stores"
+        );
+        assert_eq!(
+            fingerprint(&first),
+            fingerprint(&back.text),
+            "the letters survive"
+        );
+        for sample in &samples[1..] {
+            let text = minutes::copy_text(&[&taken(samples[0]), &taken(sample)], tz);
+            wiki.replace(&doc_id, &text).await.unwrap();
+            let back = wiki.doc(&doc_id).await.unwrap().expect("the copy");
+            eprintln!("--- replaced:\n{}\n---", back.text);
+            assert_eq!(fingerprint(&text), fingerprint(&back.text), "{sample}");
+            assert!(!back.text.contains("mention://") && !back.text.contains("javascript:"));
+            // read again: Outline gives the same text a second time
+            let again = wiki.doc(&doc_id).await.unwrap().unwrap();
+            assert_eq!(fingerprint(&again.text), fingerprint(&back.text));
+        }
+        let stored = fingerprint(&wiki.doc(&doc_id).await.unwrap().unwrap().text);
+        // someone changes it in the wiki: not the bot's any more
+        wiki.append(&doc_id, "\n\nAdded by a person.")
+            .await
+            .unwrap();
+        let changed = wiki.doc(&doc_id).await.unwrap().unwrap();
+        assert_ne!(fingerprint(&changed.text), stored);
+        // into the trash: gone for the bot
+        assert!(wiki.delete(&doc_id).await.unwrap());
+        assert!(wiki.doc(&doc_id).await.unwrap().is_none());
+        eprintln!("deleted again: {:?}", wiki.delete(&doc_id).await);
+        assert!(!wiki
+            .delete(&uuid::Uuid::new_v4().to_string())
+            .await
+            .unwrap());
+
+        // the chat template: its code block comes back with its lines
+        let tpl = uuid::Uuid::new_v4().to_string();
+        let doc = wiki
+            .create_doc(
+                &tpl,
+                &col,
+                None,
+                "House plenum: Chat template",
+                &protocol::chat_template_doc_text(),
+            )
+            .await
+            .unwrap();
+        let back = wiki.doc(&tpl).await.unwrap().unwrap();
+        eprintln!("--- chat template:\n{}\n---", back.text);
+        assert_eq!(
+            protocol::chat_template_of(&back.text),
+            protocol::DEFAULT_CHAT_TEMPLATE
+        );
+        assert_eq!(fingerprint(&doc.text), fingerprint(&back.text));
     }
 
     /// A page's text as Outline gives it back, printed (its normalisations are what this is

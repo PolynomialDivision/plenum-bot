@@ -20,6 +20,7 @@ mod engine;
 mod former;
 mod link_delivery;
 mod linking;
+mod minutes;
 mod outline;
 mod page;
 mod pdf;
@@ -42,12 +43,19 @@ use mxbot_common::{
     matrix_sdk::{
         attachment::AttachmentConfig,
         deserialized_responses::EncryptionInfo,
-        room::RoomMember,
+        room::{IncludeRelations, RelationsOptions, RoomMember},
         ruma::{
+            api::error::ErrorKind,
             events::{
-                room::message::{
-                    MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
-                    RoomMessageEventContent,
+                reaction::ReactionEventContent,
+                relation::{Annotation, RelationType},
+                room::pinned_events::RoomPinnedEventsEventContent,
+                room::{
+                    message::{
+                        MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
+                        RoomMessageEventContent,
+                    },
+                    redaction::OriginalSyncRoomRedactionEvent,
                 },
                 AnySyncMessageLikeEvent, AnySyncTimelineEvent, Mentions, SyncMessageLikeEvent,
             },
@@ -64,7 +72,8 @@ use mxbot_common::{
 use tracing::{error, info, warn};
 
 use crate::{
-    engine::{Chat, Engine, Notice, Scope, Sender},
+    commands::Command,
+    engine::{Chat, ChatMessage, Engine, Notice, Origin, Scope, Sender},
     link_delivery::LinkChat,
     linking::LinkDesk,
     outline::Outline,
@@ -76,6 +85,17 @@ use crate::{
 fn message(markdown: &str, users: &[OwnedUserId]) -> RoomMessageEventContent {
     mxbot_common::format::markdown(markdown)
         .add_mentions(Mentions::with_user_ids(users.iter().cloned()))
+}
+
+/// [`message`], but the chat template keeps its lines when it is shown (its body, which a
+/// phone copies, is the Markdown either way).
+fn message_for(markdown: &str, users: &[OwnedUserId], notice: Notice) -> RoomMessageEventContent {
+    if notice == Notice::Template {
+        mxbot_common::format::markdown_with_breaks(markdown)
+            .add_mentions(Mentions::with_user_ids(users.iter().cloned()))
+    } else {
+        message(markdown, users)
+    }
 }
 
 /// Matrix behind [`Chat`].
@@ -124,7 +144,9 @@ fn is_admin(m: &RoomMember) -> bool {
 // The engine decides what is sent (`engine::sends`); the notice only says what a message is.
 impl Chat for MatrixChat {
     async fn send(&self, room: &RoomId, markdown: &str, notice: Notice, txn: &str) -> Result<()> {
-        self.send_mentioning(room, markdown, &[], notice, txn).await
+        self.send_mentioning(room, markdown, &[], notice, txn)
+            .await
+            .map(|_| ())
     }
 
     async fn send_mentioning(
@@ -132,27 +154,27 @@ impl Chat for MatrixChat {
         room: &RoomId,
         markdown: &str,
         users: &[OwnedUserId],
-        _notice: Notice,
+        notice: Notice,
         txn: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let room = self.room(room)?;
-        let content = message(markdown, users);
+        let content = message_for(markdown, users, notice);
         let txn: OwnedTransactionId = txn.into();
-        mxbot_common::send::send_with_retry_txn(&room, content, &txn).await?;
-        Ok(())
+        let event = mxbot_common::send::send_with_retry_txn(&room, content, &txn).await?;
+        Ok(event.to_string())
     }
 
     async fn post(
         &self,
         room: &RoomId,
         markdown: &str,
-        _notice: Notice,
+        notice: Notice,
         txn: &str,
     ) -> Result<String> {
         let room = self.room(room)?;
         let txn: OwnedTransactionId = txn.into();
-        let event =
-            mxbot_common::send::send_with_retry_txn(&room, message(markdown, &[]), &txn).await?;
+        let content = message_for(markdown, &[], notice);
+        let event = mxbot_common::send::send_with_retry_txn(&room, content, &txn).await?;
         Ok(event.to_string())
     }
 
@@ -165,6 +187,66 @@ impl Chat for MatrixChat {
         let txn: OwnedTransactionId = txn.into();
         mxbot_common::send::send_with_retry_txn(&room, content, &txn).await?;
         Ok(())
+    }
+
+    async fn react(&self, room: &RoomId, event: &str, key: &str, txn: &str) -> Result<String> {
+        let room = self.room(room)?;
+        let event = OwnedEventId::try_from(event)?;
+        let content = ReactionEventContent::new(Annotation::new(event, key.to_owned()));
+        let txn: OwnedTransactionId = txn.into();
+        let sent = mxbot_common::send::send_with_retry_txn(&room, content, &txn).await?;
+        Ok(sent.to_string())
+    }
+
+    async fn unreact(&self, room: &RoomId, reaction: &str, txn: &str) -> Result<()> {
+        let room = self.room(room)?;
+        let reaction = OwnedEventId::try_from(reaction)?;
+        room.redact(&reaction, None, Some(txn.into())).await?;
+        Ok(())
+    }
+
+    async fn reply(
+        &self,
+        room: &RoomId,
+        thread: &str,
+        event: &str,
+        markdown: &str,
+        txn: &str,
+    ) -> Result<String> {
+        let room = self.room(room)?;
+        let content = mxbot_common::send::in_thread(
+            message(markdown, &[]),
+            OwnedEventId::try_from(thread)?,
+            OwnedEventId::try_from(event)?,
+        );
+        let txn: OwnedTransactionId = txn.into();
+        let sent = mxbot_common::send::send_with_retry_txn(&room, content, &txn).await?;
+        Ok(sent.to_string())
+    }
+
+    // As cleaning-bot's `pin_weekly_plan`: one state event from the list the server has now
+    // (the SDK's pin_event/unpin_event each start from a cached list).
+    async fn set_pins(&self, room: &RoomId, pin: Option<&str>, unpin: &[String]) -> Result<bool> {
+        let room = self.room(room)?;
+        let pinned = room.load_pinned_events().await?.unwrap_or_default();
+        let pin = pin.map(OwnedEventId::try_from).transpose()?;
+        let mut wanted: Vec<OwnedEventId> = pinned
+            .iter()
+            .filter(|e| !unpin.iter().any(|u| u == e.as_str()) && Some(*e) != pin.as_ref())
+            .cloned()
+            .collect();
+        wanted.extend(pin);
+        if wanted == pinned {
+            return Ok(true);
+        }
+        match room
+            .send_state_event(RoomPinnedEventsEventContent::new(wanted))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if matches!(e.client_api_error_kind(), Some(ErrorKind::Forbidden)) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn send_file(
@@ -297,7 +379,8 @@ impl LinkChat for MatrixChat {
 
 const ADMIN_HELP: &str =
     "For everyone in the plenum rooms: !plenum · !top <topic> (also as a reply to a message) · \
-!minutes done · !minutes confidential|link|full [day] · !plenum help. The meetings are in the plenums' Nextcloud calendars. \
+!minutes done · !minutes confidential|link|full [day] · !minutes as a reply (minutes from the \
+chat) · !minutes undo · !minutes template · !plenum help. The meetings are in the plenums' Nextcloud calendars. \
 Here in the admin chat !plenum shows every plenum, !members the rooms' held removals, the \
 running handovers (a member's old account → the one they chose, until when it stays) and the \
 stays that end soon or are overdue (the directory's stay_until), and \
@@ -351,6 +434,7 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<_>>()?;
     config.members.check()?;
+    config.minutes.check()?;
     let nextcloud = calendar::connect(
         &config.calendar.url,
         &config.calendar.username,
@@ -379,12 +463,14 @@ async fn main() -> Result<()> {
         state,
         state_path,
     );
+    engine.minutes = config.minutes.clone();
+    // never removed from a room, and never taken as minutes by themselves
+    engine.keep = keep;
     if !config.calendar.web_url.trim().is_empty() {
         engine.calendar_url = Some(config.calendar.web_url.trim().to_owned());
     }
     if config.members.enabled {
         engine.me = Some(bot.user_id.clone());
-        engine.keep = keep;
         engine.ask_to_choose = config.members.ask_to_choose;
         engine.choose_url = config.members.choose_url().map(str::to_owned);
         engine.grace = config.members.grace();
@@ -822,13 +908,205 @@ async fn replied_topic(
     Some((command, author))
 }
 
+/// What a text message in a room is for the bot.
+#[derive(Debug, PartialEq)]
+enum Incoming {
+    /// A new message: its text without a reply's fallback.
+    Text { body: String },
+    /// An edit of `target`: its new text, from `m.new_content` (never the fallback body, which
+    /// starts with `* `).
+    Edit { target: String, body: String },
+}
+
+/// The text of a message event: a new one or an edit; None for anything but text.
+fn incoming(ev: &OriginalSyncRoomMessageEvent) -> Option<Incoming> {
+    if let Some(Relation::Replacement(r)) = &ev.content.relates_to {
+        let MessageType::Text(text) = &r.new_content.msgtype else {
+            return None;
+        };
+        return Some(Incoming::Edit {
+            target: r.event_id.to_string(),
+            body: text.body.clone(),
+        });
+    }
+    let MessageType::Text(text) = &ev.content.msgtype else {
+        return None;
+    };
+    Some(Incoming::Text {
+        body: mxbot_common::format::strip_reply_fallback(&text.body).to_owned(),
+    })
+}
+
+/// The message a reply answers: a plain reply's, or a thread message's that answers one
+/// (not the thread's latest a client names as a fallback).
+fn replied_to(ev: &OriginalSyncRoomMessageEvent) -> Option<OwnedEventId> {
+    match &ev.content.relates_to {
+        Some(Relation::Reply(reply)) => Some(reply.in_reply_to.event_id.clone()),
+        Some(Relation::Thread(thread)) if !thread.is_falling_back => {
+            thread.in_reply_to.as_ref().map(|r| r.event_id.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The message a redaction deletes (in the event or, in newer rooms, its content).
+fn redacted(ev: &OriginalSyncRoomRedactionEvent) -> Option<String> {
+    ev.redacts
+        .as_ref()
+        .or(ev.content.redacts.as_ref())
+        .map(|id| id.to_string())
+}
+
+/// Whether a command is `!minutes …`.
+fn is_minutes_command(body: &str) -> bool {
+    body.split_whitespace()
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("!minutes"))
+}
+
+/// The name a room shows for `user`.
+async fn name_of(room: &Room, user: &UserId) -> String {
+    mxbot_common::format::fetch_names(room, &[user.as_str()])
+        .await
+        .remove(user.as_str())
+        .unwrap_or_else(|| user.localpart().to_owned())
+}
+
+/// The message a `!minutes` command is about: the one it answers. In a thread, `!minutes
+/// undo` and `!minutes <day>` without an answer are about the thread's first message (the
+/// bot's thread reply says to answer there); a bare `!minutes` in a thread stays the overview.
+///
+/// With chat minutes switched off (`from_chat` false) a bare `!minutes` is about no message:
+/// as an answer too it is the overview it always was.
+fn minutes_target(
+    ev: &OriginalSyncRoomMessageEvent,
+    command: &Command,
+    from_chat: bool,
+) -> Option<OwnedEventId> {
+    if !from_chat && matches!(command, Command::Overview(_)) {
+        return None;
+    }
+    if let Some(target) = replied_to(ev) {
+        return Some(target);
+    }
+    let in_thread = matches!(&ev.content.relates_to, Some(Relation::Thread(_)));
+    let about_minutes = matches!(command, Command::Undo(_) | Command::Take { text: None, .. });
+    (in_thread && about_minutes).then(|| mxbot_common::send::thread_root(ev))
+}
+
+/// The text `original` shows now: its sender's latest edit among `edits`, else None.
+fn latest_edit(
+    original: &OriginalSyncRoomMessageEvent,
+    edits: impl IntoIterator<Item = OriginalSyncRoomMessageEvent>,
+) -> Option<String> {
+    edits
+        .into_iter()
+        .filter(|e| e.sender == original.sender)
+        .filter_map(|e| match incoming(&e) {
+            Some(Incoming::Edit { target, body }) if target == original.event_id.as_str() => {
+                Some((e.origin_server_ts, body))
+            }
+            _ => None,
+        })
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, body)| body)
+}
+
+/// A message of the room as the bot can read it.
+async fn room_message(room: &Room, id: &OwnedEventId) -> Option<OriginalSyncRoomMessageEvent> {
+    let event = match room.event(id, None).await {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("The message a !minutes is about could not be read: {e}");
+            return None;
+        }
+    };
+    match event.raw().deserialize() {
+        Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+            SyncMessageLikeEvent::Original(original),
+        ))) => Some(original),
+        _ => None,
+    }
+}
+
+/// The edits of `original` the homeserver has (the newest ten; decrypted by the SDK). None
+/// read: the message counts as it was sent.
+async fn edits_of(
+    room: &Room,
+    original: &OriginalSyncRoomMessageEvent,
+) -> Vec<OriginalSyncRoomMessageEvent> {
+    let opts = RelationsOptions {
+        include_relations: IncludeRelations::RelationsOfType(RelationType::Replacement),
+        ..Default::default()
+    };
+    match room.relations(original.event_id.clone(), opts).await {
+        Ok(relations) => (relations.chunk.iter())
+            .filter_map(|e| match e.raw().deserialize() {
+                Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                    SyncMessageLikeEvent::Original(edit),
+                ))) => Some(edit),
+                _ => None,
+            })
+            .collect(),
+        Err(e) => {
+            warn!("The edits of a message could not be read (taken as it was sent): {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// The message `target` as minutes for a `!minutes` about it, as it reads now (its latest
+/// edit). None: nothing a person wrote (the bot's own message; its thread reply stands for
+/// the message it answers). Err: what to say.
+async fn replied_minutes(
+    room: &Room,
+    target: &OwnedEventId,
+    me: &UserId,
+    keys: &[&str],
+) -> Result<Option<ChatMessage>, String> {
+    const UNREADABLE: &str =
+        "⚠️ I cannot read the message you answered (yet). Please try again in a moment.";
+    let Some(mut original) = room_message(room, target).await else {
+        return Err(UNREADABLE.to_owned());
+    };
+    if original.sender == me {
+        // the bot's thread reply: the minutes are the thread's first message
+        let root = mxbot_common::send::thread_root(&original);
+        if root == original.event_id {
+            return Ok(None);
+        }
+        match room_message(room, &root).await {
+            Some(first) if first.sender != me => original = first,
+            Some(_) => return Ok(None),
+            None => return Err(UNREADABLE.to_owned()),
+        }
+    }
+    let Some(Incoming::Text { body }) = incoming(&original) else {
+        return Err("Only a text message can be minutes.".to_owned());
+    };
+    let body = latest_edit(&original, edits_of(room, &original).await).unwrap_or(body);
+    Ok(Some(ChatMessage {
+        event: original.event_id.to_string(),
+        thread: mxbot_common::send::thread_root(&original).to_string(),
+        sender: original.sender.clone(),
+        sender_name: name_of(room, &original.sender).await,
+        body: minutes::without_command(&body, keys).to_owned(),
+        sent_at: original
+            .origin_server_ts
+            .to_system_time()
+            .map_or_else(chrono::Utc::now, chrono::DateTime::<chrono::Utc>::from),
+    }))
+}
+
 fn install_handler(
     bot: &Bot,
     engine: &Arc<PlenumEngine>,
     link_desk: &Arc<LinkDesk>,
     own_room: &Arc<OwnRoom>,
 ) {
+    let client = bot.client.clone();
     let bot = bot.clone();
+    let redaction_engine = Arc::clone(engine);
     let engine = Arc::clone(engine);
     let link_desk = Arc::clone(link_desk);
     let own_room = Arc::clone(own_room);
@@ -848,25 +1126,69 @@ fn install_handler(
                 if dispatch == Dispatch::Handled {
                     return;
                 }
-                let MessageType::Text(text) = &ev.content.msgtype else {
+                let Some(incoming) = incoming(&ev) else {
                     return;
                 };
+                let now = chrono::Utc::now();
+                let in_plenum_room = rooms.contains(room.room_id());
+                let sent_at = ev
+                    .origin_server_ts
+                    .to_system_time()
+                    .map_or(now, chrono::DateTime::<chrono::Utc>::from);
+                // Minutes are no commands: taken whatever their age (the bot was away), but not
+                // what the first sync of a fresh store brings back, nor a keep account's.
+                let minutes_from = in_plenum_room
+                    && engine.minutes.from_chat
+                    && !mxbot_common::events::is_replayed(ev.origin_server_ts)
+                    && !engine.keep.contains(&ev.sender);
+                let body = match incoming {
+                    Incoming::Edit { target, body } => {
+                        if minutes_from {
+                            let name = name_of(&room, &ev.sender).await;
+                            engine
+                                .edited(
+                                    room.room_id(),
+                                    &target,
+                                    &ev.sender,
+                                    &name,
+                                    &body,
+                                    sent_at,
+                                    now,
+                                )
+                                .await;
+                        }
+                        return;
+                    }
+                    Incoming::Text { body } => body,
+                };
+                if in_plenum_room && !body.trim_start().starts_with('!') {
+                    if minutes_from && minutes::is_minutes(&body) {
+                        let m = ChatMessage {
+                            event: ev.event_id.to_string(),
+                            thread: mxbot_common::send::thread_root(&ev).to_string(),
+                            sender: ev.sender.clone(),
+                            sender_name: name_of(&room, &ev.sender).await,
+                            body,
+                            sent_at,
+                        };
+                        engine.message(room.room_id(), m, now).await;
+                    }
+                    return;
+                }
+                let body = body.as_str();
                 // A fresh Matrix store syncs the rooms' history: old commands are no orders
                 // (an old `!minutes done` would close the meeting that is open now).
-                let now = chrono::Utc::now();
                 if now.timestamp_millis() - i64::from(ev.origin_server_ts.0) > COMMAND_MAX_AGE_MS {
                     info!(event = %ev.event_id, "An old message from the history, left alone");
                     return;
                 }
                 // `!link` from an account on another server, in a direct chat (anywhere else it
                 // only says where). The code is in the answer only, never in the log.
-                let in_plenum_room = rooms.contains(room.room_id());
                 let direct = !in_plenum_room && room.active_members_count() == 2;
                 let sent = ev
                     .origin_server_ts
                     .to_system_time()
                     .unwrap_or_else(SystemTime::now);
-                let body = mxbot_common::format::strip_reply_fallback(&text.body);
                 if let Some(answer) =
                     link_desk.answer(&ev.sender, body, direct, sent, SystemTime::now())
                 {
@@ -912,11 +1234,45 @@ fn install_handler(
                 };
                 let name = match author {
                     Some(a) => a,
-                    None => mxbot_common::format::fetch_names(&room, &[ev.sender.as_str()])
-                        .await
-                        .remove(ev.sender.as_str())
-                        .unwrap_or_else(|| ev.sender.localpart().to_owned()),
+                    None => name_of(&room, &ev.sender).await,
                 };
+                // `!minutes` about a message: the one it answers, or its own text
+                let mut origin = Origin::default();
+                if in_plenum_room && is_minutes_command(body) {
+                    match &command {
+                        Command::Take {
+                            text: Some(text), ..
+                        } => {
+                            origin.this = Some(ChatMessage {
+                                event: ev.event_id.to_string(),
+                                thread: mxbot_common::send::thread_root(&ev).to_string(),
+                                sender: ev.sender.clone(),
+                                sender_name: name.clone(),
+                                body: text.clone(),
+                                sent_at,
+                            })
+                        }
+                        Command::Overview(_) | Command::Take { .. } | Command::Undo(_) => {
+                            let on = engine.minutes.from_chat;
+                            if let Some(target) = minutes_target(&ev, &command, on) {
+                                match replied_minutes(&room, &target, &bot.user_id, &keys).await {
+                                    Ok(m) => origin.replied = m,
+                                    Err(why) => {
+                                        let content = message(&why, &[]);
+                                        if let Err(e) =
+                                            mxbot_common::send::send_with_retry(&room, content)
+                                                .await
+                                        {
+                                            error!("Answering in {} failed: {e}", room.room_id());
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 let sender = Sender {
                     id: ev.sender.clone(),
                     name,
@@ -926,16 +1282,32 @@ fn install_handler(
                 } else {
                     Scope::Room
                 };
-                let answer = engine
-                    .command_in(room.room_id(), &sender, command, now, scope)
-                    .await;
-                let content = message(&answer, &[]);
-                if let Err(e) = mxbot_common::send::send_with_retry(&room, content).await {
-                    error!("Answering in {} failed: {e}", room.room_id());
+                for answer in engine
+                    .answer(room.room_id(), &sender, command, origin, now, scope)
+                    .await
+                {
+                    let content = message(&answer, &[]);
+                    if let Err(e) = mxbot_common::send::send_with_retry(&room, content).await {
+                        error!("Answering in {} failed: {e}", room.room_id());
+                    }
                 }
             }
         },
-    );
+    ); // A deleted minutes message is withdrawn (docs/CHAT-MINUTES.md).
+    let engine = redaction_engine;
+    client.add_event_handler(move |ev: OriginalSyncRoomRedactionEvent, room: Room| {
+        let engine = Arc::clone(&engine);
+        async move {
+            if !engine.minutes.from_chat || !engine.rooms().contains(room.room_id()) {
+                return;
+            }
+            if let Some(target) = redacted(&ev) {
+                engine
+                    .redacted(room.room_id(), &target, chrono::Utc::now())
+                    .await;
+            }
+        }
+    });
 }
 
 /// The bot's own room, known by its room ID: the alias `#<bot localpart>:<bot server>` (`make
@@ -1000,6 +1372,174 @@ fn takes_commands(room: &RoomId, admin_dm: bool, own: Option<&RoomId>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn message_event(content: serde_json::Value) -> OriginalSyncRoomMessageEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "m.room.message",
+            "event_id": "$new",
+            "sender": "@anna:example.org",
+            "origin_server_ts": 1_800_000_000_000u64,
+            "content": content,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_three_event_kinds_are_read_from_their_json() {
+        // an original message, also a reply (its fallback dropped)
+        let ev = message_event(serde_json::json!({"msgtype": "m.text", "body": "Protokoll\nx"}));
+        assert_eq!(
+            incoming(&ev),
+            Some(Incoming::Text {
+                body: "Protokoll\nx".into()
+            })
+        );
+        assert_eq!(mxbot_common::send::thread_root(&ev).as_str(), "$new");
+        assert_eq!(replied_to(&ev), None);
+        let ev = message_event(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "> <@ben:example.org> Protokoll\n\n!minutes",
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$minutes"}},
+        }));
+        assert_eq!(
+            incoming(&ev),
+            Some(Incoming::Text {
+                body: "!minutes".into()
+            })
+        );
+        assert_eq!(replied_to(&ev).unwrap().as_str(), "$minutes");
+
+        // a replacement: the new content, not the "* " fallback
+        let ev = message_event(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "* Protokoll neu",
+            "m.new_content": {"msgtype": "m.text", "body": "Protokoll neu"},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$old"},
+        }));
+        assert_eq!(
+            incoming(&ev),
+            Some(Incoming::Edit {
+                target: "$old".into(),
+                body: "Protokoll neu".into()
+            })
+        );
+
+        // a thread reply: answered in its thread; a reply to a thread message only when it
+        // answers one, not the client's fallback
+        let ev = message_event(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "Protokoll im Thread",
+            "m.relates_to": {"rel_type": "m.thread", "event_id": "$root",
+                             "is_falling_back": true, "m.in_reply_to": {"event_id": "$last"}},
+        }));
+        assert_eq!(mxbot_common::send::thread_root(&ev).as_str(), "$root");
+        assert_eq!(replied_to(&ev), None);
+        let ev = message_event(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "!minutes",
+            "m.relates_to": {"rel_type": "m.thread", "event_id": "$root",
+                             "is_falling_back": false, "m.in_reply_to": {"event_id": "$part2"}},
+        }));
+        assert_eq!(replied_to(&ev).unwrap().as_str(), "$part2");
+
+        // no text: nothing
+        let ev = message_event(
+            serde_json::json!({"msgtype": "m.image", "body": "x.png", "url": "mxc://example.org/a"}),
+        );
+        assert_eq!(incoming(&ev), None);
+
+        // a redaction, in the event (older rooms) or in its content (v11)
+        for ev in [
+            serde_json::json!({"type": "m.room.redaction", "event_id": "$r", "sender": "@anna:example.org",
+                               "origin_server_ts": 1, "redacts": "$minutes", "content": {}}),
+            serde_json::json!({"type": "m.room.redaction", "event_id": "$r", "sender": "@anna:example.org",
+                               "origin_server_ts": 1, "content": {"redacts": "$minutes"}}),
+        ] {
+            let ev: OriginalSyncRoomRedactionEvent = serde_json::from_value(ev).unwrap();
+            assert_eq!(redacted(&ev).as_deref(), Some("$minutes"));
+        }
+        assert!(is_minutes_command("!Minutes 15.11."));
+        assert!(!is_minutes_command("!plenum"));
+    }
+
+    #[test]
+    fn a_minutes_command_in_a_thread_is_about_its_first_message() {
+        let in_thread = |body: &str| {
+            message_event(serde_json::json!({
+                "msgtype": "m.text",
+                "body": body,
+                "m.relates_to": {"rel_type": "m.thread", "event_id": "$minutes",
+                                 "is_falling_back": true, "m.in_reply_to": {"event_id": "$receipt"}},
+            }))
+        };
+        let target = |body: &str| {
+            let command = commands::parse_for(body, &[]).unwrap();
+            minutes_target(&in_thread(body), &command, true).map(|id| id.to_string())
+        };
+        assert_eq!(target("!minutes undo").as_deref(), Some("$minutes"));
+        assert_eq!(target("!minutes 15.11.").as_deref(), Some("$minutes"));
+        // a bare `!minutes` there is the overview, as anywhere
+        assert_eq!(target("!minutes"), None);
+        // an answer names its message, in a thread or not
+        let ev = message_event(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "!minutes undo",
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$other"}},
+        }));
+        let undo = commands::parse_for("!minutes undo", &[]).unwrap();
+        assert_eq!(minutes_target(&ev, &undo, true).unwrap().as_str(), "$other");
+        // outside a thread and no answer: none
+        let ev = message_event(serde_json::json!({"msgtype": "m.text", "body": "!minutes undo"}));
+        assert_eq!(minutes_target(&ev, &undo, true), None);
+        // switched off: `!minutes` as an answer is the overview, whatever it answers
+        let ev = message_event(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "!minutes",
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$other"}},
+        }));
+        let bare = commands::parse_for("!minutes", &[]).unwrap();
+        assert_eq!(minutes_target(&ev, &bare, false), None);
+        assert_eq!(minutes_target(&ev, &bare, true).unwrap().as_str(), "$other");
+    }
+
+    #[test]
+    fn a_message_reads_as_its_senders_latest_edit() {
+        let original = message_event(serde_json::json!({"msgtype": "m.text", "body": "Notes"}));
+        let edit =
+            |sender: &str, at: u64, target: &str, body: &str| -> OriginalSyncRoomMessageEvent {
+                serde_json::from_value(serde_json::json!({
+                    "type": "m.room.message",
+                    "event_id": format!("$edit{at}"),
+                    "sender": sender,
+                    "origin_server_ts": at,
+                    "content": {
+                        "msgtype": "m.text",
+                        "body": format!("* {body}"),
+                        "m.new_content": {"msgtype": "m.text", "body": body},
+                        "m.relates_to": {"rel_type": "m.replace", "event_id": target},
+                    },
+                }))
+                .unwrap()
+            };
+        let anna = "@anna:example.org";
+        assert_eq!(latest_edit(&original, Vec::new()), None);
+        let edits = vec![
+            edit(anna, 1_800_000_002_000, "$new", "Protokoll, zweite Fassung"),
+            edit(anna, 1_800_000_001_000, "$new", "Protokoll, erste Fassung"),
+            // not the sender's, and not of this message
+            edit(
+                "@ben:example.org",
+                1_800_000_009_000,
+                "$new",
+                "Bens Fassung",
+            ),
+            edit(anna, 1_800_000_009_000, "$else", "eine andere Nachricht"),
+        ];
+        assert_eq!(
+            latest_edit(&original, edits).as_deref(),
+            Some("Protokoll, zweite Fassung")
+        );
+    }
 
     #[test]
     fn the_own_room_is_known_by_its_id_and_nothing_else() {

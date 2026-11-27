@@ -47,6 +47,85 @@ person, Outline shows them a notice. What stays open comes onto the next page.
 {{open_tasks}}
 ";
 
+/// The fill-in template for minutes posted in the chat (CHAT-MINUTES.md §9): "<Name>: Chat template" in
+/// the wiki starts with it, in a code block so its lines stay lines. Every word of it is a
+/// keyword or a label `minutes::read` knows (a German one too, after an edit).
+pub const DEFAULT_CHAT_TEMPLATE: &str = "\
+Minutes {{plenum}} {{date}}
+Present:
+Facilitation:
+Minutes by:
+
+{{topics}}
+
+Decisions:
+-
+
+Tasks:
+-
+
+Postponed:
+-
+
+Done:
+{{open_tasks}}";
+
+/// The chat template's document: what it is for, and the template in a code block.
+pub fn chat_template_doc_text() -> String {
+    format!(
+        "The template the bot posts in the room before each meeting (and on `!minutes \
+         template`): people copy it, fill it in and post it as the minutes. Change the text in \
+         the box below as you like (another language, other labels: see docs/CHAT-MINUTES.md \
+         of the bot); keep {{{{topics}}}} and {{{{open_tasks}}}} where the open page's topics and \
+         the open tasks go (for meetings shared in full only).\n\n```\n{DEFAULT_CHAT_TEMPLATE}\n```\n"
+    )
+}
+
+/// The template in the chat template's document: its first code block, else its text.
+pub fn chat_template_of(doc: &str) -> String {
+    let mut inside = false;
+    let mut lines: Vec<&str> = Vec::new();
+    for line in doc.lines() {
+        if line.trim_start().starts_with("```") {
+            if inside {
+                return lines.join("\n");
+            }
+            inside = true;
+            continue;
+        }
+        if inside {
+            lines.push(line);
+        }
+    }
+    crate::page::lines(doc).join("\n")
+}
+
+/// The chat template for one meeting: the placeholders filled in; `topics` (the open page's
+/// topic titles) and `tasks` (the open tasks) only for a meeting shared in full, else left out.
+pub fn render_chat_template(
+    template: &str,
+    plenum: &Plenum,
+    key: MeetingKey,
+    topics: &[String],
+    tasks: &[String],
+) -> String {
+    let date = key.0.date();
+    let topics: Vec<String> = topics.iter().map(|t| format!("## {t}")).collect();
+    let tasks: Vec<String> = tasks.iter().map(|t| format!("- [ ] {t}")).collect();
+    let mut text = template
+        .replace("{{plenum}}", &plenum.name)
+        .replace("{{weekday}}", &date.format("%A").to_string())
+        .replace("{{date}}", &date.format("%-d %B %Y").to_string())
+        .replace("{{time}}", &key.0.format("%H:%M").to_string())
+        .replace("{{iso_date}}", &date.format("%Y-%m-%d").to_string())
+        .replace("{{topics}}", &topics.join("\n\n"))
+        .replace(OPEN_TASKS_PLACEHOLDER, &tasks.join("\n"));
+    while text.contains("\n\n\n") {
+        text = text.replace("\n\n\n", "\n\n");
+    }
+    text.trim().to_owned()
+}
+
 /// Where the open tasks of the last protocol go in a template; a template without it gets
 /// them at its end, under [`OPEN_TASKS_HEADING`].
 pub const OPEN_TASKS_PLACEHOLDER: &str = "{{open_tasks}}";
@@ -849,6 +928,80 @@ pub fn summary(
     text
 }
 
+/// The longest minutes message (CHAT-MINUTES.md §8); a longer one falls back to the summary and the PDF.
+pub const MINUTES_MESSAGE_MAX: usize = 16_000;
+
+/// A line of the page as a line of the message: list marks as "- ", checkboxes as ☐ and ☑.
+fn message_line(line: &str) -> String {
+    match strip_list_marker(line.trim()) {
+        (Some(false), rest) => format!("☐ {}", rest.trim()),
+        (Some(true), rest) => format!("☑ {}", rest.trim()),
+        (None, rest) => rest.trim().to_owned(),
+    }
+}
+
+/// The minutes written on the page as one message (CHAT-MINUTES.md §8): when and who, each topic with its
+/// result, the decisions, what moves on, the open tasks (`outcome`: without the withheld
+/// ones; a result line holding one is left out too), the link. No tables, checkboxes as ☐.
+/// None above [`MINUTES_MESSAGE_MAX`].
+pub fn minutes_message(
+    plenum: &Plenum,
+    key: MeetingKey,
+    link: &str,
+    people: &[(String, String)],
+    topics: &[crate::page::Topic],
+    outcome: &Outcome,
+    withheld: &[String],
+) -> Option<String> {
+    use crate::page::Reading;
+    let mut text = format!(
+        "📋 **Minutes of {}**, {}",
+        plenum.name,
+        describe_meeting(key)
+    );
+    if !people.is_empty() {
+        let row: Vec<String> = people.iter().map(|(h, c)| format!("{h}: {c}")).collect();
+        text.push_str(&format!("\n\n{}", row.join(" · ")));
+    }
+    for t in topics {
+        text.push_str(&format!("\n\n**{}**", t.title()));
+        match t.reading {
+            Reading::NotReached | Reading::NoResult => text.push_str(" (on the next page)"),
+            Reading::Check => text.push_str(" (two \"Result:\" lines, see the page)"),
+            Reading::Decided | Reading::Discussed => {}
+        }
+        for line in &t.result {
+            let (_, rest) = strip_list_marker(line.trim());
+            if !may_share_task(rest, withheld) {
+                continue;
+            }
+            text.push_str(&format!("\n- {}", message_line(line)));
+        }
+    }
+    if !outcome.decisions.is_empty() {
+        text.push_str("\n\n**Decisions**\n");
+        for d in &outcome.decisions {
+            text.push_str(&format!("\n- {d}"));
+        }
+    }
+    let moved: Vec<String> = topics
+        .iter()
+        .filter(|t| t.reading.carried())
+        .map(|t| t.title())
+        .collect();
+    if !moved.is_empty() {
+        text.push_str(&format!("\n\n**Postponed:** {}", moved.join(", ")));
+    }
+    if !outcome.tasks.is_empty() {
+        text.push_str("\n\n**Open tasks**\n");
+        for t in &outcome.tasks {
+            text.push_str(&format!("\n- ☐ {t}"));
+        }
+    }
+    text.push_str(&format!("\n\nThe page: {link}"));
+    (text.chars().count() <= MINUTES_MESSAGE_MAX).then_some(text)
+}
+
 /// The text for Matrix: each mention of a wiki user in Outline's Markdown
 /// (`@[Ben](mention://<id>/user/<user id>)`, the form Outline writes and reads back as a live
 /// mention) as a Matrix mention of the person `account` finds for the shown name, else as
@@ -931,6 +1084,51 @@ mod tests {
 
     fn key() -> MeetingKey {
         "2026-11-01 19:00".parse().unwrap()
+    }
+
+    #[test]
+    fn the_minutes_as_one_message() {
+        let page = "**House plenum**\n\n| Facilitation | Minutes | Present |\n|---|---|---|\n| Anna | Ben | all |\n\n## Topics\n\n### Bins\n\n**Result:** yellow ones\n\nDecision: We buy yellow bins.\n\n* [ ] Ben: order them\n\n* [ ] Cara: secret task\n\n### Garden\n\nResult:\n\n## Tasks\n\n- [ ] Ben: order them\n- [ ] Cara: secret task\n";
+        let topics = crate::page::topics(page);
+        let withheld = vec!["Cara: secret task".to_owned()];
+        let outcome = extract(page);
+        let shown = Outcome {
+            decisions: outcome.decisions.clone(),
+            tasks: (outcome.tasks.iter())
+                .filter(|t| may_share_task(t, &withheld))
+                .cloned()
+                .collect(),
+        };
+        let people = crate::page::people(page);
+        let text = minutes_message(
+            &plenum(),
+            key(),
+            "https://wiki/x",
+            &people,
+            &topics,
+            &shown,
+            &withheld,
+        )
+        .unwrap();
+        assert!(text.starts_with("📋 **Minutes of House plenum**, Sunday, 1 November 2026 at 19:00\n\nFacilitation: Anna · Minutes: Ben · Present: all"), "{text}");
+        assert!(
+            text.contains(
+                "**Bins**\n- yellow ones\n- Decision: We buy yellow bins.\n- ☐ Ben: order them"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("**Garden** (on the next page)"));
+        assert!(text.contains("**Decisions**\n\n- We buy yellow bins."));
+        assert!(text.contains("**Postponed:** Garden"));
+        assert!(text.contains("**Open tasks**\n\n- ☐ Ben: order them"));
+        assert!(!text.contains("secret") && !text.contains('|'), "{text}");
+        assert!(text.ends_with("The page: https://wiki/x"));
+        let long: Vec<String> = (0..2000).map(|i| format!("decision number {i}")).collect();
+        let big = Outcome {
+            decisions: long,
+            tasks: Vec::new(),
+        };
+        assert!(minutes_message(&plenum(), key(), "x", &[], &[], &big, &[]).is_none());
     }
 
     fn top(text: &str) -> Top {

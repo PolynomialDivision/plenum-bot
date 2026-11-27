@@ -71,6 +71,15 @@ handover_max_days = 30   # …and at most this long after the choice, joined or 
 stay_reminder_days = 14  # the admins hear of a stay's end (`stay_until`) this long before and on the day (1–365)
 # link codes (!link <username>): MATRIX_LINK_KEY in the environment
 
+# Minutes posted in a plenum's room (docs/CHAT-MINUTES.md). Off by default: then none of the
+# other keys does anything and the bot behaves as without this table.
+[minutes]
+from_chat = false   # take minutes posted in a plenum's room into the wiki
+wait_days = 7       # a meeting without results waits this long for them before it closes empty (0-30)
+nudge_days = 2      # one reminder that no minutes came, this long after the meeting (0 = none, 0-30)
+pin = true          # pin the latest minutes message in the room
+template = true     # post the fill-in template after the reminder (messages all only)
+
 [[plenum]]
 key = "house"
 name = "House plenum"

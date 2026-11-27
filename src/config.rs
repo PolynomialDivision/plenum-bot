@@ -39,6 +39,56 @@ pub struct Config {
     /// refuse keys they do not know, which would stop it after a rollback).
     #[serde(default)]
     pub pages: PagesConfig,
+    /// Minutes posted in a plenum's room (docs/CHAT-MINUTES.md). Top-level for the same reason
+    /// as `[pages]`.
+    #[serde(default)]
+    pub minutes: MinutesConfig,
+}
+
+/// The longest `[minutes] wait_days` and `nudge_days`.
+pub const MINUTES_DAYS_MAX: u32 = 30;
+
+/// `[minutes]`: off by default; without `from_chat` none of the other keys does anything.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields, default)]
+pub struct MinutesConfig {
+    /// Take minutes posted in a plenum's room into the wiki.
+    pub from_chat: bool,
+    /// A meeting whose page has no result waits this many days after its end for minutes
+    /// from the chat before it closes empty (0: it closes as without chat minutes).
+    pub wait_days: u32,
+    /// One reminder that no minutes came, this many days after the meeting (0: none).
+    pub nudge_days: u32,
+    /// Pin the latest minutes message in the room.
+    pub pin: bool,
+    /// Post the fill-in template after the reminder (`messages all` only).
+    pub template: bool,
+}
+
+impl Default for MinutesConfig {
+    fn default() -> Self {
+        Self {
+            from_chat: false,
+            wait_days: 7,
+            nudge_days: 2,
+            pin: true,
+            template: true,
+        }
+    }
+}
+
+impl MinutesConfig {
+    pub fn check(&self) -> Result<()> {
+        for (name, days) in [
+            ("wait_days", self.wait_days),
+            ("nudge_days", self.nudge_days),
+        ] {
+            if days > MINUTES_DAYS_MAX {
+                bail!("[minutes] {name} ({days}) must be 0 to {MINUTES_DAYS_MAX}");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What the bot posts in a plenum's room by itself (docs/PLENUM-PAGES.md §5). Answers to a
@@ -505,6 +555,11 @@ impl Plenum {
     pub fn example_title(&self) -> String {
         format!("{}: Example minutes", self.name)
     }
+
+    /// The fill-in template for minutes posted in the chat (docs/CHAT-MINUTES.md).
+    pub fn chat_template_title(&self) -> String {
+        format!("{}: Chat template", self.name)
+    }
 }
 
 impl Config {
@@ -814,6 +869,30 @@ readers = ["calendar-bot"]
         assert_eq!(c.plenums().unwrap().len(), 2);
         c.timezone().unwrap();
         c.members.check().unwrap();
+        c.minutes.check().unwrap();
+        assert!(!c.minutes.from_chat, "off unless switched on");
+    }
+
+    #[test]
+    fn minutes_from_the_chat_are_off_by_default_and_checked() {
+        let plenum = "[[plenum]]\nkey = \"house\"\nname = \"House plenum\"\n\
+                      room = \"!house:example.org\"\ncollection = \"House plenum\"\n";
+        let c = parse(plenum);
+        let m = &c.minutes;
+        assert!(!m.from_chat && m.pin && m.template);
+        assert_eq!((m.wait_days, m.nudge_days), (7, 2));
+        let c = parse(&format!(
+            "[minutes]\nfrom_chat = true\nwait_days = 0\nnudge_days = 30\npin = false\n{plenum}"
+        ));
+        assert!(c.minutes.from_chat && !c.minutes.pin && c.minutes.template);
+        c.minutes.check().unwrap();
+        let c = parse(&format!("[minutes]\nwait_days = 31\n{plenum}"));
+        assert!(c.minutes.check().is_err());
+        let wrong = format!("{BASE}[minutes]\nfrom_chats = true\n{plenum}");
+        assert!(
+            toml::from_str::<Config>(&wrong).is_err(),
+            "unknown keys refused"
+        );
     }
 
     #[test]

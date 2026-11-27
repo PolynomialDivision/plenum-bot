@@ -17,6 +17,19 @@ pub enum Command {
     },
     /// `!minutes done [key]`
     Close(Option<String>),
+    /// Minutes from the chat (docs/CHAT-MINUTES.md): `!minutes [key]` followed by a line break
+    /// and the minutes (`text`), or `!minutes [key] <day>` as a reply (the message it answers,
+    /// for the meeting on that day). `!minutes` alone as a reply is [`Command::Overview`]
+    /// turned into this by the handler, which knows it is a reply.
+    Take {
+        key: Option<String>,
+        when: Option<When>,
+        text: Option<String>,
+    },
+    /// `!minutes undo [key]`: the message answered (or the sender's latest) is no minutes.
+    Undo(Option<String>),
+    /// `!minutes template [key]`: the fill-in template for chat minutes.
+    ChatTemplate(Option<String>),
     /// `!minutes full|link|confidential [key] [day [time]]`: what of a meeting's minutes
     /// goes into the chat; without a day the open or the next meeting's.
     Publish {
@@ -86,7 +99,7 @@ impl When {
 }
 
 /// `14.11.`, `14.11`, `14.11.2026`, `14.11.26` or `2026-11-14`, maybe followed by `19:00`.
-fn parse_when(words: &[String]) -> Result<Option<When>, String> {
+pub(crate) fn parse_when(words: &[String]) -> Result<Option<When>, String> {
     let wrong = |w: &str| {
         format!("I don't understand “{w}”. A day goes like this: `14.11.` or `14.11. 19:00`.")
     };
@@ -180,20 +193,40 @@ pub fn parse_for(body: &str, keys: &[&str]) -> Option<Command> {
             })
         }
         "!minutes" => {
+            // `!minutes [key]`, a line break, and the minutes
+            if let Some((first, text)) = body.split_once('\n') {
+                let after: Vec<&str> = first.split_whitespace().skip(1).collect();
+                if after.iter().all(|w| is_key(w)) && !text.trim().is_empty() {
+                    return Some(Command::Take {
+                        key: after.first().map(|w| (*w).to_owned()),
+                        when: None,
+                        text: Some(text.trim().to_owned()),
+                    });
+                }
+            }
             let (key, rest) = split_key(&words);
             match rest.first().map(|w| w.to_lowercase()).as_deref() {
                 None => Some(Command::Overview(key)),
                 Some("done") | Some("close") => Some(Command::Close(key)),
+                Some("undo") if rest.len() == 1 => Some(Command::Undo(key)),
+                Some("template") if rest.len() == 1 => Some(Command::ChatTemplate(key)),
                 Some(w) => match Publication::from_word(w) {
                     Some(mode) => match parse_when(&rest[1..]) {
                         Ok(when) => Some(Command::Publish { key, mode, when }),
                         Err(why) => Some(Command::Invalid(why)),
                     },
-                    None => Some(Command::Invalid(
-                        "Did you mean `!minutes done`, or `!minutes full`, `!minutes link` or \
-                         `!minutes confidential` (what of the minutes comes into the chat)?"
-                            .to_owned(),
-                    )),
+                    None => match parse_when(&rest) {
+                        Ok(Some(when)) => Some(Command::Take {
+                            key,
+                            when: Some(when),
+                            text: None,
+                        }),
+                        _ => Some(Command::Invalid(
+                            "Did you mean `!minutes done`, or `!minutes full`, `!minutes link` or \
+                             `!minutes confidential` (what of the minutes comes into the chat)?"
+                                .to_owned(),
+                        )),
+                    },
                 },
             }
         }
@@ -365,6 +398,59 @@ mod tests {
         assert_eq!(p("!plenum help"), Some(Command::Help));
         assert!(matches!(p("!minutes now"), Some(Command::Invalid(_))));
         assert!(matches!(p("!plenum xyz"), Some(Command::Invalid(_))));
+    }
+
+    #[test]
+    fn minutes_from_the_chat() {
+        assert_eq!(
+            p("!minutes\nProtokoll 15.11.\nBeschluss: x"),
+            Some(Command::Take {
+                key: None,
+                when: None,
+                text: Some("Protokoll 15.11.\nBeschluss: x".into())
+            })
+        );
+        assert_eq!(
+            p("!minutes kitchen-floor-1\nProtokoll"),
+            Some(Command::Take {
+                key: Some("kitchen-floor-1".into()),
+                when: None,
+                text: Some("Protokoll".into())
+            })
+        );
+        let nov15 = When {
+            day: 15,
+            month: 11,
+            year: None,
+            time: None,
+        };
+        assert_eq!(
+            p("!minutes 15.11."),
+            Some(Command::Take {
+                key: None,
+                when: Some(nov15),
+                text: None
+            })
+        );
+        assert_eq!(p("!minutes undo"), Some(Command::Undo(None)));
+        assert_eq!(p("!minutes template"), Some(Command::ChatTemplate(None)));
+        assert_eq!(
+            p("!minutes template kitchen-floor-1"),
+            Some(Command::ChatTemplate(Some("kitchen-floor-1".into())))
+        );
+        assert_eq!(
+            p("!Minutes UNDO kitchen-floor-3"),
+            Some(Command::Undo(Some("kitchen-floor-3".into())))
+        );
+        // alone it is the overview, as before (as a reply the handler makes it a take)
+        assert_eq!(p("!minutes"), Some(Command::Overview(None)));
+        assert_eq!(p("!minutes\n  "), Some(Command::Overview(None)));
+        assert!(matches!(p("!minutes undo now"), Some(Command::Invalid(_))));
+        assert_eq!(
+            p("!minutes done\nlater"),
+            Some(Command::Close(None)),
+            "as before"
+        );
     }
 
     #[test]

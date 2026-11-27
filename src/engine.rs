@@ -51,6 +51,10 @@ use mxbot_common::{
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+#[path = "chat_flow.rs"]
+mod chat_flow;
+pub use chat_flow::{ChatMessage, Origin};
+
 use crate::{
     calendar::Occurrence,
     commands::{Command, When},
@@ -71,6 +75,8 @@ pub struct Doc {
     pub url: String,
     /// Nobody (the bot neither) changed it since it was made.
     pub untouched: bool,
+    /// Archived in the wiki: still there, but nobody writes in it.
+    pub archived: bool,
     pub collection_id: Option<String>,
     pub parent_id: Option<String>,
 }
@@ -129,6 +135,8 @@ pub trait Wiki {
     ) -> Result<String>;
     /// A URL path as a link people can open.
     fn link(&self, path: &str) -> String;
+    /// Into the trash (Outline keeps it 30 days); false when it is gone already.
+    async fn delete(&self, id: &str) -> Result<bool>;
 }
 
 /// The chat (Matrix in production).
@@ -137,7 +145,7 @@ pub trait Chat {
     /// Send Markdown with this transaction ID (a resend with the same ID is dropped). Every
     /// message into a plenum's room says what it is ([`Notice`]): [`sends`] decides.
     async fn send(&self, room: &RoomId, markdown: &str, notice: Notice, txn: &str) -> Result<()>;
-    /// [`Self::send`], pinging `users` (Matrix mentions).
+    /// [`Self::send`], pinging `users` (Matrix mentions); the message's event ID.
     async fn send_mentioning(
         &self,
         room: &RoomId,
@@ -145,7 +153,7 @@ pub trait Chat {
         users: &[OwnedUserId],
         notice: Notice,
         txn: &str,
-    ) -> Result<()>;
+    ) -> Result<String>;
     async fn send_file(
         &self,
         room: &RoomId,
@@ -164,6 +172,22 @@ pub trait Chat {
     ) -> Result<String>;
     /// Replace the text of the bot's own message `event` (`txn` as for [`Self::send`]).
     async fn edit(&self, room: &RoomId, event: &str, markdown: &str, txn: &str) -> Result<()>;
+    /// A reaction `key` to `event`.
+    async fn react(&self, room: &RoomId, event: &str, key: &str, txn: &str) -> Result<String>;
+    /// The bot's reaction `reaction` (its event) taken back.
+    async fn unreact(&self, room: &RoomId, reaction: &str, txn: &str) -> Result<()>;
+    /// A reply in the thread `thread`, quoting `event`, pinging nobody; the reply's event ID.
+    async fn reply(
+        &self,
+        room: &RoomId,
+        thread: &str,
+        event: &str,
+        markdown: &str,
+        txn: &str,
+    ) -> Result<String>;
+    /// One `m.room.pinned_events` from the list as the server has it: `pin` added last,
+    /// `unpin` taken out, everything else kept; false when the bot may not.
+    async fn set_pins(&self, room: &RoomId, pin: Option<&str>, unpin: &[String]) -> Result<bool>;
     /// Who is in the room, joined or invited.
     async fn members(&self, room: &RoomId) -> Result<Vec<Member>>;
     async fn invite(&self, room: &RoomId, user: &UserId) -> Result<()>;
@@ -202,6 +226,10 @@ pub enum Notice {
     Pdf,
     /// A setting changed from somewhere else (an admin's direct chat).
     Setting,
+    /// No chat minutes came for a meeting yet (docs/CHAT-MINUTES.md).
+    MinutesMissing,
+    /// The fill-in template for chat minutes, after the reminder.
+    Template,
 }
 
 /// Whether the bot posts `notice` by itself in a plenum with these `messages`.
@@ -286,6 +314,8 @@ pub struct Engine<W, C> {
     /// from the last read of the directory: their chosen one, else the house account; None
     /// for a name two people share.
     accounts_by_name: std::sync::Mutex<HashMap<String, Option<OwnedUserId>>>,
+    /// `[minutes]`: minutes from the chat (`chat_flow.rs`).
+    pub minutes: config::MinutesConfig,
     pub(crate) state: Mutex<State>,
     state_path: PathBuf,
     /// The plenums whose area was checked since the start: a restart (a deploy with a new
@@ -343,6 +373,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             members_round: Mutex::new(()),
             calendar_url: None,
             accounts_by_name: std::sync::Mutex::new(HashMap::new()),
+            minutes: config::MinutesConfig::default(),
             state: Mutex::new(state),
             state_path,
             areas_checked: std::sync::Mutex::new(HashSet::new()),
@@ -360,7 +391,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     /// The state on disk. Every step saves before its side effect (the document's ID, the
     /// message's transaction ID): a step whose save fails must not go on, or a restart would
     /// do it again.
-    async fn save(&self, st: &State) -> Result<()> {
+    pub(crate) async fn save(&self, st: &State) -> Result<()> {
         st.save(&self.state_path).await.context("saving the state")
     }
 
@@ -379,6 +410,9 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         for base in &self.plenums {
             let p = &self.effective(&st, base);
             self.follow_calendar(&mut st, p, now).await;
+            if let Err(e) = self.file_pending(&mut st, p, now).await {
+                report.wiki(format!("{}: chat minutes: {e:#}", p.key));
+            }
             self.tick_plenum(&mut st, p, now).await;
             if let Err(e) = self.carry_topics_on(&mut st, p).await {
                 warn!(plenum = %p.key, "Topics onto the next page (again at the next tick): {e:#}");
@@ -389,6 +423,9 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 report.wiki(format!("{}: wiki area: {e:#}", p.key));
             }
             st.plenums.entry(p.key.clone()).or_default().prune();
+            if let Some(pm) = st.minutes.plenums.get_mut(&p.key) {
+                pm.prune(now);
+            }
             if let Some(room) = st.settings.plenums.get_mut(&p.key) {
                 room.prune(now);
             }
@@ -715,6 +752,13 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 Ok(()) => {
                     info!(plenum = %p.key, meeting = %id, %title, "Protocol renamed");
                     meeting(st, p, &id).title = Some(title);
+                    // its chat minutes' copy follows
+                    if let Some(f) = (st.minutes.plenums.get_mut(&p.key))
+                        .and_then(|pm| pm.filings.get_mut(&id))
+                        .filter(|f| f.created)
+                    {
+                        f.pending = true;
+                    }
                 }
                 Err(e) => {
                     warn!(plenum = %p.key, meeting = %id, "Renaming the protocol (again at the next tick): {e:#}")
@@ -1115,9 +1159,24 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 self.remind(st, p, key, now >= start).await?;
             }
         }
+        // the fill-in template for chat minutes, by itself right after the reminder
+        let template_at = start - Duration::minutes(i64::from(p.remind_minutes));
+        if self.minutes.from_chat && self.minutes.template && now >= template_at && now < end {
+            self.post_template(st, p, key).await?;
+        }
         let requested = st.plenums[&p.key].meetings[key].close.requested;
         let close_at = end + Duration::hours(i64::from(p.close_after_hours));
-        if requested || now >= close_at {
+        // chat minutes close the meeting once it is over (docs/CHAT-MINUTES.md)
+        let filed = self.chat_minutes_of(st, p, key).is_some();
+        if requested || now >= close_at || (filed && now >= end) {
+            if !requested
+                && !filed
+                && self
+                    .waits_for_minutes(st, p, key, end, close_at, now)
+                    .await?
+            {
+                return self.nudge(st, p, key, end, now).await;
+            }
             self.close(st, p, key, now).await?;
         }
         Ok(())
@@ -1232,6 +1291,20 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             .await?;
         ps.decisions_doc_id = Some(decisions.id.clone());
         ps.urls.insert("decisions".into(), decisions.url.clone());
+        if self.minutes.from_chat {
+            let chat_template = self
+                .ensure_doc(
+                    &collection,
+                    &p.chat_template_title(),
+                    &protocol::chat_template_doc_text(),
+                    &[],
+                    ps.chat_template_doc_id.as_deref(),
+                    &mut ps.written,
+                )
+                .await?;
+            ps.chat_template_doc_id = Some(chat_template.id);
+            ps.urls.insert("chat_template".into(), chat_template.url);
+        }
         Ok((collection, template.text, decisions))
     }
 
@@ -1541,7 +1614,14 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             self.save(st).await?;
             return Ok(());
         };
-        let outcome = protocol::extract(&doc.text);
+        let mut outcome = protocol::extract(&doc.text);
+        // chat minutes: their decisions and tasks too (docs/CHAT-MINUTES.md)
+        let chat = self.chat_minutes_of(st, p, key);
+        let closed_tasks = if self.minutes.from_chat {
+            self.merge_chat(st, p, &mut outcome, chat.as_ref())
+        } else {
+            Vec::new()
+        };
         // Read at every try: a change in the chat while a step fails reaches the next one.
         let shared = publication(p, meeting(st, p, key));
         // What the next protocol and the overview carry on with (each close sets it anew,
@@ -1564,13 +1644,25 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             };
             // The newest meeting's open tasks are the ones that go on.
             if ps.open_tasks_from.is_none_or(|from| from <= start) {
+                // tasks of a later day (chat minutes filed by their day) stay: this page
+                // never had them
+                let later: Vec<Carried> = (ps.open_tasks.iter())
+                    .filter(|t| t.date > date && !outcome.tasks.contains(&t.text))
+                    .cloned()
+                    .collect();
                 ps.open_tasks = outcome.tasks.iter().map(carried).collect();
+                ps.open_tasks.extend(later);
                 ps.open_tasks_from = Some(start);
             }
             // By the protocol: two meetings on one day keep their decisions apart.
             ps.decisions.retain(|d| d.link != link);
             ps.decisions.extend(outcome.decisions.iter().map(carried));
             ps.decisions.sort_by_key(|d| d.date);
+            for task in closed_tasks {
+                if !ps.done_tasks.contains(&task) {
+                    ps.done_tasks.push(task);
+                }
+            }
         }
         if !meeting(st, p, key).close.tasks_carried {
             self.carry_tasks_on(st, p, start).await?;
@@ -1580,12 +1672,19 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         // the topics not reached wait for the next page (carry_topics_on puts them there)
         let topics = page::topics(&doc.text);
         if !meeting(st, p, key).close.topics_read {
+            // with chat minutes only what they postponed
             let carried: Vec<page::Topic> = topics
                 .iter()
                 .filter(|t| t.reading.carried())
+                .filter(|t| {
+                    (chat.as_ref()).is_none_or(|f| page::postponed_names(&f.read.postponed, t))
+                })
                 .cloned()
                 .collect();
             self.keep_topics(st, p, &carried, start, &link, shared);
+            if let Some(f) = &chat {
+                self.keep_postponed(st, p, &f.read.postponed, &topics, start, &link, shared);
+            }
             meeting(st, p, key).close.topics_read = true;
             self.save(st).await?;
         }
@@ -1601,7 +1700,28 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             } else {
                 c.box_attempts += 1;
                 self.save(st).await?;
-                let text = page::result_box(&outcome.decisions, &topics, &outcome.tasks);
+                let text = match &chat {
+                    Some(f) => {
+                        let title = f.title.clone().unwrap_or_default();
+                        let copy = f
+                            .url
+                            .as_deref()
+                            .map(|u| self.wiki.link(u))
+                            .unwrap_or_default();
+                        let with = page::ChatBox {
+                            title: &title,
+                            link: &copy,
+                            postponed: &f.read.postponed,
+                        };
+                        page::result_box_with(
+                            &outcome.decisions,
+                            &topics,
+                            &outcome.tasks,
+                            Some(&with),
+                        )
+                    }
+                    None => page::result_box(&outcome.decisions, &topics, &outcome.tasks),
+                };
                 self.wiki
                     .patch(&doc_id, page::RESULT_MARKER, &format!("\n\n{text}\n\n"))
                     .await?;
@@ -1629,9 +1749,43 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             }
         }
 
-        // 2. the PDF, attached to the protocol and linked in it, then posted in the room
+        // 2. the PDF, attached to the protocol and linked in it, then posted in the room (with
+        // chat minutes: the page followed by their copy, and nothing into the room)
+        let pdf_doc = match &chat {
+            Some(f) => {
+                let copy = match self.wiki.doc(&f.doc_id).await? {
+                    Some(d) => d.text,
+                    None => String::new(),
+                };
+                Doc {
+                    text: chat_flow::pdf_source(&doc.text, &copy),
+                    ..doc.clone()
+                }
+            }
+            None => doc.clone(),
+        };
+        // `full`, minutes written on the page: they go into the room as one message (CHAT-MINUTES.md §8),
+        // the PDF only into the wiki; too long a message: the summary and the PDF, as before
+        let minutes_message = if self.minutes.from_chat
+            && chat.is_none()
+            && shared == Publication::Full
+            && sends(p.messages, Notice::Summary)
+        {
+            let withheld = &st.plenums[&p.key].withheld_tasks;
+            let shown = protocol::Outcome {
+                decisions: outcome.decisions.clone(),
+                tasks: (outcome.tasks.iter())
+                    .filter(|t| protocol::may_share_task(t, withheld))
+                    .cloned()
+                    .collect(),
+            };
+            let people = page::people(&doc.text);
+            protocol::minutes_message(p, start, &link, &people, &topics, &shown, withheld)
+        } else {
+            None
+        };
         if self.pdf.enabled && !meeting(st, p, key).close.pdf_failed {
-            if let Err(e) = self.attach_pdf(st, p, key, &doc, &title, now).await {
+            if let Err(e) = self.attach_pdf(st, p, key, &pdf_doc, &title, now).await {
                 let c = &mut meeting(st, p, key).close;
                 c.pdf_attempts += 1;
                 if c.pdf_attempts < PDF_ATTEMPTS {
@@ -1645,6 +1799,8 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
         let c = &meeting(st, p, key).close;
         if self.pdf.post_to_room
+            && chat.is_none()
+            && minutes_message.is_none()
             && shared == Publication::Full
             && sends(p.messages, Notice::Pdf)
             && c.pdf_url.is_some()
@@ -1678,6 +1834,22 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             self.save(st).await?;
             if !sends(p.messages, Notice::Summary) {
                 // quiet: nothing after the meeting
+            } else if chat.is_some() {
+                // the minutes are in the room already
+            } else if let Some(text) = &minutes_message {
+                let (text, users) = protocol::for_matrix(text, |name| self.account_of(name));
+                let event = self
+                    .chat
+                    .send_mentioning(&p.room, &text, &users, Notice::Summary, &txn)
+                    .await?;
+                st.minutes
+                    .plenums
+                    .entry(p.key.clone())
+                    .or_default()
+                    .wiki_message = Some(crate::state::WikiMessage {
+                    day: start.date(),
+                    event,
+                });
             } else if shared == Publication::Full {
                 let withheld = &st.plenums[&p.key].withheld_tasks;
                 let shown = protocol::Outcome {
@@ -1702,7 +1874,16 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             }
             meeting(st, p, key).close.summary.done = true;
         }
+        if let Some(f) = &chat {
+            self.closed_with_chat(st, p, key, &doc, f, &link).await?;
+        } else {
+            self.shorten_template(st, p, key, false).await?;
+        }
         meeting(st, p, key).close.done = true;
+        if minutes_message.is_some() {
+            self.save(st).await?;
+            self.sync_pin(st, p).await;
+        }
         info!(plenum = %p.key, meeting = %key, decisions = outcome.decisions.len(), publication = shared.word(), "Protocol closed");
         self.save(st).await?;
         Ok(())
@@ -1716,9 +1897,26 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         if ps.open_tasks_from != Some(after) || ps.open_tasks.is_empty() {
             return Ok(());
         }
-        let next = ps
-            .meetings
-            .iter()
+        let tasks = ps.open_tasks.clone();
+        self.tasks_onto_next_page(st, p, after, &tasks).await
+    }
+
+    /// `tasks` as open checklist items on the first open page after `after`, each only if it
+    /// is not there yet. Without such a page nothing happens: the next page takes the open
+    /// tasks when it is made.
+    async fn tasks_onto_next_page(
+        &self,
+        st: &State,
+        p: &Plenum,
+        after: MeetingKey,
+        tasks: &[Carried],
+    ) -> Result<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        let next = (st.plenums.get(&p.key))
+            .into_iter()
+            .flat_map(|ps| ps.meetings.iter())
             .filter(|(_, m)| m.created && !m.close.done && !m.cancelled && !m.skipped)
             .filter(|(_, m)| m.start.is_some_and(|s| s > after))
             .min_by_key(|(id, m)| (m.start, id.as_str()))
@@ -1729,7 +1927,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         let Some(doc) = self.wiki.doc(&next.doc_id).await? else {
             return Ok(());
         };
-        let block = protocol::open_tasks_block(&ps.open_tasks);
+        let block = protocol::open_tasks_block(tasks);
         let missing: Vec<&str> = block
             .lines()
             .filter(|l| l.starts_with("- [ ]") && !protocol::contains_line(&doc.text, l))
@@ -1895,22 +2093,68 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         now: DateTime<Utc>,
         scope: Scope,
     ) -> String {
+        self.answer(room, sender, cmd, Origin::default(), now, scope)
+            .await
+            .join("\n\n")
+    }
+
+    /// A command and the messages it is about (`origin`: the one it answers, or its own
+    /// when it carries minutes); the answers for the room, in order (none when the thread says
+    /// it all).
+    pub async fn answer(
+        &self,
+        room: &RoomId,
+        sender: &Sender,
+        cmd: Command,
+        origin: Origin,
+        now: DateTime<Utc>,
+        scope: Scope,
+    ) -> Vec<String> {
         const ORGANIZERS_ONLY: &str = "⛔ Only the organizers may do that here.";
         // the rooms' held removals: an admin in their direct chat with the bot only
         match (&cmd, scope) {
             (Command::Members | Command::ConfirmRemovals { .. }, Scope::Room) => {
-                return "⛔ `!members` works in an admin's direct chat with me only.".to_owned()
+                return vec![
+                    "⛔ `!members` works in an admin's direct chat with me only.".to_owned(),
+                ]
             }
-            (Command::Members, Scope::AdminDm) => return self.members_overview(now).await,
+            (Command::Members, Scope::AdminDm) => return vec![self.members_overview(now).await],
             (Command::ConfirmRemovals { room, digest }, Scope::AdminDm) => {
-                return self.confirm_removals(room, digest, now).await
+                return vec![self.confirm_removals(room, digest, now).await]
             }
             _ => {}
         }
         let mut st = self.state.lock().await;
         let answer = match cmd {
             Command::Help => help(),
+            // `!minutes` as a reply: the message it answers is minutes
+            Command::Overview(key) if origin.replied.is_some() => {
+                self.take_command(&mut st, room, sender, key.as_deref(), None, origin, now)
+                    .await
+            }
             Command::Overview(key) => self.list(&mut st, room, key.as_deref(), now, scope),
+            Command::Take { key, when, text } => {
+                let origin = match text {
+                    Some(_) => origin,
+                    None => Origin {
+                        this: None,
+                        replied: origin.replied,
+                    },
+                };
+                self.take_command(&mut st, room, sender, key.as_deref(), when, origin, now)
+                    .await
+            }
+            Command::ChatTemplate(key) => match self.pick(room, key.as_deref()) {
+                Ok(p) => {
+                    let p = self.effective(&st, p);
+                    self.template_command(&mut st, &p, now).await
+                }
+                Err(e) => e,
+            },
+            Command::Undo(key) => {
+                self.undo_command(&mut st, room, sender, key.as_deref(), origin.replied, now)
+                    .await
+            }
             Command::Top { key, text } => match self.pick(room, key.as_deref()) {
                 Ok(p) => self.add_top(&mut st, p, sender, &text, now).await,
                 Err(e) => e,
@@ -1956,7 +2200,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         };
         self.save_or_log(&st).await;
         drop(st);
-        answer
+        [answer].into_iter().filter(|a| !a.is_empty()).collect()
     }
 
     /// The plenum a settings command is for: in its room by the key or alone, in an admin's
@@ -3529,6 +3773,14 @@ pub fn help() -> String {
      `!minutes confidential`, `!minutes link`, `!minutes full`: nothing from the page in the \
      chat, only the link, or the summary, for the meeting that is on or comes next; for \
      another add its day: `!minutes confidential 14.11.`\n\n\
+     Minutes in the chat (when the bot takes them): a message whose first line starts with \
+     \"Minutes\" or \"Protokoll\" is filed in the wiki below the meeting's page, and followed \
+     when it is edited or deleted. Lines that start with \"Decision:\", \"Task:\", \
+     \"Postponed:\" or \"Done:\" (also Beschluss, Aufgabe, Vertagt, Erledigt) are tracked.\n\
+     `!minutes` as a reply: that message is the minutes (`!minutes 14.11.`: of that day's \
+     meeting); `!minutes`, a line break and the minutes: the same in one message\n\
+     `!minutes undo` (as a reply, or for your latest): not the minutes after all\n\
+     `!minutes template`: the fill-in template\n\n\
      The meetings are in the plenum's Nextcloud calendar: add, move or cancel them there, or \
      make a series; the bot follows it. With several plenums in a room, add the key: \
      `!top kitchen-floor-1 dishwasher`."
@@ -3561,6 +3813,8 @@ pub(crate) mod fakes {
         pub no_pins: StdMutex<bool>,
         /// documents.update refused (an archived document)
         pub no_replace: StdMutex<bool>,
+        /// documents.delete calls (ids)
+        pub deleted: StdMutex<Vec<String>>,
     }
 
     impl FakeWiki {
@@ -3723,6 +3977,7 @@ pub(crate) mod fakes {
                 text: text.to_owned(),
                 url: format!("/doc/{}", title.to_lowercase().replace(' ', "-")),
                 untouched: true,
+                archived: false,
                 collection_id: Some(collection_id.to_owned()),
                 parent_id: parent_id.map(str::to_owned),
             };
@@ -3781,7 +4036,22 @@ pub(crate) mod fakes {
         fn link(&self, path: &str) -> String {
             format!("https://wiki.test{path}")
         }
+        async fn delete(&self, id: &str) -> Result<bool> {
+            self.check()?;
+            self.deleted.lock().unwrap().push(id.to_owned());
+            let mut docs = self.docs.lock().unwrap();
+            match docs.iter_mut().find(|(d, del)| d.id == id && !del) {
+                Some((_, del)) => {
+                    *del = true;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
     }
+
+    /// A thread reply: (room, thread, event, text, txn).
+    pub type Reply = (String, String, String, String, String);
 
     #[derive(Default)]
     pub struct FakeChat {
@@ -3809,6 +4079,16 @@ pub(crate) mod fakes {
         pub notices: StdMutex<Vec<(String, Notice)>>,
         /// (room, event, text, txn) of each edit (a resend of a txn is dropped).
         pub edits: StdMutex<Vec<(String, String, String, String)>>,
+        /// (room, event, key, txn) of each reaction; their IDs are `$rx-<n>`.
+        pub reactions: StdMutex<Vec<(String, String, String, String)>>,
+        /// The reactions taken back (their IDs).
+        pub unreacted: StdMutex<Vec<String>>,
+        /// (room, thread, event, text, txn) of each thread reply; their IDs are `$re-<n>`.
+        pub replies: StdMutex<Vec<Reply>>,
+        /// The room's pinned events, whether the bot may pin, and its calls.
+        pub room_pins: StdMutex<Vec<(String, String)>>,
+        pub no_room_pins: StdMutex<bool>,
+        pub pin_events: StdMutex<u32>,
     }
 
     impl FakeChat {
@@ -3828,8 +4108,20 @@ pub(crate) mod fakes {
             if let Some((_, _, t, _)) = edits.iter().rev().find(|(_, e, _, _)| e == event) {
                 return Some(t.clone());
             }
+            if let Some(n) = event.strip_prefix("$re-") {
+                let n: usize = n.parse().ok()?;
+                return self.replies.lock().unwrap().get(n).map(|r| r.3.clone());
+            }
             let n: usize = event.strip_prefix("$ev-")?.parse().ok()?;
             self.sent.lock().unwrap().get(n).map(|(_, t, _)| t.clone())
+        }
+
+        /// The events pinned in `room`, in order.
+        pub fn pinned_in(&self, room: &str) -> Vec<String> {
+            (self.room_pins.lock().unwrap().iter())
+                .filter(|(r, _)| r == room)
+                .map(|(_, e)| e.clone())
+                .collect()
         }
 
         pub fn texts(&self) -> Vec<String> {
@@ -3896,15 +4188,88 @@ pub(crate) mod fakes {
             users: &[OwnedUserId],
             notice: Notice,
             txn: &str,
-        ) -> Result<()> {
-            self.send(room, markdown, notice, txn).await?;
+        ) -> Result<String> {
+            let event = self.post(room, markdown, notice, txn).await?;
             if !users.is_empty() {
                 self.pinged.lock().unwrap().push((
                     txn.to_owned(),
                     users.iter().map(|u| u.to_string()).collect(),
                 ));
             }
+            Ok(event)
+        }
+        async fn react(&self, room: &RoomId, event: &str, key: &str, txn: &str) -> Result<String> {
+            if *self.fail.lock().unwrap() {
+                anyhow::bail!("matrix down");
+            }
+            let mut r = self.reactions.lock().unwrap();
+            let i = match r.iter().position(|(_, _, _, t)| t == txn) {
+                Some(i) => i,
+                None => {
+                    r.push((room.to_string(), event.into(), key.into(), txn.into()));
+                    r.len() - 1
+                }
+            };
+            Ok(format!("$rx-{i}"))
+        }
+        async fn unreact(&self, _room: &RoomId, reaction: &str, _txn: &str) -> Result<()> {
+            if *self.fail.lock().unwrap() {
+                anyhow::bail!("matrix down");
+            }
+            let mut u = self.unreacted.lock().unwrap();
+            if !u.iter().any(|r| r == reaction) {
+                u.push(reaction.to_owned());
+            }
             Ok(())
+        }
+        async fn reply(
+            &self,
+            room: &RoomId,
+            thread: &str,
+            event: &str,
+            markdown: &str,
+            txn: &str,
+        ) -> Result<String> {
+            if *self.fail.lock().unwrap() {
+                anyhow::bail!("matrix down");
+            }
+            let mut r = self.replies.lock().unwrap();
+            let i = match r.iter().position(|x| x.4 == txn) {
+                Some(i) => i,
+                None => {
+                    r.push((
+                        room.to_string(),
+                        thread.into(),
+                        event.into(),
+                        markdown.into(),
+                        txn.into(),
+                    ));
+                    r.len() - 1
+                }
+            };
+            Ok(format!("$re-{i}"))
+        }
+        async fn set_pins(
+            &self,
+            room: &RoomId,
+            pin: Option<&str>,
+            unpin: &[String],
+        ) -> Result<bool> {
+            if *self.fail.lock().unwrap() {
+                anyhow::bail!("matrix down");
+            }
+            *self.pin_events.lock().unwrap() += 1;
+            if *self.no_room_pins.lock().unwrap() {
+                return Ok(false);
+            }
+            let mut pins = self.room_pins.lock().unwrap();
+            pins.retain(|(r, e)| {
+                r != room.as_str() || !(unpin.contains(e) || Some(e.as_str()) == pin)
+            });
+            if let Some(e) = pin {
+                pins.push((room.to_string(), e.to_owned()));
+            }
+            Ok(true)
         }
         async fn send_file(
             &self,
@@ -7143,6 +7508,7 @@ mod tests {
             old.pdf.clone(),
             old.admins.clone(),
         );
+        let minutes = old.minutes.clone();
         t.engine = Engine::new(
             plenums,
             tz,
@@ -7153,6 +7519,7 @@ mod tests {
             state,
             path,
         );
+        t.engine.minutes = minutes;
     }
 
     #[tokio::test]
