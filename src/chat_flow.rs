@@ -12,7 +12,7 @@ use super::*;
 use crate::{
     commands::When,
     minutes::{self, Receipt},
-    state::{Filing, Read, Taken, Withdrawn},
+    state::{DoneTask, Filing, PlenumState, Read, Taken, Withdrawn},
 };
 
 /// The reaction to a message that was filed.
@@ -24,12 +24,32 @@ const TAKES_A_DAY: usize = 10;
 /// A meeting waiting for chat minutes reads its page for a result at most this often.
 const WAIT_CHECK_EVERY: Duration = Duration::minutes(15);
 
-/// The PDF of a meeting with chat minutes: the page, then their copy.
-pub(super) fn pdf_source(page: &str, copy: &str) -> String {
+/// Chat minutes close their meeting once they have not changed for this long (the first
+/// version of a message is rarely the last).
+pub(super) const QUIET: Duration = Duration::minutes(60);
+
+/// The PDF of a meeting with chat minutes: the page, then their copy as of `made` (with the
+/// copy's line who posted it and when; the rest of its notice is the wiki's, and the PDF
+/// leaves notices out).
+pub(super) fn pdf_source(page: &str, copy: &str, made: DateTime<Utc>, tz: Tz) -> String {
     if copy.trim().is_empty() {
         return page.to_owned();
     }
-    format!("{page}\n\n---\n\n## Chat minutes\n\n{copy}")
+    let copy = copy.trim_start();
+    let copy = match copy
+        .strip_prefix(":::info\n")
+        .and_then(|c| c.split_once("\n:::"))
+    {
+        Some((notice, rest)) => {
+            let who = notice.lines().next().unwrap_or_default();
+            format!("{who}\n\n{}", rest.trim_start_matches('\n'))
+        }
+        None => copy.to_owned(),
+    };
+    format!(
+        "{page}\n\n---\n\n## Chat minutes as of {}\n\n{copy}",
+        minutes::when(made, tz)
+    )
 }
 
 /// How the automatic template message starts once it is shortened.
@@ -59,6 +79,16 @@ pub struct Origin {
     pub this: Option<ChatMessage>,
     /// The message the command answers.
     pub replied: Option<ChatMessage>,
+}
+
+/// `tasks` closed for the pages open now, up to the one at `until` (`done_for_open_pages`).
+pub(super) fn remember_done(ps: &mut PlenumState, tasks: Vec<String>, until: MeetingKey) {
+    for text in tasks {
+        let done = DoneTask { text, until };
+        if !ps.done_for_open_pages.contains(&done) {
+            ps.done_for_open_pages.push(done);
+        }
+    }
 }
 
 fn day_key(day: NaiveDate) -> String {
@@ -141,14 +171,32 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
     }
 
-    /// An edit of message `target` (main.rs; its new text, not the fallback). A taken
-    /// message follows it when it is its sender's and newer than the version kept; one not
-    /// taken that becomes minutes is taken, under the original's ID.
+    /// [`Self::edited_in_thread`] of a message that is its thread's root.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub async fn edited(
         &self,
         room: &RoomId,
         target: &str,
+        sender: &UserId,
+        sender_name: &str,
+        body: &str,
+        sent_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) {
+        (self.edited_in_thread(room, target, None, sender, sender_name, body, sent_at, now)).await
+    }
+
+    /// An edit of message `target` (main.rs; its new text, not the fallback). A taken
+    /// message follows it when it is its sender's and newer than the version kept; one not
+    /// taken that becomes minutes is taken, under the original's ID, and answered in the
+    /// original's thread (`thread`; None: the message's own).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn edited_in_thread(
+        &self,
+        room: &RoomId,
+        target: &str,
+        thread: Option<&str>,
         sender: &UserId,
         sender_name: &str,
         body: &str,
@@ -186,6 +234,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             }
             t.text = text;
             f.pending = true;
+            f.changed_at = Some(now);
             if f.adopted && !f.adopted_told.done {
                 f.adopted_due = true;
             }
@@ -202,7 +251,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         drop(st);
         let m = ChatMessage {
             event: target.to_owned(),
-            thread: target.to_owned(),
+            thread: thread.unwrap_or(target).to_owned(),
             sender: sender.to_owned(),
             sender_name: sender_name.to_owned(),
             body: text,
@@ -225,6 +274,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             }
             f.messages[i].withdrawn = Some(Withdrawn::Deleted);
             f.pending = true;
+            f.changed_at = Some(now);
             if let Err(e) = self.save(&st).await {
                 error!("{e:#}");
                 return;
@@ -323,19 +373,10 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         now: DateTime<Utc>,
     ) -> Result<String, String> {
         let (key, day) = self.place(st, p, &m.body, m.sent_at, when, now)?;
-        let today = self.today(now);
-        let pm = st.minutes.plenums.entry(p.key.clone()).or_default();
-        let taken_today = (pm.taken.iter())
-            .filter(|at| at.with_timezone(&self.tz).date_naive() == today)
-            .count();
-        if taken_today >= TAKES_A_DAY {
-            warn!(plenum = %p.key, "Ten minutes taken today: no more until tomorrow");
-            return Err(format!(
-                "⏳ {TAKES_A_DAY} messages were filed as minutes of {} today: no more until \
-                 tomorrow.",
-                p.name
-            ));
+        if let Some(why) = self.over_the_limit(st, p, now) {
+            return Err(why);
         }
+        let pm = st.minutes.plenums.entry(p.key.clone()).or_default();
         let print = former::fingerprint(&m.body);
         if let Some(f) = pm.filings.get(&key) {
             if f.active().any(|t| former::fingerprint(&t.text) == print) {
@@ -365,6 +406,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             receipt_message: None,
         });
         f.pending = true;
+        f.changed_at = Some(now);
         // a copy that is the wiki's does not take this message: its thread hears it
         if f.adopted && !f.adopted_told.done {
             f.adopted_due = true;
@@ -385,6 +427,36 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             warn!(plenum = %p.key, filing = %key, "Filing chat minutes (again at the next tick): {e:#}");
         }
         Ok(key)
+    }
+
+    /// Why no more minutes are taken or moved today ([`TAKES_A_DAY`]), if so.
+    fn over_the_limit(&self, st: &State, p: &Plenum, now: DateTime<Utc>) -> Option<String> {
+        let today = self.today(now);
+        let taken_today = (st.minutes.plenums.get(&p.key))
+            .map(|pm| {
+                (pm.taken.iter())
+                    .filter(|at| at.with_timezone(&self.tz).date_naive() == today)
+                    .count()
+            })
+            .unwrap_or_default();
+        (taken_today >= TAKES_A_DAY).then(|| {
+            warn!(plenum = %p.key, "Ten minutes taken today: no more until tomorrow");
+            format!(
+                "⏳ {TAKES_A_DAY} messages were filed as minutes of {} today: no more until \
+                 tomorrow.",
+                p.name
+            )
+        })
+    }
+
+    /// Who may withdraw or move filed minutes: who posted them, who filed them, the
+    /// organizers and the admins.
+    fn may_withdraw(&self, p: &Plenum, t: &Taken, sender: &Sender) -> bool {
+        let me = sender.id.as_str();
+        t.sender == me
+            || t.taken_by.as_deref() == Some(me)
+            || p.organizers.contains(&sender.id)
+            || self.admins.contains(&sender.id)
     }
 
     /// Every filing with something left to do (at every tick). The first error is the
@@ -467,12 +539,17 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
 
     /// The filing's copy written, its messages answered, what they say read and applied.
     async fn file(&self, st: &mut State, p: &Plenum, key: &str, now: DateTime<Utc>) -> Result<()> {
-        self.write_copy(st, p, key).await?;
-        self.answer_messages(st, p, key).await?;
+        // read first: a close while the wiki or the room fails has what they say
         let f = filing(st, p, key);
         f.read = (f.active())
             .map(|t| minutes::read(&t.text))
             .fold(Read::default(), |all, r| all.union(&r));
+        // 📥 at once: a wiki that is down holds up no sign of life (tried again below)
+        if let Err(e) = self.react(st, p, key).await {
+            warn!(plenum = %p.key, filing = %key, "Reacting to chat minutes (again at the next tick): {e:#}");
+        }
+        self.write_copy(st, p, key).await?;
+        self.answer_messages(st, p, key).await?;
         // a meeting closed already, or none: applied now (else its close does it)
         let open = (st.plenums.get(&p.key))
             .and_then(|ps| ps.meetings.get(key))
@@ -506,13 +583,14 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 if let Some(page_doc) = self.wiki.doc(&m.doc_id).await? {
                     topics = page::topics(&page_doc.text)
                         .iter()
-                        .map(|t| minutes::literal(&t.title()))
+                        .map(|t| minutes::literal(&protocol::plain_mentions(&t.title())))
                         .collect();
                 }
             }
+            // the wiki's mentions as names: the room is no wiki page
             tasks = (ps.open_tasks.iter())
                 .filter(|t| protocol::may_share_task(&t.text, &ps.withheld_tasks))
-                .map(|t| t.text.clone())
+                .map(|t| protocol::plain_mentions(&t.text))
                 .collect();
         }
         Ok(protocol::render_chat_template(
@@ -676,14 +754,15 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
     }
 
     /// The page's outcome with the chat minutes' (CHAT-MINUTES.md §1: the union): their decisions and tasks
-    /// added, the tasks a done line closes taken out, and those closed from the chat before
-    /// (`done_tasks`) too. The tasks closed now, for `done_tasks`.
+    /// added, the tasks a done line closes taken out, and those closed for this page before
+    /// (`done_for_open_pages`, the meeting at `start`) too. The tasks closed now.
     pub(super) fn merge_chat(
         &self,
         st: &State,
         p: &Plenum,
         outcome: &mut protocol::Outcome,
         chat: Option<&Filing>,
+        start: MeetingKey,
     ) -> Vec<String> {
         let mut closed = Vec::new();
         if let Some(f) = chat {
@@ -704,9 +783,27 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             closed = done;
         }
         if let Some(ps) = st.plenums.get(&p.key) {
-            (outcome.tasks).retain(|t| !ps.done_tasks.iter().any(|d| minutes::same_task(d, t)));
+            (outcome.tasks).retain(|t| {
+                !(ps.done_for_open_pages.iter())
+                    .any(|d| start <= d.until && minutes::same_task(&d.text, t))
+            });
         }
         closed
+    }
+
+    /// The latest start among the open pages (made, not closed) but `except`'s: a task closed
+    /// now is closed for them. None: no such page.
+    pub(super) fn latest_open_page(
+        &self,
+        st: &State,
+        p: &Plenum,
+        except: Option<&str>,
+    ) -> Option<MeetingKey> {
+        (st.plenums.get(&p.key)?.meetings.iter())
+            .filter(|(id, _)| Some(id.as_str()) != except)
+            .filter(|(_, m)| m.created && !m.close.done && !m.cancelled && !m.skipped)
+            .filter_map(|(_, m)| m.start)
+            .max()
     }
 
     /// The postponed lines of chat minutes that name no topic of the page: topics of their own
@@ -740,6 +837,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 block,
                 from,
                 publication: shared,
+                written_to: None,
             });
         }
     }
@@ -874,6 +972,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             (None, None, None) => return Ok(()),
         };
         let old = f.applied.clone().unwrap_or_default();
+        let open_until = self.latest_open_page(st, p, None);
         let shared = m.as_ref().map_or(p.publication, |m| publication(p, m));
         let day = f.day;
         // a closed page: the link to the copy, once
@@ -959,10 +1058,8 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             .map(|t| t.text.clone())
             .collect();
         ps.open_tasks.retain(|t| !closed.contains(&t.text));
-        for t in closed {
-            if !ps.done_tasks.contains(&t) {
-                ps.done_tasks.push(t);
-            }
+        if let Some(until) = open_until {
+            remember_done(ps, closed, until);
         }
         // new postponed topics
         let from = match &m {
@@ -1033,8 +1130,21 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         if !f.has_active() {
             if f.created {
                 if !f.adopted {
-                    self.wiki.delete(&f.doc_id).await?;
-                    info!(plenum = %p.key, filing = %key, "Chat minutes withdrawn: their copy is in the wiki's trash");
+                    // looked at first: gone already, or no longer the bot's, it is left
+                    match self.wiki.doc(&f.doc_id).await? {
+                        None => {}
+                        Some(d)
+                            if d.archived
+                                || ![f.written, f.trying]
+                                    .contains(&Some(former::fingerprint(&d.text))) =>
+                        {
+                            info!(plenum = %p.key, filing = %key, "Chat minutes withdrawn: their copy was changed in the wiki, so it is left there");
+                        }
+                        Some(_) => {
+                            self.wiki.delete(&f.doc_id).await?;
+                            info!(plenum = %p.key, filing = %key, "Chat minutes withdrawn: their copy is in the wiki's trash");
+                        }
+                    }
                 }
                 // a message taken later gets a copy of its own
                 *filing(st, p, key) = Filing {
@@ -1101,20 +1211,29 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             filing(st, p, key).adopted_due = f.sent != Some(sent);
             return self.save(st).await;
         }
-        if f.written != Some(former::fingerprint(&doc.text)) {
-            info!(plenum = %p.key, filing = %key, "The copy of chat minutes was changed in the wiki: it is left as it is");
-            filing(st, p, key).adopted = true;
-            // a change of the message did not reach the copy: its thread hears it once
-            filing(st, p, key).adopted_due = f.sent != Some(sent);
-            return self.save(st).await;
+        let has = former::fingerprint(&doc.text);
+        if f.written != Some(has) {
+            if f.trying != Some(has) {
+                info!(plenum = %p.key, filing = %key, "The copy of chat minutes was changed in the wiki: it is left as it is");
+                filing(st, p, key).adopted = true;
+                // a change of the message did not reach the copy: its thread hears it once
+                filing(st, p, key).adopted_due = f.sent != Some(sent);
+                return self.save(st).await;
+            }
+            // the bot's own write, whose answer was lost
+            filing(st, p, key).written = Some(has);
+            self.save(st).await?;
         }
         if f.sent != Some(sent) {
+            filing(st, p, key).trying = Some(former::fingerprint(&text));
+            self.save(st).await?;
             self.wiki.replace(&doc.id, &text).await?;
             let back = (self.wiki.doc(&doc.id).await?)
                 .context("the copy vanished while it was written")?;
             let fm = filing(st, p, key);
             fm.written = Some(former::fingerprint(&back.text));
             fm.sent = Some(sent);
+            fm.trying = None;
             self.save(st).await?;
             info!(plenum = %p.key, filing = %key, "The copy of chat minutes follows its messages");
         }
@@ -1144,12 +1263,15 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             read: &read,
             house_reads: p.access == Access::Members,
             withdrawn: t.withdrawn.is_some(),
+            unused_day: minutes::unused_day(&t.text, self.today(t.posted_at), f.day),
+            messages: f.active().count(),
         })
     }
 
     /// Each message's reaction and thread reply (CHAT-MINUTES.md §6), once; a reply whose text changed is
     /// edited (pings nobody). A copy that became the wiki's is said once.
-    async fn answer_messages(&self, st: &mut State, p: &Plenum, key: &str) -> Result<()> {
+    /// The 📥 on each message filed and not marked yet (once).
+    async fn react(&self, st: &mut State, p: &Plenum, key: &str) -> Result<()> {
         let n = filing(st, p, key).messages.len();
         for i in 0..n {
             let t = filing(st, p, key).messages[i].clone();
@@ -1162,6 +1284,15 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 tm.reaction_event = Some(reaction);
                 self.save(st).await?;
             }
+        }
+        Ok(())
+    }
+
+    async fn answer_messages(&self, st: &mut State, p: &Plenum, key: &str) -> Result<()> {
+        self.react(st, p, key).await?;
+        let n = filing(st, p, key).messages.len();
+        for i in 0..n {
+            let t = filing(st, p, key).messages[i].clone();
             // `undo`: the message is no minutes, so the mark on it goes (a deleted message has
             // none any more, a moved one keeps its own)
             if let (Some(Withdrawn::Undone), Some(reaction)) = (t.withdrawn, &t.reaction_event) {
@@ -1279,16 +1410,38 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         if let Some((old, i)) = self.find_taken(st, &p, &m.event) {
             let t = st.minutes.plenums[&p.key].filings[&old].messages[i].clone();
             if when.is_some() {
-                return self.move_minutes(st, &p, &old, i, when, now).await;
+                return self.move_minutes(st, &p, sender, &old, i, when, now).await;
+            }
+            if t.withdrawn.is_none() && t.text == m.body {
+                return "📥 That message is filed already (see its thread).".to_owned();
             }
             if t.withdrawn.is_none() {
-                return "📥 That message is filed already (see its thread).".to_owned();
+                // it reads otherwise now (an edit the bot never saw): followed like an edit
+                let f = filing(st, &p, &old);
+                let tm = &mut f.messages[i];
+                tm.text = m.body.clone();
+                tm.text_at = tm.text_at.max(now);
+                f.pending = true;
+                f.changed_at = Some(now);
+                if f.adopted && !f.adopted_told.done {
+                    f.adopted_due = true;
+                }
+                if let Err(e) = self.save(st).await {
+                    error!("{e:#}");
+                    return "⚠️ That could not be saved just now. Please try again.".to_owned();
+                }
+                info!(plenum = %p.key, filing = %old, "Chat minutes updated from the message as it reads now");
+                if let Err(e) = self.file(st, &p, &old, now).await {
+                    warn!(plenum = %p.key, filing = %old, "Filing chat minutes (again at the next tick): {e:#}");
+                }
+                return "📥 Updated from the message as it reads now.".to_owned();
             }
             // withdrawn before: taken again
             let tm = &mut filing(st, &p, &old).messages[i];
             tm.withdrawn = None;
             tm.taken_by = by.map(|s| s.id.to_string()).or(tm.taken_by.take());
             filing(st, &p, &old).pending = true;
+            filing(st, &p, &old).changed_at = Some(now);
             if let Err(e) = self.save(st).await {
                 error!("{e:#}");
                 return "⚠️ That could not be saved just now. Please try again.".to_owned();
@@ -1310,16 +1463,26 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
 
     /// `!minutes <day>` as a reply to filed minutes: they move to the meeting of that day;
     /// both copies are written anew.
+    #[allow(clippy::too_many_arguments)]
     async fn move_minutes(
         &self,
         st: &mut State,
         p: &Plenum,
+        sender: &Sender,
         old: &str,
         i: usize,
         when: Option<When>,
         now: DateTime<Utc>,
     ) -> String {
         let t = st.minutes.plenums[&p.key].filings[old].messages[i].clone();
+        if !self.may_withdraw(p, &t, sender) {
+            return "⛔ Only who posted the minutes, who filed them, the organizers or the admins \
+                    move them."
+                .to_owned();
+        }
+        if let Some(why) = self.over_the_limit(st, p, now) {
+            return why;
+        }
         let (key, day) = match self.place(st, p, &t.text, t.posted_at, when, now) {
             Ok(place) => place,
             Err(why) => return why,
@@ -1335,6 +1498,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             tm.receipt.done = true;
         }
         filing(st, p, old).pending = true;
+        filing(st, p, old).changed_at = Some(now);
         let pm = st.minutes.plenums.get_mut(&p.key).expect("above");
         let f = pm
             .filings
@@ -1345,6 +1509,8 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
             ..t
         });
         f.pending = true;
+        f.changed_at = Some(now);
+        pm.taken.push(now);
         if let Err(e) = self.save(st).await {
             error!("{e:#}");
             return "⚠️ That could not be saved just now. Please try again.".to_owned();
@@ -1408,11 +1574,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
                 .to_owned();
         };
         let t = st.minutes.plenums[&p.key].filings[&k].messages[i].clone();
-        let allowed = t.sender == me
-            || t.taken_by.as_deref() == Some(me)
-            || p.organizers.contains(&sender.id)
-            || self.admins.contains(&sender.id);
-        if !allowed {
+        if !self.may_withdraw(&p, &t, sender) {
             return "⛔ Only who posted the minutes, who filed them, the organizers or the admins \
                     withdraw them."
                 .to_owned();
@@ -1422,6 +1584,7 @@ impl<W: Wiki, C: Chat> Engine<W, C> {
         }
         filing(st, &p, &k).messages[i].withdrawn = Some(Withdrawn::Undone);
         filing(st, &p, &k).pending = true;
+        filing(st, &p, &k).changed_at = Some(now);
         if let Err(e) = self.save(st).await {
             error!("{e:#}");
             filing(st, &p, &k).messages[i].withdrawn = None;
@@ -1677,7 +1840,12 @@ Vertagt: Werkzeugregal";
             .message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
             .await;
         assert!(copies(&t.engine).is_empty());
-        assert_eq!(reactions(&t.engine), 0, "nothing before the copy");
+        assert_eq!(
+            reactions(&t.engine),
+            1,
+            "📥 at once, the reply after the copy"
+        );
+        assert!(replies(&t.engine).is_empty());
         restart(&mut t).await;
         let e = &t.engine;
         e.tick(at(2026, 11, 16, 10, 1)).await; // still down
@@ -1705,6 +1873,23 @@ Vertagt: Werkzeugregal";
         assert_eq!(copies(e).len(), 1);
         assert!(doc_by_id(e, &doc_id).is_some());
         assert_eq!((reactions(e), replies(e).len()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn the_reaction_comes_at_once_and_the_reply_with_the_copy() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
+        let e = &t.engine;
+        pages_made(e).await;
+        *e.wiki.fail.lock().unwrap() = true;
+        let now = at(2026, 11, 16, 10, 0);
+        e.message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
+            .await;
+        e.tick(at(2026, 11, 16, 10, 1)).await;
+        assert_eq!((reactions(e), replies(e).len()), (1, 0), "a sign of life");
+        *e.wiki.fail.lock().unwrap() = false;
+        e.tick(at(2026, 11, 16, 10, 2)).await;
+        e.tick(at(2026, 11, 16, 10, 3)).await;
+        assert_eq!((copies(e).len(), reactions(e), replies(e).len()), (1, 1, 1));
     }
 
     #[tokio::test]
@@ -1768,6 +1953,51 @@ Vertagt: Werkzeugregal";
     }
 
     #[tokio::test]
+    async fn a_day_in_the_message_that_was_not_used_is_said() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
+        let e = &t.engine;
+        pages_made(e).await;
+        let now = at(2026, 11, 16, 10, 0);
+        // more than 60 days back: filed with the latest meeting
+        let old = SAMPLE.replace("15.11.", "3.9.");
+        e.message(&room(), msg("$m1", "Anna", &old, now), now).await;
+        // a usable day
+        let other = SAMPLE.replace("Hausplenum 15.11.", "Hausplenum 1.11.");
+        e.message(&room(), msg("$m2", "Ben", &other, now), now)
+            .await;
+        let r = replies(e);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r[0].contains("15 November 2026"), "{}", r[0]);
+        assert!(
+            r[0].contains("The day in the message (3.9.) was not used. Meant another meeting? Answer with `!minutes <day>`."),
+            "{}",
+            r[0]
+        );
+        assert!(!r[1].contains("was not used"), "{}", r[1]);
+    }
+
+    #[tokio::test]
+    async fn the_replies_say_when_a_meeting_has_several_minutes_messages() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
+        let e = &t.engine;
+        pages_made(e).await;
+        let now = at(2026, 11, 16, 10, 0);
+        e.message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
+            .await;
+        assert!(!replies(e)[0].contains("minutes messages"));
+        let part2 = "Protokoll Teil 2\nAufgabe: Ben fragt\nx\ny";
+        e.message(&room(), msg("$m2", "Ben", part2, now), now).await;
+        let line = "This meeting has 2 minutes messages; all of them are in the copy. To replace an earlier one, delete it or answer it with `!minutes undo`.";
+        for reply in ["$re-0", "$re-1"] {
+            let shown = e.chat.shown(reply).unwrap();
+            assert!(shown.ends_with(line), "{reply}: {shown}");
+        }
+        e.redacted(&room(), "$m1", at(2026, 11, 16, 11, 0)).await;
+        let shown = e.chat.shown("$re-1").unwrap();
+        assert!(!shown.contains("minutes messages"), "{shown}");
+    }
+
+    #[tokio::test]
     async fn minutes_without_a_meeting_are_filed_by_their_day() {
         let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
         let e = &t.engine;
@@ -1805,6 +2035,10 @@ Vertagt: Werkzeugregal";
                 .await
                 .starts_with("⛔")
         );
+        // moving them is for the same people
+        let a = take_reply(e, &person("Ben"), "!minutes 1.11.", m1.clone(), later).await;
+        assert!(a.starts_with("⛔"), "{a}");
+        assert!(e.state.lock().await.minutes.plenums["house"].filings[NOV15].has_active());
         for who in ["Anna", "Orga", "Admin"] {
             let a = take_reply(e, &person(who), "!minutes undo", m1.clone(), later).await;
             assert!(a.starts_with("↩️"), "{who}: {a}");
@@ -2042,6 +2276,53 @@ Vertagt: Werkzeugregal";
     }
 
     #[tokio::test]
+    async fn minutes_as_a_reply_to_a_filed_message_follows_an_edit_the_bot_missed() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
+        let e = &t.engine;
+        pages_made(e).await;
+        let posted = at(2026, 11, 16, 10, 0);
+        e.message(&room(), msg("$m1", "Anna", SAMPLE, posted), posted)
+            .await;
+        // the message reads otherwise now (an edit the bot never saw)
+        let now_reads = SAMPLE.replace("Werkzeugregal", "Werkzeugregal und Leiter");
+        let later = at(2026, 11, 16, 11, 0);
+        let a = take_reply(
+            e,
+            &person("Ben"),
+            "!minutes",
+            msg("$m1", "Anna", &now_reads, posted),
+            later,
+        )
+        .await;
+        assert_eq!(a, "📥 Updated from the message as it reads now.");
+        let c = copies(e);
+        assert_eq!(c.len(), 1);
+        assert!(c[0].text.contains("und Leiter"), "{}", c[0].text);
+        assert_eq!(replies(e).len(), 1, "the reply edited, not a second one");
+        assert!(e
+            .chat
+            .shown("$re-0")
+            .unwrap()
+            .contains("Postponed (1): Werkzeugregal und Leiter"));
+        {
+            let st = e.state.lock().await;
+            let f = &st.minutes.plenums["house"].filings[NOV15];
+            assert_eq!(f.messages.len(), 1, "nothing filed twice");
+            assert_eq!(f.read.postponed, ["Werkzeugregal und Leiter"]);
+        }
+        // the same text again: filed already
+        let a = take_reply(
+            e,
+            &person("Ben"),
+            "!minutes",
+            msg("$m1", "Anna", &now_reads, posted),
+            later,
+        )
+        .await;
+        assert!(a.contains("filed already"), "{a}");
+    }
+
+    #[tokio::test]
     async fn an_edit_that_makes_minutes_takes_the_message() {
         let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
         let e = &t.engine;
@@ -2089,6 +2370,45 @@ Vertagt: Werkzeugregal";
         let r = replies(e);
         assert_eq!(r.len(), 2, "{r:?}");
         assert!(r[1].contains("changed there"), "{}", r[1]);
+    }
+
+    #[tokio::test]
+    async fn a_write_whose_answer_was_lost_is_still_the_bots() {
+        for read_back in [false, true] {
+            let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
+            let e = &t.engine;
+            pages_made(e).await;
+            let now = at(2026, 11, 16, 10, 0);
+            e.message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
+                .await;
+            // the write lands, its answer (or the read after it) does not
+            if read_back {
+                *e.wiki.lose_read_back.lock().unwrap() = true;
+            } else {
+                *e.wiki.lose_answer.lock().unwrap() = true;
+            }
+            let anna = person("Anna").id;
+            let first = SAMPLE.replace("Werkzeugregal", "Werkzeugregal und Leiter");
+            let at1 = at(2026, 11, 16, 10, 5);
+            e.edited(&room(), "$m1", &anna, "Anna", &first, at1, at1)
+                .await;
+            assert!(copies(e)[0].text.contains("und Leiter"));
+            e.tick(at(2026, 11, 16, 10, 6)).await;
+            let second = first.replace("im Januar", "im Februar");
+            let at2 = at(2026, 11, 16, 10, 10);
+            e.edited(&room(), "$m1", &anna, "Anna", &second, at2, at2)
+                .await;
+            let c = copies(e);
+            assert!(
+                c[0].text.contains("im Februar"),
+                "read_back {read_back}: {}",
+                c[0].text
+            );
+            let st = e.state.lock().await;
+            assert!(!st.minutes.plenums["house"].filings[NOV15].adopted);
+            drop(st);
+            assert!(!replies(e).iter().any(|r| r == ADOPTED), "{:?}", replies(e));
+        }
     }
 
     #[tokio::test]
@@ -2178,6 +2498,97 @@ Vertagt: Werkzeugregal";
         // a deletion of something else changes nothing
         e.redacted(&room(), "$other", now).await;
         assert_eq!(replies(e).len(), 2);
+    }
+
+    /// Minutes filed after an empty close (their decisions are in the lists at once), then
+    /// their copy changed in the wiki by `change` (the copy and whether it is in the trash).
+    async fn late_minutes_changed_in_the_wiki(change: impl FnOnce(&mut Doc, &mut bool)) -> T {
+        let mut t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
+        t.engine.minutes.wait_days = 0;
+        let e = &t.engine;
+        pages_made(e).await;
+        e.tick(at(2026, 11, 16, 9, 0)).await;
+        e.tick(at(2026, 11, 16, 9, 1)).await;
+        let now = at(2026, 11, 16, 12, 0);
+        e.message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
+            .await;
+        assert_eq!(e.state.lock().await.plenums["house"].decisions.len(), 1);
+        {
+            let mut docs = e.wiki.docs.lock().unwrap();
+            let (d, del) = (docs.iter_mut())
+                .find(|(d, _)| d.title.ends_with(": Chat minutes"))
+                .unwrap();
+            change(d, del);
+        }
+        t
+    }
+
+    /// The withdrawal took the decisions out of the lists and said so in the thread.
+    async fn withdrawn_from_the_lists(e: &Engine<FakeWiki, FakeChat>) {
+        let st = e.state.lock().await;
+        let ps = &st.plenums["house"];
+        assert!(
+            ps.decisions.is_empty() && ps.open_tasks.is_empty(),
+            "{ps:?}"
+        );
+        drop(st);
+        let d = e.wiki.by_title("House plenum: Decisions").unwrap().text;
+        assert!(d.contains("(withdrawn 16 Nov 2026, "), "{d}");
+        assert!(e.chat.shown("$re-0").unwrap().starts_with("↩️ Withdrawn"));
+    }
+
+    #[tokio::test]
+    async fn a_copy_edited_in_the_wiki_stays_when_its_message_is_deleted() {
+        let t = late_minutes_changed_in_the_wiki(|d, _| {
+            d.text.push_str("\n\nAdded in the wiki by Ben.");
+            d.untouched = false;
+        })
+        .await;
+        let e = &t.engine;
+        e.redacted(&room(), "$m1", at(2026, 11, 16, 13, 0)).await;
+        let report = e.tick(at(2026, 11, 16, 13, 1)).await;
+        assert!(report.failed.is_empty() && report.unavailable.is_empty());
+        let c = copies(e);
+        assert_eq!(c.len(), 1, "not into the trash");
+        assert!(c[0].text.contains("Added in the wiki by Ben."));
+        assert!(e.wiki.deleted.lock().unwrap().is_empty());
+        withdrawn_from_the_lists(e).await;
+    }
+
+    #[tokio::test]
+    async fn an_archived_copy_stays_at_undo_and_fails_no_tick() {
+        let t = late_minutes_changed_in_the_wiki(|d, _| d.archived = true).await;
+        let e = &t.engine;
+        let m1 = msg("$m1", "Anna", SAMPLE, at(2026, 11, 16, 12, 0));
+        let a = take_reply(
+            e,
+            &person("Anna"),
+            "!minutes undo",
+            m1,
+            at(2026, 11, 16, 13, 0),
+        )
+        .await;
+        assert!(a.starts_with("↩️"), "{a}");
+        let report = e.tick(at(2026, 11, 16, 13, 1)).await;
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(report.unavailable.is_empty(), "{:?}", report.unavailable);
+        assert_eq!(copies(e).len(), 1, "left as it is");
+        assert!(e.wiki.deleted.lock().unwrap().is_empty());
+        withdrawn_from_the_lists(e).await;
+    }
+
+    #[tokio::test]
+    async fn a_copy_trashed_in_the_wiki_is_not_deleted_again() {
+        let t = late_minutes_changed_in_the_wiki(|_, del| *del = true).await;
+        let e = &t.engine;
+        e.redacted(&room(), "$m1", at(2026, 11, 16, 13, 0)).await;
+        let report = e.tick(at(2026, 11, 16, 13, 1)).await;
+        assert!(report.failed.is_empty() && report.unavailable.is_empty());
+        assert!(
+            e.wiki.deleted.lock().unwrap().is_empty(),
+            "nothing to delete"
+        );
+        withdrawn_from_the_lists(e).await;
     }
 
     fn closed(e: &Engine<FakeWiki, FakeChat>, id: &str) -> bool {
@@ -2287,14 +2698,21 @@ Vertagt: Werkzeugregal";
         e.message(&room(), msg("$m1", "Anna", &body, now), now)
             .await;
         assert!(!closed(e, NOV15));
-        e.tick(at(2026, 11, 15, 22, 1)).await; // the result box
-        e.tick(at(2026, 11, 15, 22, 2)).await; // closed
+        // an hour without a change first: the usual typo edits still reach the page
+        e.tick(at(2026, 11, 15, 22, 1)).await;
+        e.tick(at(2026, 11, 15, 22, 59)).await;
+        assert!(!closed(e, NOV15));
+        assert!(!page::has_box(
+            &e.wiki.by_title("House plenum 2026-11-15").unwrap().text
+        ));
+        e.tick(at(2026, 11, 15, 23, 0)).await; // the result box
+        e.tick(at(2026, 11, 15, 23, 1)).await; // closed
         assert!(closed(e, NOV15));
         let page = e.wiki.by_title("House plenum 2026-11-15").unwrap();
         let copy = &copies(e)[0];
         assert!(
             page.text.contains(&format!(
-                "📥 Chat minutes: [House plenum 2026-11-15: Chat minutes](https://wiki.test{})",
+                "📥 Chat minutes as of 15 Nov 2026, 23:00 (later changes are in the copy): [House plenum 2026-11-15: Chat minutes](https://wiki.test{})",
                 copy.url
             )),
             "{}",
@@ -2351,13 +2769,151 @@ Vertagt: Werkzeugregal";
         assert!(next.text.contains("Anna besorgt Schilder"));
     }
 
-    #[test]
-    fn the_pdf_is_the_page_then_the_copy() {
-        assert_eq!(
-            pdf_source("page", "copy"),
-            "page\n\n---\n\n## Chat minutes\n\ncopy"
+    #[tokio::test]
+    async fn a_meeting_closed_without_its_page_still_lists_its_chat_minutes() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
+        let e = &t.engine;
+        pages_made(e).await;
+        let now = at(2026, 11, 15, 22, 0);
+        e.message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
+            .await;
+        {
+            let mut docs = e.wiki.docs.lock().unwrap();
+            let (_, del) = (docs.iter_mut())
+                .find(|(d, _)| d.title == "House plenum 2026-11-15")
+                .unwrap();
+            *del = true;
+        }
+        for minute in 0..3 {
+            e.tick(at(2026, 11, 15, 23, minute)).await;
+        }
+        assert!(closed(e, NOV15));
+        let d = e.wiki.by_title("House plenum: Decisions").unwrap().text;
+        assert!(d.contains("* Räder ohne Schild"), "{d}");
+        let st = e.state.lock().await;
+        assert!(open_tasks(&st)
+            .iter()
+            .any(|t| t.starts_with("Anna besorgt")));
+    }
+
+    #[tokio::test]
+    async fn an_edit_within_the_hour_starts_it_again_and_reaches_the_box() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
+        let e = &t.engine;
+        pages_made(e).await;
+        let now = at(2026, 11, 15, 22, 0);
+        e.message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
+            .await;
+        let edited = SAMPLE.replace("im Januar", "im Februar");
+        let at1 = at(2026, 11, 15, 22, 30);
+        e.edited(
+            &room(),
+            "$m1",
+            &person("Anna").id,
+            "Anna",
+            &edited,
+            at1,
+            at1,
+        )
+        .await;
+        e.tick(at(2026, 11, 15, 23, 0)).await;
+        e.tick(at(2026, 11, 15, 23, 1)).await;
+        assert!(!closed(e, NOV15), "half an hour since the edit");
+        e.tick(at(2026, 11, 15, 23, 30)).await;
+        e.tick(at(2026, 11, 15, 23, 31)).await;
+        assert!(closed(e, NOV15));
+        let page = e.wiki.by_title("House plenum 2026-11-15").unwrap().text;
+        assert!(
+            page.contains("✅ Decided: Räder ohne Schild kommen im Februar"),
+            "{page}"
         );
-        assert_eq!(pdf_source("page", " "), "page");
+        assert!(!page.contains("im Januar"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn undo_within_the_hour_keeps_the_meeting_open_with_its_topics() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
+        let e = &t.engine;
+        pages_made(e).await;
+        top(e, "Werkzeugregal", at(2026, 11, 13, 10, 0)).await;
+        top(e, "Garten", at(2026, 11, 13, 10, 0)).await;
+        let now = at(2026, 11, 15, 22, 0);
+        let m1 = msg("$m1", "Anna", SAMPLE, now);
+        e.message(&room(), m1.clone(), now).await;
+        e.tick(at(2026, 11, 15, 22, 1)).await;
+        e.tick(at(2026, 11, 15, 22, 2)).await;
+        let a = take_reply(
+            e,
+            &person("Anna"),
+            "!minutes undo",
+            m1,
+            at(2026, 11, 15, 22, 20),
+        )
+        .await;
+        assert!(a.starts_with("↩️"), "{a}");
+        for (d, h, m) in [(15, 22, 21), (15, 23, 30), (16, 9, 0), (16, 9, 1)] {
+            e.tick(at(2026, 11, d, h, m)).await;
+        }
+        assert!(
+            !closed(e, NOV15),
+            "waits for minutes, as an empty page does"
+        );
+        // the wait is over: closed as a meeting without minutes, every topic moves on
+        e.tick(at(2026, 11, 22, 21, 0)).await;
+        e.tick(at(2026, 11, 22, 21, 1)).await;
+        assert!(closed(e, NOV15));
+        let st = e.state.lock().await;
+        let headings: Vec<&str> = (st.plenums["house"].open_topics.iter())
+            .map(|t| t.heading.as_str())
+            .collect();
+        assert_eq!(headings, ["### Werkzeugregal", "### Garten"]);
+    }
+
+    #[tokio::test]
+    async fn minutes_done_closes_at_once() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
+        let e = &t.engine;
+        pages_made(e).await;
+        let now = at(2026, 11, 15, 22, 0);
+        e.message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
+            .await;
+        let cmd = crate::commands::parse_for("!minutes done", &[]).unwrap();
+        let a = e
+            .command(&room(), &person("Anna"), cmd, at(2026, 11, 15, 22, 5))
+            .await;
+        assert!(a.starts_with("👍"), "{a}");
+        e.tick(at(2026, 11, 15, 22, 6)).await;
+        e.tick(at(2026, 11, 15, 22, 7)).await;
+        assert!(closed(e, NOV15));
+    }
+
+    #[tokio::test]
+    async fn the_room_failing_after_the_hour_closes_with_what_was_read() {
+        let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
+        let e = &t.engine;
+        pages_made(e).await;
+        *e.chat.fail.lock().unwrap() = true;
+        let now = at(2026, 11, 15, 22, 0);
+        e.message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
+            .await;
+        assert_eq!(copies(e).len(), 1);
+        e.tick(at(2026, 11, 15, 23, 0)).await;
+        e.tick(at(2026, 11, 15, 23, 1)).await;
+        assert!(closed(e, NOV15));
+        let page = e.wiki.by_title("House plenum 2026-11-15").unwrap().text;
+        assert!(page.contains("✅ Decided: Räder ohne Schild"), "{page}");
+    }
+
+    #[test]
+    fn the_pdf_is_the_page_then_the_copy_as_of_when_it_was_made() {
+        let tz: Tz = "Europe/Berlin".parse().unwrap();
+        let made = at(2026, 11, 28, 10, 40);
+        let copy = ":::info\nCopy of the minutes Anna posted in the chat on 16 Nov 2026, 10:12.\nTo change them, edit the message in the chat: the bot follows.\n:::\n\nProtokoll\n\nx";
+        assert_eq!(
+            pdf_source("page", copy, made, tz),
+            "page\n\n---\n\n## Chat minutes as of 28 Nov 2026, 10:40\n\nCopy of the minutes Anna posted in the chat on 16 Nov 2026, 10:12.\n\nProtokoll\n\nx"
+        );
+        assert_eq!(pdf_source("page", " ", made, tz), "page");
     }
 
     #[tokio::test]
@@ -2460,43 +3016,198 @@ Vertagt: Werkzeugregal";
         assert!(decisions(e).contains("(withdrawn 16 Nov 2026, 15:00)"));
     }
 
-    #[tokio::test]
-    async fn a_done_line_closes_a_task_for_good() {
-        let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
-        let e = &t.engine;
+    /// Open tasks from an earlier meeting, so every page made from now on has them.
+    async fn with_open_tasks(e: &Engine<FakeWiki, FakeChat>, texts: &[&str]) {
+        let mut st = e.state.lock().await;
+        st.plenums.get_mut("house").unwrap().open_tasks = (texts.iter())
+            .map(|t| Carried {
+                text: (*t).into(),
+                date: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+                link: String::new(),
+            })
+            .collect();
+    }
+
+    /// The meeting of 15 November waits for its minutes while the next page opens (the day
+    /// after its closing time), with the open tasks from before.
+    async fn next_page_open_while_nov15_waits(e: &Engine<FakeWiki, FakeChat>) {
+        with_open_tasks(e, &["Ben: Tonne kaufen", "Cara: Liste"]).await;
         pages_made(e).await;
-        edit_page(e, "House plenum 2026-11-15", |t| {
-            t.push_str("\n- [ ] Ben: Tonne kaufen\n- [ ] Cara: Liste\n")
-        });
-        let now = at(2026, 11, 15, 22, 0);
+        e.tick(at(2026, 11, 17, 0, 5)).await;
+        assert!(!closed(e, NOV15));
+        let next = e.wiki.by_title("House plenum 2026-12-01").unwrap();
+        assert!(
+            next.text.contains("- [ ] Ben: Tonne kaufen"),
+            "{}",
+            next.text
+        );
+    }
+
+    /// A meeting closed by a decision on its page, at the usual time.
+    async fn close_with_a_decision(e: &Engine<FakeWiki, FakeChat>, title: &str, day: u32) {
+        edit_page(e, title, |t| t.push_str("\nDecision: Weiter so.\n"));
+        e.tick(at(2026, 12, day, 9, 0)).await;
+        e.tick(at(2026, 12, day, 9, 1)).await;
+    }
+
+    #[tokio::test]
+    async fn a_save_that_stops_after_the_state_keeps_the_lists_ahead_of_the_minutes() {
+        let mut p = plenum("house", "House plenum", "!house:example.org");
+        p.page_after_days = Some(1);
+        let mut t = setup(vec![p]);
+        t.engine.minutes.wait_days = 0;
+        pages_made(&t.engine).await;
+        t.engine.tick(at(2026, 11, 16, 9, 0)).await;
+        t.engine.tick(at(2026, 11, 16, 9, 1)).await;
+        t.engine.tick(at(2026, 11, 17, 0, 5)).await; // the next page opens
+        let now = at(2026, 11, 17, 12, 0);
+        (t.engine)
+            .message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
+            .await;
+        // the new task goes onto the next page, and the save after it stops at its second
+        // file
+        let settings = crate::state::settings_path(&t.dir.path().join("state.json"));
+        *t.engine.wiki.block_after_append.lock().unwrap() = Some(settings.clone());
+        let more = format!("{SAMPLE}\nAufgabe: Ben fragt den Vermieter");
+        let at1 = at(2026, 11, 17, 13, 0);
+        let anna = person("Anna").id;
+        (t.engine)
+            .edited(&room(), "$m1", &anna, "Anna", &more, at1, at1)
+            .await;
+        std::fs::remove_dir(&settings).unwrap();
+        restart(&mut t).await;
+        t.engine.tick(at(2026, 11, 17, 13, 1)).await;
+        let open = open_tasks(&*t.engine.state.lock().await);
+        assert_eq!(
+            open.iter()
+                .filter(|t| *t == "Ben fragt den Vermieter")
+                .count(),
+            1,
+            "{open:?}"
+        );
+        let next = t
+            .engine
+            .wiki
+            .by_title("House plenum 2026-12-01")
+            .unwrap()
+            .text;
+        assert_eq!(next.matches("Ben fragt den Vermieter").count(), 1, "{next}");
+    }
+
+    #[tokio::test]
+    async fn a_done_line_closes_a_task_for_the_pages_open_then_and_no_later_one() {
+        let mut p = plenum("house", "House plenum", "!house:example.org");
+        p.page_after_days = Some(1);
+        let t = setup(vec![p]);
+        let e = &t.engine;
+        next_page_open_while_nov15_waits(e).await;
+        let now = at(2026, 11, 17, 12, 0);
         let body = "Protokoll 15.11.\nAnwesend: alle\n- [x] Ben: Tonne kaufen\nNichts weiter.";
         e.message(&room(), msg("$m1", "Anna", body, now), now).await;
-        e.tick(at(2026, 11, 15, 22, 1)).await;
-        e.tick(at(2026, 11, 15, 22, 2)).await;
+        for minute in 0..3 {
+            e.tick(at(2026, 11, 17, 14, minute)).await;
+        }
         assert!(closed(e, NOV15));
         {
             let st = e.state.lock().await;
-            let ps = &st.plenums["house"];
-            let open: Vec<&str> = ps.open_tasks.iter().map(|t| t.text.as_str()).collect();
-            assert_eq!(open, ["Cara: Liste"]);
-            assert_eq!(ps.done_tasks, ["Ben: Tonne kaufen"]);
+            let open = open_tasks(&st);
+            assert_eq!(open.len(), 1, "{open:?}");
+            assert!(open[0].starts_with("Cara: Liste"), "{open:?}");
         }
-        // the next page still has it unticked (copied before): it stays closed
-        e.tick(at(2026, 11, 28, 19, 0)).await;
-        edit_page(e, "House plenum 2026-12-01", |t| {
-            t.push_str("\n- [ ] Ben: Tonne kaufen (since 15 Nov 2026)\nDecision: Weiter so.\n")
-        });
-        e.tick(at(2026, 12, 2, 9, 0)).await;
-        e.tick(at(2026, 12, 2, 9, 1)).await;
+        // the next page, open already, still has it unticked: it stays closed
+        close_with_a_decision(e, "House plenum 2026-12-01", 2).await;
         assert!(closed(e, "house#2026-12-01"));
-        let st = e.state.lock().await;
-        let open: Vec<&str> = st.plenums["house"]
-            .open_tasks
-            .iter()
-            .map(|t| t.text.as_str())
-            .collect();
+        let open = open_tasks(&*e.state.lock().await);
         assert!(!open.iter().any(|t| t.contains("Tonne")), "{open:?}");
         assert!(open.iter().any(|t| t.contains("Cara: Liste")), "{open:?}");
+        // the same words as a new task on a page made later: a task of its own
+        e.tick(at(2026, 12, 3, 0, 5)).await;
+        edit_page(e, "House plenum 2026-12-15", |t| {
+            t.push_str("\n- [ ] Ben: Tonne kaufen\n")
+        });
+        close_with_a_decision(e, "House plenum 2026-12-15", 16).await;
+        assert!(closed(e, "house#2026-12-15"));
+        let open = open_tasks(&*e.state.lock().await);
+        assert!(open.iter().any(|t| t == "Ben: Tonne kaufen"), "{open:?}");
+    }
+
+    #[tokio::test]
+    async fn a_task_ticked_on_the_waiting_page_is_not_opened_again_by_the_next_one() {
+        let mut p = plenum("house", "House plenum", "!house:example.org");
+        p.page_after_days = Some(1);
+        let t = setup(vec![p]);
+        let e = &t.engine;
+        next_page_open_while_nov15_waits(e).await;
+        edit_page(e, "House plenum 2026-11-15", |t| {
+            *t = t.replacen("- [ ] Ben: Tonne kaufen", "- [x] Ben: Tonne kaufen", 1);
+        });
+        let now = at(2026, 11, 17, 12, 0);
+        e.message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
+            .await;
+        for minute in 0..3 {
+            e.tick(at(2026, 11, 17, 14, minute)).await;
+        }
+        assert!(closed(e, NOV15));
+        close_with_a_decision(e, "House plenum 2026-12-01", 2).await;
+        assert!(closed(e, "house#2026-12-01"));
+        let open = open_tasks(&*e.state.lock().await);
+        assert!(!open.iter().any(|t| t.contains("Tonne")), "{open:?}");
+        assert!(open.iter().any(|t| t.contains("Cara: Liste")), "{open:?}");
+    }
+
+    #[tokio::test]
+    async fn a_task_ticked_on_the_open_next_page_is_not_added_again() {
+        let mut p = plenum("house", "House plenum", "!house:example.org");
+        p.page_after_days = Some(1);
+        let t = setup(vec![p]);
+        let e = &t.engine;
+        next_page_open_while_nov15_waits(e).await;
+        edit_page(e, "House plenum 2026-12-01", |t| {
+            *t = t.replacen("- [ ] Ben: Tonne kaufen", "- [x] Ben: Tonne kaufen", 1);
+        });
+        let now = at(2026, 11, 17, 12, 0);
+        e.message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
+            .await;
+        for minute in 0..3 {
+            e.tick(at(2026, 11, 17, 14, minute)).await;
+        }
+        assert!(closed(e, NOV15));
+        let next = e.wiki.by_title("House plenum 2026-12-01").unwrap().text;
+        assert_eq!(next.matches("Ben: Tonne kaufen").count(), 1, "{next}");
+        assert!(next.contains("- [ ] Anna besorgt Schilder"), "{next}");
+    }
+
+    #[tokio::test]
+    async fn an_archived_next_page_is_skipped_like_a_deleted_one() {
+        let mut p = plenum("house", "House plenum", "!house:example.org");
+        p.page_after_days = Some(1);
+        let t = setup(vec![p]);
+        let e = &t.engine;
+        pages_made(e).await;
+        top(e, "Werkzeugregal", at(2026, 11, 13, 10, 0)).await;
+        next_page_open_while_nov15_waits(e).await;
+        {
+            let mut docs = e.wiki.docs.lock().unwrap();
+            let (d, _) = (docs.iter_mut())
+                .find(|(d, _)| d.title == "House plenum 2026-12-01")
+                .unwrap();
+            d.archived = true;
+        }
+        let now = at(2026, 11, 17, 12, 0);
+        e.message(&room(), msg("$m1", "Anna", SAMPLE, now), now)
+            .await;
+        for minute in 0..3 {
+            e.tick(at(2026, 11, 17, 14, minute)).await;
+        }
+        assert!(closed(e, NOV15));
+        let report = e.tick(at(2026, 11, 17, 14, 3)).await;
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(report.unavailable.is_empty(), "{:?}", report.unavailable);
+        assert_eq!(
+            e.state.lock().await.plenums["house"].open_topics.len(),
+            1,
+            "Werkzeugregal waits for a page it can go onto"
+        );
     }
 
     fn open_tasks(st: &State) -> Vec<String> {
@@ -2922,9 +3633,9 @@ Vertagt: Werkzeugregal";
         let shortened: Vec<_> = edits.iter().filter(|x| x.1 == posted[0].0).collect();
         assert_eq!(shortened.len(), 1);
         assert_eq!(shortened[0].2, "📋 Template for House plenum on Sunday, 15 November 2026 at 19:00. The minutes are filed.");
-        // the meeting closes with them; the template is not edited again
-        e.tick(at(2026, 11, 15, 21, 31)).await;
-        e.tick(at(2026, 11, 15, 21, 32)).await;
+        // the meeting closes with them (after a quiet hour); the template is not edited again
+        e.tick(at(2026, 11, 15, 22, 30)).await;
+        e.tick(at(2026, 11, 15, 22, 31)).await;
         assert!(closed(e, NOV15));
         assert_eq!(
             e.chat
@@ -2935,6 +3646,25 @@ Vertagt: Werkzeugregal";
                 .filter(|x| x.1 == posted[0].0)
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn the_template_names_a_mentioned_person_without_the_wikis_link() {
+        let t = setup(vec![plenum("house", "House plenum", ROOM)]);
+        let e = &t.engine;
+        with_open_tasks(
+            e,
+            &["@[Ben Berg](mention://m1/user/u1): write to the landlord"],
+        )
+        .await;
+        pages_made(e).await;
+        e.tick(at(2026, 11, 15, 18, 30)).await;
+        let text = templates(e)[0].1.clone();
+        assert!(!text.contains("mention://"), "{text}");
+        assert!(
+            text.contains("- [ ] @Ben Berg: write to the landlord"),
+            "{text}"
         );
     }
 
@@ -3083,9 +3813,9 @@ Vertagt: Werkzeugregal";
         let edits = e.chat.edits.lock().unwrap().clone();
         assert_eq!(edits.len(), 1, "{edits:?}");
         assert!(edits[0].2.ends_with("The minutes are filed."), "{edits:?}");
-        // and then no more: not at the close either
-        e.tick(at(2026, 11, 15, 22, 1)).await;
-        e.tick(at(2026, 11, 15, 22, 2)).await;
+        // and then no more: not at the close either (after a quiet hour)
+        e.tick(at(2026, 11, 15, 23, 0)).await;
+        e.tick(at(2026, 11, 15, 23, 1)).await;
         assert!(closed(e, NOV15));
         assert_eq!(e.chat.edits.lock().unwrap().len(), 1);
     }
@@ -3113,6 +3843,84 @@ Vertagt: Werkzeugregal";
         assert!(d.contains("(updated 16 Nov 2026, 14:00)") && d.contains("im März"));
     }
 
+    #[tokio::test]
+    async fn a_meetings_own_publication_survives_a_new_calendar_id() {
+        let t = setup(vec![plenum("house", "House plenum", ROOM)]);
+        let e = &t.engine;
+        let now = at(2026, 11, 20, 10, 0);
+        for line in ["!minutes confidential 15.12.", "!minutes link 1.12."] {
+            let cmd = crate::commands::parse_for(line, &[]).unwrap();
+            e.command(&room(), &person("Anna"), cmd, now).await;
+        }
+        // a "this and all future" change: a new ID on the same day, another time; the 1st is gone
+        {
+            let mut st = e.state.lock().await;
+            let ps = st.plenums.get_mut("house").unwrap();
+            assert!(ps.meetings["house#2026-12-15"].publication.is_some());
+            ps.occurrences.retain(|o| o.id != "house#2026-12-01");
+            for o in ps
+                .occurrences
+                .iter_mut()
+                .filter(|o| o.id == "house#2026-12-15")
+            {
+                *o = occ("house#new-2026-12-15", "2026-12-15 18:00");
+            }
+        }
+        e.tick(at(2026, 11, 20, 10, 1)).await;
+        e.tick(at(2026, 11, 20, 10, 2)).await;
+        let notes = e.chat.admin_notes.lock().unwrap().clone();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].1.contains("Tuesday, 1 December 2026") && notes[0].1.contains("link"),
+            "{notes:?}"
+        );
+        e.tick(at(2026, 12, 12, 18, 0)).await; // the page opens
+        let announced = e.chat.texts().last().unwrap().clone();
+        assert!(
+            announced.starts_with(
+                "🔒 **House plenum** on Tuesday, 15 December 2026 at 18:00: confidential"
+            ),
+            "{announced}"
+        );
+        edit_page(e, "House plenum 2026-12-15", |t| {
+            t.push_str("\nDecision: Kompost kommt.\n")
+        });
+        e.tick(at(2026, 12, 16, 9, 0)).await;
+        e.tick(at(2026, 12, 16, 9, 1)).await;
+        assert!(closed(e, "house#new-2026-12-15"));
+        let last = e.chat.texts().last().unwrap().clone();
+        assert!(
+            last.contains("confidential") && !last.contains("Kompost"),
+            "{last}"
+        );
+        assert_eq!(e.chat.admin_notes.lock().unwrap().len(), 1, "told once");
+    }
+
+    #[tokio::test]
+    async fn a_carried_topic_the_bot_cannot_see_on_the_page_is_written_once() {
+        let t = setup(vec![plenum("house", "House plenum", ROOM)]);
+        let e = &t.engine;
+        pages_made(e).await;
+        top(e, "Werkzeugregal", at(2026, 11, 13, 10, 0)).await;
+        // a template with the marker, but its topics under another heading
+        edit_page(e, "House plenum: Template", |t| {
+            *t = t.replace("## Topics", "## What we talk about")
+        });
+        edit_page(e, "House plenum 2026-11-15", |t| {
+            t.push_str("\nDecision: Weiter so.\n")
+        });
+        e.tick(at(2026, 11, 16, 9, 0)).await;
+        e.tick(at(2026, 11, 16, 9, 1)).await;
+        assert!(closed(e, NOV15));
+        assert_eq!(e.state.lock().await.plenums["house"].open_topics.len(), 1);
+        for minute in 0..5 {
+            e.tick(at(2026, 11, 28, 19, minute)).await;
+        }
+        let next = e.wiki.by_title("House plenum 2026-12-01").unwrap().text;
+        assert_eq!(next.matches("### Werkzeugregal").count(), 1, "{next}");
+        assert!(e.state.lock().await.plenums["house"].open_topics.is_empty());
+    }
+
     #[test]
     fn the_help_has_the_chat_minutes() {
         let h = help();
@@ -3137,12 +3945,37 @@ Vertagt: Werkzeugregal";
             e.message(&room(), msg(&format!("$m{i}"), "Bot", &body, now), now)
                 .await;
         }
-        let st = e.state.lock().await;
+        {
+            let st = e.state.lock().await;
+            assert_eq!(
+                st.minutes.plenums["house"].filings["house#2026-11-15"]
+                    .messages
+                    .len(),
+                10
+            );
+        }
+        // a move counts too, and is refused over the limit
+        let m0 = msg("$m0", "Bot", "Minutes\nnumber 0\nline\nline", now);
+        let a = take_reply(e, &person("Bot"), "!minutes 1.11.", m0, now).await;
+        assert!(a.starts_with("⏳"), "{a}");
+
+        let t = setup(vec![plenum("house", "House plenum", "!house:example.org")]);
+        let e = &t.engine;
+        pages_made(e).await;
+        for i in 0..9 {
+            let body = format!("Minutes\nnumber {i}\nline\nline");
+            e.message(&room(), msg(&format!("$m{i}"), "Bot", &body, now), now)
+                .await;
+        }
+        let m0 = msg("$m0", "Bot", "Minutes\nnumber 0\nline\nline", now);
         assert_eq!(
-            st.minutes.plenums["house"].filings["house#2026-11-15"]
-                .messages
-                .len(),
-            10
+            take_reply(e, &person("Bot"), "!minutes 1.11.", m0, now).await,
+            ""
         );
+        let body = "Minutes\nnumber 9\nline\nline";
+        e.message(&room(), msg("$m9", "Bot", body, now), now).await;
+        let st = e.state.lock().await;
+        let f = &st.minutes.plenums["house"].filings["house#2026-11-15"];
+        assert!(!f.messages.iter().any(|t| t.event == "$m9"), "the eleventh");
     }
 }

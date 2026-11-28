@@ -168,17 +168,17 @@ container's `TZ`.
 |---|---|
 | `!plenum` | next date and the page's link |
 | `!top <topic>` | a topic onto the next page (the first line its title, the next ones what it is about; waits for the page if it is not open yet) |
-| `!minutes done` | close the protocol now (decisions, PDF, summary). While the meeting is on only `organizers` and the admins; after its end everyone (or `organizers` only, if set) |
+| `!minutes done` | close the protocol now (decisions, PDF, summary); nothing else on its line. While the meeting is on only `organizers` and the admins; after its end everyone (or `organizers` only, if set) |
 | `!minutes confidential` | nothing from this meeting's minutes comes into the chat (see below) |
 | `!minutes link` | only the link to them |
 | `!minutes full` | the summary again, as usual |
 | `!top` as a reply | the message it answers is the topic (by its author) |
-| `!minutes` as a reply | the message it answers is the minutes (with `[minutes] from_chat`; below); `!minutes <day>`: of that day's meeting, also to move filed minutes |
+| `!minutes` as a reply | the message it answers is the minutes (with `[minutes] from_chat`; below); `!minutes <day>`: of that day's meeting, also to move filed minutes (for the same people as `undo`) |
 | `!minutes`, a line break, the minutes | the same in one message |
 | `!minutes undo` | as a reply, or for your latest: not the minutes after all (its sender, who filed it, the organizers, the admins) |
 | `!minutes template` | the fill-in template for minutes in the chat |
 | `!plenum settings` | the plenum's own settings: `messages`, `reminder`, `page_days`, `page_after` |
-| `!plenum set <name> <value>`, `!plenum reset <name>` | change one, back to the default (the `organizers`; without any, everyone in the room; admins always; 10 a day per person, 30 per plenum) |
+| `!plenum set <name> <value>`, `!plenum reset <name>` | change one, back to the default (the `organizers`; without any, everyone in the room; admins always; 10 a day per person, 30 per plenum); a number may have its own unit only (`30 min`, `3 days`) |
 | `!plenum help` | this list |
 
 In an admin's direct chat with the bot: `!plenum` (every plenum), `!members` (the held
@@ -186,15 +186,17 @@ removals and their digests, the running handovers and their end dates, the stays
 or are overdue), `!members confirm <plenum key|room> <digest>`. In a direct chat from an account on another
 server: `!link <username>`.
 
-Several plenums in one room: the key goes along, `!top kitchen-floor-1 dishwasher`. Commands
+Several plenums in one room: the key goes along, `!top kitchen-floor-1 dishwasher` (in a room
+with one plenum its key is no key: `!top house rules` is the topic "house rules"). Commands
 older than 15 minutes (a fresh Matrix store syncs the rooms' history) are left alone. `!minutes`
 alone (no reply) is the overview, as `!plenum`.
 
 ## Minutes from the chat
 
 With `[minutes] from_chat = true` (off by default; docs/CHAT-MINUTES.md): a message whose first
-line starts with "Protokoll", "Plenumsprotokoll", "Minutes" or "Protocol" (short, with more
-lines after it), or one someone answers with `!minutes`, is copied into a document of its own
+line starts with "Protokoll", "Plenumsprotokoll", "Minutes" or "Protocol" and a few more (short,
+no question, with more lines after it or a labelled line), or one someone answers with
+`!minutes`, is copied into a document of its own
 below the meeting's page ("<page title>: Chat minutes"; a day in its first two lines picks the
 meeting, else the latest one that began in the last 21 days, else it is filed by its day). An
 edit of the message by its sender is followed, a deletion or `!minutes undo` withdraws it; a
@@ -204,8 +206,8 @@ in German and English; also checkboxes) go into the decision list and the open t
 without labels are filed as text. The bot reacts with 📥, answers once in the message's thread
 (edited when the message changes) and pins the latest minutes in the room. A meeting whose page
 has no result waits `wait_days` (7) for minutes from the chat instead of closing empty, with one
-reminder after `nudge_days` (2); minutes close it, and then only the topics a "Postponed:" line
-names move on. A fill-in template ("<Name>: Chat template" in the wiki, English, editable) is
+reminder after `nudge_days` (2); minutes close it once they have been quiet for an hour, and
+then only the topics a "Postponed:" line names move on. A fill-in template ("<Name>: Chat template" in the wiki, English, editable) is
 posted after the reminder and on `!minutes template`. With `publication: full`, minutes written
 on the page come into the room at close as one message instead of the summary (and are
 pinned). Kept in `store/minutes.json`.
@@ -234,14 +236,17 @@ The page opens, once the plenum's previous meeting is closed or past its closing
 N-th day after that meeting (0: right then), however far its own meeting is; without it (and
 for a first meeting) `prepare_days` (the room's `page_days`) before its meeting. A day before
 it opens anyway (two meetings close together). An open page whose calendar event got another
-ID (a series changed "this and all future") keeps its meeting; an event entered twice is one
+ID (a series changed "this and all future") keeps its meeting, and so does a date with a
+`!minutes confidential|link` of its own and no page yet; an event entered twice is one
 meeting (docs/PLENUM-PAGES.md §4.1). The open pages are pinned in the collection and unpinned
 when closed or cancelled (§6.1; needs `pins.*` in the key).
 
 At close: the topics not reached go into the state (`open_topics`) and from there into the next
 page that is open (above its marker, else above its "Tasks" heading, else at the end), and are
-dropped from the state only once a later read shows their heading there (compared without
-emphasis or escapes: Outline 1.12 drops the escape of `_`); a meeting that receives a topic from
+dropped from the state once a later read shows their heading there (compared without
+emphasis or escapes: Outline 1.12 drops the escape of `_`), or, written there and still not
+among its topics at the next tick (a page without a "Topics" heading), with one warning; topics
+put into a new page's text when it is made are dropped then. A meeting that receives a topic from
 one shared less takes that publication. The result box (each decided topic with its decision,
 discussed, on the next page, to check, tasks) replaces the result marker, once, and is checked
 at the next tick before the PDF (an API edit can be lost in a race with a browser's save; after
@@ -322,6 +327,10 @@ one: nobody changed it since the bot made it, it has the text the bot wrote last
 fingerprint in the state), or one of the bot's earlier versions (`src/former.rs`: the old
 template and example minutes). Compared by letters and digits only, as Outline gives the text
 back in its own Markdown. A person's change keeps the document theirs. A private collection is only ever found by its ID, never taken over by its name.
+An archived document (it refuses every write) counts as gone: a decision list or overview is made
+anew, and an archived next page gets no carried topics or tasks (they wait for the page after).
+A collection counts as gone only when Outline says so (404, or deleted); a refusal (403) is an
+error, so a key that lost its access never makes a second collection.
 
 **The house group** (2026-10-31, for subtenants): Outline 1.12.0 self-hosted has no guest role
 (its Community plan refuses it), so a subtenant in the wiki is a member or viewer, and both read
@@ -373,7 +382,10 @@ OUTLINE_IT_URL=http://localhost:3000 OUTLINE_IT_KEY=ol_api_… cargo test -- --i
 The second runs a whole meeting against a real Outline (it creates a collection "IT <uuid>").
 `chat_minutes_in_a_real_outline` (also `--ignored`, the same two variables) makes the copy of
 chat minutes below a page, replaces it, checks its fingerprint after Outline's round trip, a
-change through the API and the trash, and the chat template's code block.
+change through the API and the trash (a second delete from the trash is "nothing to delete"),
+and the chat template's code block. Without an Outline, `outline::http_mapping` checks how the
+client reads Outline's answers (404, `deletedAt`, 403, 5xx, a body that is no JSON, another ID
+than the one sent) against a local stub.
 `house_group_areas_in_a_real_outline` (also `--ignored`) sets up a house plenum, a kitchen and
 the finance group first open to the workspace, then with the house group, and checks each
 collection's access and groups; it needs an admin's key (`OUTLINE_IT_ADMIN_KEY`) and the

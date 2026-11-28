@@ -114,6 +114,10 @@ pub struct Filing {
     /// of punctuation).
     #[serde(default)]
     pub sent: Option<u64>,
+    /// `former::fingerprint` of the text the bot is writing, saved before the write: a copy
+    /// that has it is the bot's, also when the write's answer was lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trying: Option<u64>,
     /// Changed or deleted in the wiki: the bot writes no more into it.
     #[serde(default)]
     pub adopted: bool,
@@ -145,6 +149,10 @@ pub struct Filing {
     /// Something is still to do (a write, a reaction, a reply, an apply): tried every tick.
     #[serde(default)]
     pub pending: bool,
+    /// When a message was last taken, changed, withdrawn, taken again or moved: the meeting
+    /// closes once that is an hour ago. None (a file from before): long ago.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_at: Option<DateTime<Utc>>,
 }
 
 impl Filing {
@@ -157,6 +165,7 @@ impl Filing {
             title: None,
             written: None,
             sent: None,
+            trying: None,
             adopted: false,
             adopted_due: false,
             adopted_told: Step::default(),
@@ -167,6 +176,7 @@ impl Filing {
             listed: None,
             noted_on_page: false,
             pending: true,
+            changed_at: None,
         }
     }
 
@@ -397,10 +407,15 @@ pub struct PlenumState {
     /// from here then).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_topics: Vec<CarriedTopic>,
-    /// Tasks a chat minutes' done line closed: an unticked checkbox of one on a later page
-    /// does not open it again.
+    /// Tasks a chat minutes' done line closed, as the image before scoped entries kept them
+    /// (no pages they are for): no longer read, kept for a rollback.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub done_tasks: Vec<String>,
+    /// Tasks closed while later pages were open already (a chat minutes' done line, or a close
+    /// that resolved them): those pages' unticked copies do not open them again. Each goes
+    /// once those pages are closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub done_for_open_pages: Vec<DoneTask>,
     /// "<Name>: Chat template", the fill-in template for chat minutes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_doc_id: Option<String>,
@@ -420,6 +435,18 @@ pub struct CarriedTopic {
     /// receives it shares no more than that.
     pub from: MeetingKey,
     pub publication: Publication,
+    /// The page it was written onto (its document ID): not seen there at the next tick, it is
+    /// dropped (a page whose topics the bot cannot read would get it at every tick).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_to: Option<String>,
+}
+
+/// A task closed for the pages open when it was closed: those of meetings that start at
+/// most `until` (the latest of them then).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DoneTask {
+    pub text: String,
+    pub until: MeetingKey,
 }
 
 /// The message with a page's link (`messages quiet` edits it when the meeting moves or is
@@ -594,6 +621,17 @@ impl PlenumState {
         if self.done_tasks.len() > KEEP_DONE {
             self.done_tasks.drain(..self.done_tasks.len() - KEEP_DONE);
         }
+        // a done task whose pages are all closed has nothing left to do
+        let meetings = &self.meetings;
+        self.done_for_open_pages.retain(|d| {
+            meetings.values().any(|m| {
+                m.created
+                    && !m.close.done
+                    && !m.cancelled
+                    && !m.skipped
+                    && m.start.is_some_and(|s| s <= d.until)
+            })
+        });
         if self.withheld_tasks.len() > KEEP_WITHHELD {
             self.withheld_tasks
                 .drain(..self.withheld_tasks.len() - KEEP_WITHHELD);
@@ -623,10 +661,13 @@ impl State {
         Ok(st)
     }
 
+    /// `state.json` first, `minutes.json` last: a save that stops in between leaves the lists
+    /// ahead of what the chat minutes say is applied (applied again, nothing twice), never
+    /// behind it (a change that would never be made).
     pub async fn save(&self, path: &Path) -> Result<()> {
-        mxbot_common::persist::save_json_atomic(&minutes_path(path), &self.minutes).await?;
+        mxbot_common::persist::save_json_atomic(path, self).await?;
         mxbot_common::persist::save_json_atomic(&settings_path(path), &self.settings).await?;
-        mxbot_common::persist::save_json_atomic(path, self).await
+        mxbot_common::persist::save_json_atomic(&minutes_path(path), &self.minutes).await
     }
 }
 

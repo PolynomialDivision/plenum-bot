@@ -177,12 +177,18 @@ struct Attachment {
     url: String,
 }
 
+/// How long a connection to Outline may take to open.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Outline {
     pub fn new(base: &str, public: &str, key: &str, timeout: Duration) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
                 .user_agent(concat!("plenum-bot/", env!("CARGO_PKG_VERSION")))
                 .timeout(timeout)
+                // a wiki that is gone fails fast: the calls hold the lock every command and
+                // the sync wait for
+                .connect_timeout(CONNECT_TIMEOUT)
                 .build()?,
             base: base.trim_end_matches('/').to_owned(),
             key: key.to_owned(),
@@ -429,8 +435,9 @@ async fn ensure_collection<C: Collections>(
         match api.info(id).await {
             Ok(c) if c.deleted_at.is_none() && c.archived_at.is_none() => found = Some(c),
             Ok(_) => {}
-            // deleted, or no longer the bot's: looked up by its name
-            Err(e) if matches!(status_of(&e), Some(400 | 403 | 404)) => {}
+            // deleted: looked up by its name (a refusal is an error: a second collection
+            // would split the plenum's minutes)
+            Err(e) if status_of(&e) == Some(404) => {}
             Err(e) => return Err(e),
         }
     }
@@ -588,6 +595,11 @@ impl Wiki for Outline {
                        "parentDocumentId": parent_id, "publish": true}),
             )
             .await?;
+        // the bot saved this ID before the call to find the document again: another one would
+        // be made anew at every try
+        if d.id != id {
+            anyhow::bail!("Outline documents.create made {} instead of {id}", d.id);
+        }
         Ok(d.into())
     }
 
@@ -721,6 +733,95 @@ impl Wiki for Outline {
     }
 }
 
+/// How Outline's HTTP answers map to what the engine sees, against a local stub that answers
+/// every call with one status and body (no Outline needed).
+#[cfg(test)]
+mod http_mapping {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The client against a local server that answers each request with `status` and `body`.
+    async fn stub(status: u16, body: &'static str) -> Outline {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // the request: its head, then as many bytes as it says it has
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+                        let len = (head.lines())
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                    let answer = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(answer.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        let base = format!("http://{addr}");
+        Outline::new(&base, "https://wiki.test", "key", Duration::from_secs(5)).unwrap()
+    }
+
+    const DOC: &str = r#"{"data":{"id":"d1","title":"T","text":"x","url":"/doc/t"}}"#;
+    const TRASHED: &str = r#"{"data":{"id":"d1","title":"T","text":"x","url":"/doc/t","deletedAt":"2026-11-28T10:00:00.000Z"}}"#;
+    const REFUSED: &str =
+        r#"{"ok":false,"error":"authorization_error","message":"Authorization error"}"#;
+    const MISSING: &str = r#"{"ok":false,"error":"not_found","message":"Resource not found"}"#;
+    const BROKEN: &str = "<html>Bad gateway</html>";
+
+    #[tokio::test]
+    async fn doc_and_delete_tell_gone_from_failing() {
+        assert!(stub(200, DOC).await.doc("d1").await.unwrap().is_some());
+        assert!(stub(404, MISSING).await.doc("d1").await.unwrap().is_none());
+        assert!(stub(200, TRASHED).await.doc("d1").await.unwrap().is_none());
+        for (status, body) in [(403, REFUSED), (500, BROKEN), (502, BROKEN), (200, BROKEN)] {
+            let r = stub(status, body).await.doc("d1").await;
+            assert!(r.is_err(), "{status} {body}: {r:?}");
+        }
+        let ok = r#"{"success":true}"#;
+        assert!(stub(200, ok).await.delete("d1").await.unwrap());
+        assert!(!stub(404, MISSING).await.delete("d1").await.unwrap());
+        for (status, body) in [(403, REFUSED), (500, BROKEN), (502, BROKEN)] {
+            let r = stub(status, body).await.delete("d1").await;
+            assert!(r.is_err(), "{status} {body}: {r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_document_made_under_another_id_is_an_error() {
+        let made = stub(200, DOC)
+            .await
+            .create_doc("d1", "c", None, "T", "x")
+            .await;
+        assert_eq!(made.unwrap().id, "d1");
+        let other = stub(200, DOC)
+            .await
+            .create_doc("d2", "c", None, "T", "x")
+            .await;
+        assert!(other.is_err(), "{other:?}");
+    }
+}
+
 /// The collection rules ([`ensure_collection`], [`grant_group`]) against a fake Outline that
 /// models the groups' memberships and logs every change in order.
 #[cfg(test)]
@@ -744,6 +845,8 @@ mod collection_rules {
         groups: Mutex<Vec<String>>,
         cols: Mutex<Vec<Col>>,
         log: Mutex<Vec<String>>,
+        /// collections.info refused (403: the key's account lost its access)
+        refuse_info: Mutex<bool>,
     }
 
     impl FakeOutline {
@@ -816,6 +919,14 @@ mod collection_rules {
             Ok(groups.iter().find(|g| *g == name).map(|g| format!("g-{g}")))
         }
         async fn info(&self, id: &str) -> Result<ApiCollection> {
+            if *self.refuse_info.lock().unwrap() {
+                return Err(ApiError {
+                    status: 403,
+                    error: "authorization_error".into(),
+                    message: String::new(),
+                }
+                .into());
+            }
             self.with(id, |c| api(c))
         }
         async fn list(&self, name: &str) -> Result<Vec<ApiCollection>> {
@@ -882,6 +993,25 @@ mod collection_rules {
         ensure_collection(wiki, HOUSE, known, name, access, group)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn info_403_creates_nothing() {
+        let wiki = FakeOutline::with_groups(&["residents", "finance"]);
+        let id = wiki.add("Finance", None, &[("finance", "read_write")]);
+        *wiki.refuse_info.lock().unwrap() = true;
+        let r = ensure_collection(
+            &wiki,
+            HOUSE,
+            Some(&id),
+            "Finance",
+            Access::Private,
+            Some("finance"),
+        )
+        .await;
+        assert!(r.is_err(), "{r:?}");
+        assert!(wiki.changes().is_empty());
+        assert_eq!(wiki.cols.lock().unwrap().len(), 1, "no second collection");
     }
 
     #[tokio::test]
@@ -1389,7 +1519,9 @@ mod against_outline {
         // into the trash: gone for the bot
         assert!(wiki.delete(&doc_id).await.unwrap());
         assert!(wiki.doc(&doc_id).await.unwrap().is_none());
-        eprintln!("deleted again: {:?}", wiki.delete(&doc_id).await);
+        // deleted again, from the trash: nothing to delete (the bot reads before it deletes,
+        // and would fail at every tick on an error here)
+        assert!(!wiki.delete(&doc_id).await.unwrap());
         assert!(!wiki
             .delete(&uuid::Uuid::new_v4().to_string())
             .await

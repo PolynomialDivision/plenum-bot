@@ -16,7 +16,15 @@ use crate::{
 };
 
 /// The words a first line starts with (any case, after `#`, `*`, emoji and spaces).
-const KEYWORDS: [&str; 4] = ["plenumsprotokoll", "protokoll", "minutes", "protocol"];
+const KEYWORDS: [&str; 7] = [
+    "plenumsprotokoll",
+    "plenumprotokoll",
+    "kurzprotokoll",
+    "ergebnisprotokoll",
+    "protokoll",
+    "minutes",
+    "protocol",
+];
 
 /// The first line of minutes is a title, not a paragraph.
 const FIRST_LINE_MAX: usize = 80;
@@ -58,6 +66,7 @@ const LABELS: [(Kind, &[&str]); 4] = [
             "consensus",
             "beschluss",
             "beschlüsse",
+            "beschluesse",
             "beschlossen",
             "entscheidung",
             "entscheidungen",
@@ -75,6 +84,9 @@ const LABELS: [(Kind, &[&str]); 4] = [
             "to-do",
             "todo",
             "todos",
+            "to-dos",
+            "to dos",
+            "todo's",
             "action",
             "actions",
             "action item",
@@ -85,6 +97,7 @@ const LABELS: [(Kind, &[&str]); 4] = [
             "zu erledigen",
             "auftrag",
             "aufträge",
+            "auftraege",
         ],
     ),
     (
@@ -95,13 +108,11 @@ const LABELS: [(Kind, &[&str]); 4] = [
             "adjourned",
             "tabled",
             "next time",
-            "next meeting",
             "carried over",
             "not reached",
             "vertagt",
             "verschoben",
             "nächstes mal",
-            "nächstes plenum",
             "nicht geschafft",
             "offen geblieben",
         ],
@@ -144,21 +155,24 @@ fn first_line(body: &str) -> Option<&str> {
 }
 
 /// Whether a message is minutes by itself (CHAT-MINUTES.md §3): its first line starts with one of the
-/// [`KEYWORDS`] and is short, and more follows.
+/// [`KEYWORDS`], is short and asks nothing, and more follows (enough of it, or a labelled line).
 pub fn is_minutes(body: &str) -> bool {
     let text = own_text(body);
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
     let Some(first) = lines.next() else {
         return false;
     };
-    if first.chars().count() > FIRST_LINE_MAX {
+    if first.chars().count() > FIRST_LINE_MAX || first.contains('?') {
         return false;
     }
     let lower = lead(first).to_lowercase();
     if !KEYWORDS.iter().any(|k| starts_with_word(&lower, k)) {
         return false;
     }
-    lines.count() >= MORE_LINES || text.trim().chars().count() >= MORE_CHARS
+    let more = lines.count();
+    more >= MORE_LINES
+        || text.trim().chars().count() >= MORE_CHARS
+        || (more >= 1 && read(text) != Read::default())
 }
 
 /// Whether the first line names a plenum (by its key or its name), for a room with several.
@@ -211,10 +225,11 @@ fn month(word: &str) -> Option<u32> {
     (1..=12u32).find(|m| months[*m as usize - 1].contains(&w.as_str()))
 }
 
-/// A day in the message's first two lines (CHAT-MINUTES.md §4): `15.11.`, `15.11.2026`, `2026-11-15`,
-/// `15. November`. Without a year the latest such day not after `today`; a day after `today`
-/// is none.
-pub fn day_in(body: &str, today: NaiveDate) -> Option<NaiveDate> {
+/// A day as written: day, month, maybe the year.
+type Written = (u32, u32, Option<i32>);
+
+/// The days written in the message's first two lines, as written and as numbers.
+fn days_written(body: &str) -> Vec<(String, Written)> {
     let lines: Vec<&str> = own_text(body)
         .lines()
         .map(str::trim)
@@ -229,33 +244,53 @@ pub fn day_in(body: &str, today: NaiveDate) -> Option<NaiveDate> {
                 .to_owned()
         })
         .collect();
+    let mut out = Vec::new();
     for (i, w) in words.iter().enumerate() {
         let found = match crate::commands::parse_when(std::slice::from_ref(w)) {
-            Ok(Some(when)) => Some((when.day, when.month, when.year)),
+            Ok(Some(when)) => Some(((when.day, when.month, when.year), 1)),
             _ => {
                 let day = w.trim_end_matches('.').parse::<u32>().ok();
                 let m = words.get(i + 1).and_then(|n| month(n));
                 day.zip(m).map(|(d, m)| {
                     let year = words.get(i + 2).and_then(|y| y.parse::<i32>().ok());
-                    (d, m, year.filter(|y| (2000..=2100).contains(y)))
+                    let year = year.filter(|y| (2000..=2100).contains(y));
+                    ((d, m, year), if year.is_some() { 3 } else { 2 })
                 })
             }
         };
-        let Some((day, m, year)) = found else {
-            continue;
-        };
-        let date = match year {
+        if let Some((day, n)) = found {
+            out.push((words[i..i + n].join(" "), day));
+        }
+    }
+    out
+}
+
+/// A day in the message's first two lines (CHAT-MINUTES.md §4): `15.11.`, `15.11.2026`, `2026-11-15`,
+/// `15. November`. Without a year the latest such day not after `today`; a day after `today`
+/// is none.
+pub fn day_in(body: &str, today: NaiveDate) -> Option<NaiveDate> {
+    days_written(body)
+        .into_iter()
+        .find_map(|(_, (day, m, year))| match year {
             Some(y) => NaiveDate::from_ymd_opt(y, m, day).filter(|d| *d <= today),
             None => [today.year(), today.year() - 1]
                 .into_iter()
                 .filter_map(|y| NaiveDate::from_ymd_opt(y, m, day))
                 .find(|d| *d <= today && today - *d <= Duration::days(DAY_WITHOUT_YEAR_DAYS)),
-        };
-        if date.is_some() {
-            return date;
-        }
+        })
+}
+
+/// The day written in the first two lines when none of them is used (still to come, too far
+/// back, no such day), as written; None when one is used or none is there. `filed`: the day
+/// the minutes are filed for (moved there by hand: that day is used).
+pub fn unused_day(body: &str, posted: NaiveDate, filed: NaiveDate) -> Option<String> {
+    if day_in(body, posted).is_some() {
+        return None;
     }
-    None
+    days_written(body)
+        .into_iter()
+        .find(|(_, (d, m, _))| !(filed.day() == *d && filed.month() == *m))
+        .map(|(written, _)| written)
 }
 
 /// The meeting minutes belong to (CHAT-MINUTES.md §4), of `meetings` (ID, start; neither cancelled nor
@@ -295,9 +330,27 @@ enum Block {
     List,
 }
 
-/// A link's target people may follow from the wiki.
+/// A line that opens a code block: a fence whose rest has no backtick ("```x```" is inline
+/// code).
+fn opens_fence(line: &str) -> bool {
+    let t = line.trim();
+    ["```", "~~~"]
+        .iter()
+        .any(|f| t.strip_prefix(f).is_some_and(|rest| !rest.contains('`')))
+}
+
+/// A line that closes a code block: a bare fence.
+fn closes_fence(line: &str) -> bool {
+    let t = line.trim();
+    t.len() >= 3 && (t.chars().all(|c| c == '`') || t.chars().all(|c| c == '~'))
+}
+
+/// A link's target people may follow from the wiki: its destination alone (without a title,
+/// spaces and `<`).
 fn followable(url: &str) -> bool {
-    let lower = url.to_lowercase();
+    let dest = url.trim_start_matches([' ', '<']);
+    let dest = dest.split(char::is_whitespace).next().unwrap_or_default();
+    let lower = dest.to_lowercase();
     ["http://", "https://", "mailto:"]
         .iter()
         .any(|s| lower.starts_with(s))
@@ -313,7 +366,7 @@ fn links(line: &str) -> String {
         let parsed = tail[1..].split_once("](").and_then(|(label, after)| {
             let end = after.find(')')?;
             let url = &after[..end];
-            let ok = !label.contains(['[', ']', '\n']) && !url.contains(char::is_whitespace);
+            let ok = !label.contains(['[', ']', '\n']);
             ok.then(|| (label, url, &after[end + 1..]))
         });
         let Some((label, url, after)) = parsed else {
@@ -353,16 +406,16 @@ pub fn to_wiki(body: &str) -> String {
     let mut code = false;
     for line in own_text(body).trim().lines() {
         let line = line.trim_end();
-        let fence = line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~");
         if code {
             out.push('\n');
             out.push_str(line);
-            if fence {
+            if closes_fence(line) {
                 code = false;
                 prev = Block::Text;
             }
             continue;
         }
+        let fence = opens_fence(line);
         if line.trim().is_empty() {
             if prev != Block::Start {
                 prev = Block::Blank;
@@ -400,9 +453,19 @@ pub fn to_wiki(body: &str) -> String {
     out
 }
 
+/// Whether a line ends with a colon (after emphasis): a heading of its own, so the end of a
+/// section.
+fn ends_with_colon(line: &str) -> bool {
+    line.trim_end()
+        .trim_end_matches(['*', '_'])
+        .trim_end()
+        .ends_with(':')
+}
+
 /// `(kind, the text after the label)` of a line that starts with a label: "Beschluss: …"
-/// (also bold, as a list item, after an emoji), or the label alone as a heading or in bold
-/// (the start of a section; the text is empty then). A checkbox item is never a label line.
+/// (also bold, as a list item, after an emoji), or the start of a section (the text is empty
+/// then): the label alone as a heading or in bold, or a line that starts with the label and
+/// ends with a colon ("Aufgaben (bis nächstes Mal):"). A checkbox item is never a label line.
 fn label_of(line: &str) -> Option<(Kind, String)> {
     let t = line.trim();
     let heading = t.starts_with('#');
@@ -424,7 +487,15 @@ fn label_of(line: &str) -> Option<(Kind, String)> {
         if head.to_lowercase() != label {
             continue;
         }
-        let after = t[head.len()..].trim_start_matches(['*', '_']);
+        let after = &t[head.len()..];
+        // a whole word ("Aufgabenliste" is none)
+        if after.starts_with(char::is_alphanumeric) {
+            continue;
+        }
+        if ends_with_colon(after) {
+            return Some((kind, String::new()));
+        }
+        let after = after.trim_start_matches(['*', '_']);
         if let Some(rest) = after.trim_start().strip_prefix(':') {
             return Some((kind, clean(rest.trim_start_matches(['*', '_']))));
         }
@@ -435,7 +506,23 @@ fn label_of(line: &str) -> Option<(Kind, String)> {
     None
 }
 
-/// An entry's text, or none for what is no entry (empty, a lone "-", an ellipsis).
+/// What people write under a label that has nothing (lower case, without punctuation).
+const NO_ENTRY: [&str; 12] = [
+    "keine",
+    "keiner",
+    "keins",
+    "nichts",
+    "nix",
+    "none",
+    "nothing",
+    "nein",
+    "no",
+    "n/a",
+    "entfällt",
+    "/",
+];
+
+/// An entry's text, or none for what is no entry (empty, a lone "-", an ellipsis, "keine").
 fn entry(text: &str) -> Option<String> {
     let t = clean(text);
     let t = t.trim();
@@ -445,19 +532,71 @@ fn entry(text: &str) -> Option<String> {
     if blank {
         return None;
     }
+    let lower = t.to_lowercase();
+    let word = lower.trim_matches(|c: char| !c.is_alphanumeric() && c != '/');
+    if NO_ENTRY.contains(&word) {
+        return None;
+    }
     Some(t.chars().take(ENTRY_MAX).collect())
 }
 
-/// What the labelled lines say (CHAT-MINUTES.md §5): one line ("Beschluss: …"), or a section (the label
-/// alone, also as a heading, then its lines up to an empty line, the next label or a
-/// heading). An open checkbox is a task, a ticked one done; an open one under "Done:" is
-/// neither (the template's open tasks nobody ticked). Code blocks are not read.
+/// Whether a postponed entry is only a day or a time ("auf den 29.11.", "19 Uhr"): the next
+/// meeting's date, no topic. One with a word of four letters or more is a topic.
+fn only_a_date(text: &str) -> bool {
+    let long_word = (text.split(|c: char| !c.is_alphabetic())).any(|w| w.chars().count() >= 4);
+    if long_word {
+        return false;
+    }
+    let words: Vec<&str> = (text.split_whitespace())
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .collect();
+    words.iter().enumerate().any(|(i, w)| {
+        let digits = w.chars().any(|c| c.is_ascii_digit());
+        let day_or_time = digits
+            && w.contains(['.', ':', '-', '/'])
+            && (w.chars()).all(|c| c.is_ascii_digit() || matches!(c, '.' | ':' | '-' | '/'));
+        let hour = digits
+            && w.chars().all(|c| c.is_ascii_digit())
+            && words
+                .get(i + 1)
+                .is_some_and(|n| n.eq_ignore_ascii_case("uhr"));
+        day_or_time || hour
+    })
+}
+
+/// A list item of chat minutes: `(whether it is one, its checkbox, its text)`. Also "•", "–"
+/// and a "-" without a space, which phones and people type (the wiki's readers keep
+/// `strip_list_marker`).
+fn list_item(line: &str) -> (bool, Option<bool>, &str) {
+    let (checkbox, rest) = strip_list_marker(line);
+    if checkbox.is_some() || rest.len() != line.len() {
+        return (true, checkbox, rest);
+    }
+    for mark in ['•', '–', '-'] {
+        if let Some(r) = line.strip_prefix(mark) {
+            let (checkbox, rest) = strip_list_marker(r.trim_start());
+            return (true, checkbox, rest);
+        }
+    }
+    (false, None, line)
+}
+
+/// What the labelled lines say (CHAT-MINUTES.md §5): one line ("Beschluss: …"), or a section
+/// (the label alone, also as a heading, then its lines). A section ends at the next label, a
+/// heading, a line that ends with a colon, an empty line once it has an entry, and, when its
+/// first entry is a list item, the first line that is none; empty lines right after the label
+/// do not end it when a list follows. An open checkbox is a task, a ticked one done; an open
+/// one under "Done:" is neither (the template's open tasks nobody ticked). Code blocks are not
+/// read.
 pub fn read(body: &str) -> Read {
     let mut out = Read::default();
     let mut push = |kind: Kind, text: &str| {
         let Some(text) = entry(text) else {
             return;
         };
+        if kind == Kind::Postponed && only_a_date(&text) {
+            return;
+        }
         let list = match kind {
             Kind::Decision => &mut out.decisions,
             Kind::Task => &mut out.tasks,
@@ -468,41 +607,56 @@ pub fn read(body: &str) -> Read {
             list.push(text);
         }
     };
-    let mut section: Option<Kind> = None;
+    // the open section: its kind, and whether its first entry was a list item (None: no
+    // entry yet)
+    let mut section: Option<(Kind, Option<bool>)> = None;
     let mut code = false;
-    for line in own_text(body).lines() {
-        let t = line.trim();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            code = !code;
-            section = None;
+    let lines: Vec<&str> = own_text(body).lines().map(str::trim).collect();
+    for (i, &t) in lines.iter().enumerate() {
+        if code {
+            code = !closes_fence(t);
             continue;
         }
-        if code {
+        if opens_fence(t) {
+            code = true;
+            section = None;
             continue;
         }
         if t.is_empty() {
-            section = None;
+            let list_follows = (lines[i + 1..].iter())
+                .find(|l| !l.is_empty())
+                .is_some_and(|l| list_item(l).0);
+            if !(matches!(section, Some((_, None))) && list_follows) {
+                section = None;
+            }
             continue;
         }
         if let Some((kind, rest)) = label_of(t) {
             if rest.is_empty() {
-                section = Some(kind);
+                section = Some((kind, None));
             } else {
                 push(kind, &rest);
                 section = None;
             }
             continue;
         }
-        if t.starts_with('#') {
+        if t.starts_with('#') || ends_with_colon(t) {
             section = None;
             continue;
         }
-        match strip_list_marker(t) {
-            (Some(true), rest) => push(Kind::Done, rest),
-            (Some(false), _) if section == Some(Kind::Done) => {}
-            (Some(false), rest) => push(Kind::Task, rest),
-            (None, rest) => {
-                if let Some(kind) = section {
+        let (is_list, checkbox, rest) = list_item(t);
+        match &mut section {
+            Some((_, first @ None)) => *first = Some(is_list),
+            Some((_, Some(true))) if !is_list => section = None,
+            _ => {}
+        }
+        let kind = section.map(|(k, _)| k);
+        match checkbox {
+            Some(true) => push(Kind::Done, rest),
+            Some(false) if kind == Some(Kind::Done) => {}
+            Some(false) => push(Kind::Task, rest),
+            None => {
+                if let Some(kind) = kind {
                     push(kind, rest);
                 }
             }
@@ -572,8 +726,8 @@ pub fn same_task(a: &str, b: &str) -> bool {
 pub fn nudge(plenum: &str, start: MeetingKey, link: Option<&str>) -> String {
     let mut text = format!(
         "📝 No minutes for **{plenum}** on {} yet. Post them here as a message whose first line \
-         starts with \"Minutes\" (or answer the message that has them with `!minutes`), or write \
-         them on the page",
+         starts with \"Protokoll\" or \"Minutes\" (or answer the message that has them with \
+         `!minutes`), or write them on the page",
         crate::schedule::describe_meeting(start)
     );
     match link {
@@ -598,7 +752,8 @@ pub fn literal(text: &str) -> String {
     out
 }
 
-fn when(at: chrono::DateTime<chrono::Utc>, tz: Tz) -> String {
+/// A moment as "28 Nov 2026, 10:40", local.
+pub fn when(at: chrono::DateTime<chrono::Utc>, tz: Tz) -> String {
     at.with_timezone(&tz).format("%-d %b %Y, %H:%M").to_string()
 }
 
@@ -670,6 +825,10 @@ pub struct Receipt<'a> {
     /// The house reads the copy (a kitchen's collection).
     pub house_reads: bool,
     pub withdrawn: bool,
+    /// A day written in the message that was not used ([`unused_day`]).
+    pub unused_day: Option<String>,
+    /// How many messages are filed with this one (itself too).
+    pub messages: usize,
 }
 
 /// The thread reply to a message filed as minutes (CHAT-MINUTES.md §6). It repeats only what the
@@ -729,9 +888,23 @@ pub fn receipt(r: &Receipt) -> String {
             text.push_str(&line);
         }
     }
+    if let Some(day) = &r.unused_day {
+        text.push_str(&format!(
+            "\n\nThe day in the message ({}) was not used. Meant another meeting? Answer with \
+             `!minutes <day>`.",
+            literal(day)
+        ));
+    }
     text.push_str(
         "\n\nEdit your message and I follow. Not the minutes? Answer with `!minutes undo`.",
     );
+    if r.messages > 1 {
+        text.push_str(&format!(
+            "\n\nThis meeting has {} minutes messages; all of them are in the copy. To replace \
+             an earlier one, delete it or answer it with `!minutes undo`.",
+            r.messages
+        ));
+    }
     text
 }
 
@@ -808,6 +981,27 @@ Nobody wanted to talk about the cellar.";
     }
 
     #[test]
+    fn a_question_is_no_minutes_and_short_minutes_with_an_entry_are() {
+        for body in [
+            "Protokoll schreibt heute wer?\nIch nicht\nIch auch nicht\nDann Anna",
+            "Protokoll kommt morgen",
+            "Protokoll kommt morgen\nversprochen",
+            "Protokoll 28.11.",
+        ] {
+            assert!(!is_minutes(body), "{body}");
+        }
+        for body in [
+            "Protokoll 28.11.\nBeschluss: Gelbe Tonnen\nAufgabe: Ben bestellt",
+            "Protokoll\nVertagt: Werkzeugregal",
+            "Plenumprotokoll 28.11.\nBeschluss: Gelbe Tonnen",
+            "Kurzprotokoll\nAufgabe: Ben bestellt",
+            "Ergebnisprotokoll vom Plenum\n- [ ] Ben bestellt",
+        ] {
+            assert!(is_minutes(body), "{body}");
+        }
+    }
+
+    #[test]
     fn every_label_is_read_in_both_forms() {
         for (kind, labels) in LABELS {
             for label in labels {
@@ -858,6 +1052,63 @@ Nobody wanted to talk about the cellar.";
     }
 
     #[test]
+    fn sections_end_where_the_minutes_go_on_and_none_is_no_entry() {
+        let r = |d: &[&str], t: &[&str], p: &[&str], done: &[&str]| Read {
+            decisions: strings(d),
+            tasks: strings(t),
+            postponed: strings(p),
+            done: strings(done),
+        };
+        let unfilled = crate::protocol::DEFAULT_CHAT_TEMPLATE
+            .replace("{{plenum}}", "House plenum")
+            .replace("{{date}}", "15 November 2026")
+            .replace("{{topics}}", "## Bins\n\n## Garden")
+            .replace("{{open_tasks}}", "- [ ] Ben: write to the landlord");
+        let cases = [
+            (
+                "Protokoll 15.11.\nBeschlüsse:\n- Räder ohne Schild kommen in die Werkstatt\nSonstiges:\n- Sommerfest im Juni\nTOP 2 Garten\nBen fragt die Nachbarn.",
+                r(&["Räder ohne Schild kommen in die Werkstatt"], &[], &[], &[]),
+            ),
+            (
+                "## Beschlüsse\n\n- Gelbe Tonnen\n- Ein neuer Plan",
+                r(&["Gelbe Tonnen", "Ein neuer Plan"], &[], &[], &[]),
+            ),
+            ("Beschluss:\n\nAufgabe:", Read::default()),
+            (
+                "Decisions: none\nAufgaben: keine\nVertagt:\n- nichts",
+                Read::default(),
+            ),
+            (
+                "Beschlüsse: Keine.\nTasks:\n- n/a\nDone: nein\nPostponed:\n• /\nAufträge: entfällt",
+                Read::default(),
+            ),
+            ("Nächstes Plenum: 29.11., 19 Uhr", Read::default()),
+            ("Verschoben: auf den 29.11.", Read::default()),
+            ("Vertagt:\n- 19:00\n- 13.12. um 19 Uhr", Read::default()),
+            ("Vertagt: Werkzeugregal", r(&[], &[], &["Werkzeugregal"], &[])),
+            ("To-Dos:\n- Anna bestellt", r(&[], &["Anna bestellt"], &[], &[])),
+            (
+                "Aufgaben (bis nächstes Mal):\n- Anna bestellt",
+                r(&[], &["Anna bestellt"], &[], &[]),
+            ),
+            (
+                "Beschluesse:\n•Gelbe Tonnen\n– Ein Plan\n-Kein Grill",
+                r(&["Gelbe Tonnen", "Ein Plan", "Kein Grill"], &[], &[], &[]),
+            ),
+            (
+                "Auftraege:\nAnna bestellt\nBen fragt\n\nSpäter mehr",
+                r(&[], &["Anna bestellt", "Ben fragt"], &[], &[]),
+            ),
+            (unfilled.as_str(), Read::default()),
+        ];
+        let wrong: Vec<String> = (cases.iter())
+            .filter(|(body, want)| read(body) != *want)
+            .map(|(body, _)| format!("{body:?}: {:?}", read(body)))
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
     fn what_is_no_entry() {
         let r = read("Ergebnis: alles gut\nResult: fine\nWir haben Beschluss: keiner\nDecisions:\n-\n\nTasks:\n- \n\nPostponed:\n–\nDone:\n- [ ] Ben: write to the landlord (since 1 Nov 2026)");
         assert_eq!(r, Read::default(), "{r:?}");
@@ -898,6 +1149,34 @@ Nobody wanted to talk about the cellar.";
         // early in January a day of December is last year's
         let jan = day(2027, 1, 3);
         assert_eq!(day_in("Protokoll 29.12.", jan), Some(day(2026, 12, 29)));
+    }
+
+    #[test]
+    fn a_day_that_was_not_used() {
+        let nov15 = day(2026, 11, 15);
+        let u = |body: &str, filed| unused_day(body, today(), filed);
+        assert_eq!(
+            u("Protokoll Plenum 3.9.\nx", nov15).as_deref(),
+            Some("3.9.")
+        );
+        assert_eq!(u("Protokoll 30.11.", nov15).as_deref(), Some("30.11."));
+        assert_eq!(
+            u("Minutes\n3. September", nov15).as_deref(),
+            Some("3. September")
+        );
+        assert_eq!(u("Protokoll 15.11.", nov15), None, "used");
+        assert_eq!(u("Protokoll", nov15), None, "none written");
+        assert_eq!(u("Protokoll 3.9.", day(2026, 9, 3)), None, "moved there");
+    }
+
+    #[test]
+    fn the_nudge_names_both_words() {
+        let start: MeetingKey = "2026-11-15 19:00".parse().unwrap();
+        let text = nudge("House plenum", start, None);
+        assert!(
+            text.contains("starts with \"Protokoll\" or \"Minutes\""),
+            "{text}"
+        );
     }
 
     #[test]
@@ -969,6 +1248,27 @@ Nobody wanted to talk about the cellar.";
             to_wiki("| a | b |\n|---|---|\n| 1 | 2 |"),
             "| a | b |\n|---|---|\n| 1 | 2 |"
         );
+    }
+
+    #[test]
+    fn an_inline_fence_or_a_link_title_breaks_nothing() {
+        assert_eq!(
+            to_wiki("```x```\n:::tip\nboo\n:::"),
+            "```x```\n\n\\:::tip\n\nboo\n\n\\:::"
+        );
+        assert_eq!(
+            to_wiki("```\ncode ```x``` still\n```\n:::tip"),
+            "```\ncode ```x``` still\n```\n\n\\:::tip"
+        );
+        assert_eq!(
+            to_wiki(
+                r#"[t](javascript:alert "x") [w](https://example.org "x") [u](< javascript:x>)"#
+            ),
+            r#"t [w](https://example.org "x") u"#
+        );
+        let r = read("```x```\nBeschluss: gilt\n```\nAufgabe: im Code\n```");
+        assert_eq!(r.decisions, ["gilt"], "{r:?}");
+        assert!(r.tasks.is_empty(), "{r:?}");
     }
 
     #[test]
@@ -1095,6 +1395,8 @@ Nobody wanted to talk about the cellar.";
             read: &r,
             house_reads: false,
             withdrawn: false,
+            unused_day: None,
+            messages: 1,
         };
         let text = receipt(&base);
         assert!(text.starts_with("📥 Filed as the minutes of House plenum, Sunday, 15 November 2026 at 19:00: https://wiki.example.org/doc/x"), "{text}");
@@ -1120,6 +1422,8 @@ Nobody wanted to talk about the cellar.";
             plenum: "House plenum",
             day: day(2026, 11, 15),
             house_reads: false,
+            unused_day: None,
+            messages: 1,
         });
         assert!(text.starts_with("↩️ Withdrawn"), "{text}");
     }

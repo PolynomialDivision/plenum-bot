@@ -87,11 +87,12 @@ fn message(markdown: &str, users: &[OwnedUserId]) -> RoomMessageEventContent {
         .add_mentions(Mentions::with_user_ids(users.iter().cloned()))
 }
 
-/// [`message`], but the chat template keeps its lines when it is shown (its body, which a
-/// phone copies, is the Markdown either way).
+/// [`message`], but the chat template as plain text: it keeps its lines when it is shown, and a
+/// line followed by a lone `-` stays a line (as Markdown it would be a heading); its body, which
+/// a phone copies, is the same either way.
 fn message_for(markdown: &str, users: &[OwnedUserId], notice: Notice) -> RoomMessageEventContent {
     if notice == Notice::Template {
-        mxbot_common::format::markdown_with_breaks(markdown)
+        RoomMessageEventContent::text_plain(markdown)
             .add_mentions(Mentions::with_user_ids(users.iter().cloned()))
     } else {
         message(markdown, users)
@@ -1145,10 +1146,19 @@ fn install_handler(
                     Incoming::Edit { target, body } => {
                         if minutes_from {
                             let name = name_of(&room, &ev.sender).await;
+                            // an edit that makes minutes of a message: answered in that
+                            // message's own thread (unreadable: its own)
+                            let thread = match OwnedEventId::try_from(target.as_str()) {
+                                Ok(id) if minutes::is_minutes(&body) => room_message(&room, &id)
+                                    .await
+                                    .map(|o| mxbot_common::send::thread_root(&o).to_string()),
+                                _ => None,
+                            };
                             engine
-                                .edited(
+                                .edited_in_thread(
                                     room.room_id(),
                                     &target,
+                                    thread.as_deref(),
                                     &ev.sender,
                                     &name,
                                     &body,
@@ -1382,6 +1392,16 @@ mod tests {
             "content": content,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn the_chat_template_is_sent_as_plain_text() {
+        let template = "Minutes House plenum\nDecisions:\n-\n\nTasks:\n-";
+        let json = serde_json::to_value(message_for(template, &[], Notice::Template)).unwrap();
+        assert!(json.get("formatted_body").is_none(), "{json}");
+        assert_eq!(json["body"], template);
+        let json = serde_json::to_value(message_for("**x**", &[], Notice::Link)).unwrap();
+        assert!(json.get("formatted_body").is_some(), "{json}");
     }
 
     #[test]

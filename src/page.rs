@@ -7,7 +7,7 @@
 //! without `](`, `#` inside a line), a Shift-Enter break as `\n` inside the line.
 
 use crate::{
-    protocol::{after_label, clean, for_matrix, strip_list_marker, DECISION_LABELS},
+    protocol::{after_label, clean, plain_mentions, strip_list_marker, DECISION_LABELS},
     schedule::describe_day,
     state::Top,
 };
@@ -216,24 +216,15 @@ pub fn has_topics(markdown: &str) -> bool {
 /// first one's level is the topics' level: a heading at that level or above starts a topic, a
 /// deeper one belongs to the topic above it.
 pub fn topics(markdown: &str) -> Vec<Topic> {
-    let ls = lines(markdown);
+    // without the help and the result box; what people wrote in other notices counts
+    let ls = lines(&without_box(markdown));
     let Some(start) = topics_heading(&ls) else {
         return Vec::new();
     };
     let own = heading(&ls[start]).map_or(2, |(lv, _)| lv);
-    // the area, without notices (the help) and markers
+    // the area, without markers
     let mut area: Vec<&str> = Vec::new();
-    let mut notice = false;
-    for (i, l) in ls.iter().enumerate().skip(start + 1) {
-        let t = l.trim();
-        if notice {
-            notice = t != ":::";
-            continue;
-        }
-        if opens_notice(&ls, i) {
-            notice = true;
-            continue;
-        }
+    for l in ls.iter().skip(start + 1) {
         if heading(l).is_some_and(|(lv, title)| is_ending(lv, &title, own)) {
             break;
         }
@@ -372,11 +363,6 @@ pub fn people(markdown: &str) -> Vec<(String, String)> {
         .filter(|(h, c)| !h.is_empty() && !c.is_empty())
         .map(|(h, c)| (h.clone(), c.clone()))
         .collect()
-}
-
-/// Mentions as plain names (a copy by the bot must not notify anyone again).
-fn plain_mentions(text: &str) -> String {
-    for_matrix(text, |_| None).0
 }
 
 /// Outline's Markdown sent back: a single `_` it returns is a literal one (its emphasis is
@@ -584,7 +570,8 @@ pub fn has_box(markdown: &str) -> bool {
 }
 
 /// The page without its result box (it repeats the decisions) and without the template's
-/// help (`:::info`): neither is read for decisions or tasks.
+/// help (`:::info`): neither is read for decisions, tasks or topics. Other notices keep their
+/// content (without their `:::` lines): what people wrote there counts.
 pub fn without_box(markdown: &str) -> String {
     let mut out = Vec::new();
     let mut in_notice = false;
@@ -597,7 +584,7 @@ pub fn without_box(markdown: &str) -> String {
             if t == ":::" {
                 let help = notice[0].trim() == ":::info";
                 if !help && !notice.iter().any(|n| clean(n).starts_with(BOX_TITLE)) {
-                    out.append(&mut notice);
+                    out.extend_from_slice(&notice[1..notice.len() - 1]);
                 }
                 notice.clear();
                 in_notice = false;
@@ -620,6 +607,8 @@ pub struct ChatBox<'a> {
     /// The copy's title and link.
     pub title: &'a str,
     pub link: &'a str,
+    /// When the box is made ("28 Nov 2026, 10:40"): later changes are only in the copy.
+    pub as_of: &'a str,
     /// The minutes' postponed lines: the topics they name move on, the others do not.
     pub postponed: &'a [String],
 }
@@ -666,7 +655,8 @@ pub fn result_box_with(
     let mut items: Vec<String> = Vec::new();
     if let Some(c) = chat {
         items.push(format!(
-            "📥 Chat minutes: [{}]({})",
+            "📥 Chat minutes as of {} (later changes are in the copy): [{}]({})",
+            c.as_of,
             literal(c.title),
             c.link
         ));
@@ -1061,6 +1051,22 @@ Notes only, no result line.
         let b = carried_block(&topic, NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(), "x");
         assert!(b.contains("Proposal: yellow ones"), "{b}");
         assert!(crate::protocol::extract(&b).decisions.is_empty());
+    }
+
+    #[test]
+    fn a_decision_in_a_notice_decides_its_topic() {
+        let page = "## Topics\n\n:::info\nResult: the help\n:::\n\n### Bins\n\n:::success\nDecision: yellow ones\n:::\n\n### Garden\n\nResult:\n";
+        let t = topics(page);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert_eq!(t[0].reading, Reading::Decided, "{t:?}");
+        assert!(!t[0].reading.carried());
+        assert_eq!(t[0].decisions, ["yellow ones"]);
+        assert!(t[1].reading.carried());
+        assert_eq!(crate::protocol::extract(page).decisions, ["yellow ones"]);
+        // the result box and the help are never read
+        let boxed = format!("{}\n\n{page}", result_box(&["old".into()], &[], &[]));
+        assert_eq!(crate::protocol::extract(&boxed).decisions, ["yellow ones"]);
+        assert_eq!(topics(&boxed), t);
     }
 
     #[test]

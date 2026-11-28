@@ -150,8 +150,15 @@ pub fn normalize(name: &str, value: &str) -> Result<String, String> {
                 .trim()
                 .trim_end_matches(|c: char| c.is_alphabetic())
                 .trim();
+            // only the setting's own unit after the number ("2h" is no reminder of 2 minutes)
+            let written = value.trim()[digits.len()..].trim().to_lowercase();
+            let units: &[&str] = match unit {
+                "minutes" => &["m", "min", "mins", "minute", "minutes"],
+                _ => &["d", "day", "days"],
+            };
+            let fits = written.is_empty() || units.contains(&written.as_str());
             match digits.parse::<u32>() {
-                Ok(n) if (from..=to).contains(&n) => Ok(n.to_string()),
+                Ok(n) if fits && (from..=to).contains(&n) => Ok(n.to_string()),
                 _ => Err(format!(
                     "`{}` is a number of {unit} from {from} to {to}{}, e.g. `!plenum set {} {}`.",
                     s.name,
@@ -306,6 +313,18 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn a_number_takes_only_the_unit_that_fits() {
+        assert_eq!(normalize("reminder", "30 min").unwrap(), "30");
+        assert_eq!(normalize("reminder", "30 minutes").unwrap(), "30");
+        assert_eq!(normalize("reminder", "30").unwrap(), "30");
+        assert!(normalize("reminder", "2h").is_err());
+        assert!(normalize("reminder", "2 days").is_err());
+        assert_eq!(normalize("page_days", "3 days").unwrap(), "3");
+        assert!(normalize("page_days", "3h").is_err());
+        assert!(normalize("page_after", "1 minute").is_err());
     }
 
     #[test]

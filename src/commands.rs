@@ -178,8 +178,12 @@ pub fn parse_for(body: &str, keys: &[&str]) -> Option<Command> {
     };
     match head.as_str() {
         "!top" => {
+            // a key only where there is a choice: in a room with one plenum it is the topic's
+            // first word ("!top house rules")
             let (key, text) = match words.first() {
-                Some(w) if is_key(w) => (Some((*w).to_owned()), rest[w.len()..].trim()),
+                Some(w) if keys.len() > 1 && is_key(w) => {
+                    (Some((*w).to_owned()), rest[w.len()..].trim())
+                }
                 _ => (None, rest),
             };
             if text.is_empty() {
@@ -205,9 +209,28 @@ pub fn parse_for(body: &str, keys: &[&str]) -> Option<Command> {
                 }
             }
             let (key, rest) = split_key(&words);
+            let hint = || {
+                Command::Invalid(
+                    "Did you mean `!minutes` as a reply to the message with the minutes \
+                     (`!minutes <day>` for that day's meeting), `!minutes undo`, \
+                     `!minutes template`, `!minutes done`, or `!minutes full`, `!minutes link` \
+                     or `!minutes confidential` (what of the minutes comes into the chat)?"
+                        .to_owned(),
+                )
+            };
+            // a close is final: nothing may follow on its line ("!minutes done yet?")
+            let alone = || {
+                let line = body.lines().next().unwrap_or_default();
+                line.split_whitespace()
+                    .skip(1)
+                    .filter(|w| !is_key(w))
+                    .count()
+                    == 1
+            };
             match rest.first().map(|w| w.to_lowercase()).as_deref() {
                 None => Some(Command::Overview(key)),
-                Some("done") | Some("close") => Some(Command::Close(key)),
+                Some("done") | Some("close") if alone() => Some(Command::Close(key)),
+                Some("done") | Some("close") => Some(hint()),
                 Some("undo") if rest.len() == 1 => Some(Command::Undo(key)),
                 Some("template") if rest.len() == 1 => Some(Command::ChatTemplate(key)),
                 Some(w) => match Publication::from_word(w) {
@@ -221,11 +244,7 @@ pub fn parse_for(body: &str, keys: &[&str]) -> Option<Command> {
                             when: Some(when),
                             text: None,
                         }),
-                        _ => Some(Command::Invalid(
-                            "Did you mean `!minutes done`, or `!minutes full`, `!minutes link` or \
-                             `!minutes confidential` (what of the minutes comes into the chat)?"
-                                .to_owned(),
-                        )),
+                        _ => Some(hint()),
                     },
                 },
             }
@@ -318,6 +337,44 @@ mod tests {
 
     fn p(s: &str) -> Option<Command> {
         parse_for(s, &["kitchen-floor-1", "kitchen-floor-3"])
+    }
+
+    #[test]
+    fn strict_forms_where_a_word_too_many_would_do_harm() {
+        // `done` closes: a question after it does not
+        assert_eq!(p("!minutes done"), Some(Command::Close(None)));
+        assert_eq!(
+            p("!minutes done kitchen-floor-1"),
+            Some(Command::Close(Some("kitchen-floor-1".into())))
+        );
+        assert!(matches!(p("!minutes done yet?"), Some(Command::Invalid(_))));
+        // a room with one plenum has no key to read: the word is the topic's
+        assert_eq!(
+            parse_for("!top house rules for the yard", &["house"]),
+            Some(Command::Top {
+                key: None,
+                text: "house rules for the yard".into()
+            })
+        );
+        assert_eq!(
+            parse_for("!top house rules", &["house", "garden"]),
+            Some(Command::Top {
+                key: Some("house".into()),
+                text: "rules".into()
+            })
+        );
+        // a wrong `!minutes` names what works
+        let Some(Command::Invalid(hint)) = p("!minutes please") else {
+            panic!()
+        };
+        for form in [
+            "as a reply",
+            "`!minutes undo`",
+            "`!minutes template`",
+            "`!minutes done`",
+        ] {
+            assert!(hint.contains(form), "{form}: {hint}");
+        }
     }
 
     #[test]

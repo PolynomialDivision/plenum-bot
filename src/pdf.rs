@@ -59,10 +59,29 @@ impl Frame {
     }
 }
 
-/// Outline's Markdown without what only Outline understands.
+/// Outline's Markdown without what only Outline understands; a Shift-Enter (Outline writes
+/// it as `\n` in the line) is a line break, outside code.
+///
+/// Not `page::without_box`: that one is for reading a page and drops the result box, which
+/// the PDF keeps (it is the meeting's outcome at the top of the page). Here only the
+/// template's help goes; every other notice keeps its content.
 fn outline_cleanup(markdown: &str) -> String {
     let mut help = false;
-    markdown
+    let mut code = false;
+    let broken: Vec<String> = (markdown.lines())
+        .map(|l| {
+            if l.trim_start().starts_with("```") {
+                code = !code;
+            }
+            if code || l.trim_start().starts_with("```") {
+                l.to_owned()
+            } else {
+                crate::page::lines(l).join("  \n")
+            }
+        })
+        .collect();
+    broken
+        .join("\n")
         .lines()
         .filter(|l| {
             let t = l.trim();
@@ -81,14 +100,24 @@ fn outline_cleanup(markdown: &str) -> String {
         .join("\n")
 }
 
-/// Without emoji and pictographs: DejaVu Sans has no glyphs for them. The checkbox
-/// symbols and check marks stay.
+/// Without emoji and pictographs (also the technical and arrow symbols the result box uses,
+/// "⏭️", and the keycap "1️⃣"): DejaVu Sans has no glyphs for them. The checkbox symbols and
+/// check marks stay.
 fn printable(text: &str) -> String {
     text.chars()
         .filter(|c| {
             let u = *c as u32;
             let keep = matches!(*c, '☐' | '☑' | '☒' | '✓' | '✔' | '✗' | '•');
-            keep || !(matches!(u, 0x1F000..=0x1FFFF | 0x2600..=0x27BF | 0xFE00..=0xFE0F | 0x200D))
+            keep || !(matches!(
+                u,
+                0x1F000..=0x1FFFF
+                    | 0x2600..=0x27BF
+                    | 0x2300..=0x23FF
+                    | 0x2B00..=0x2BFF
+                    | 0x20E3
+                    | 0xFE00..=0xFE0F
+                    | 0x200D
+            ))
         })
         .collect()
 }
@@ -565,6 +594,39 @@ mod tests {
         assert!(!Look::for_text("Łódź").builtin);
         assert_eq!(Look { builtin: true }.text("☐ a ☑ b"), "[ ] a [x] b");
         assert_eq!(Look { builtin: false }.text("☐ a"), "☐ a");
+    }
+
+    #[test]
+    fn the_result_box_keeps_the_readers_fonts_and_a_shift_enter_breaks_the_line() {
+        let topics =
+            crate::page::topics("## Topics\n\n### Bins\n\nResult: done\n\n### Garden\n\nResult:\n");
+        let postponed = vec!["Garden".to_owned()];
+        let chat = crate::page::ChatBox {
+            title: "House plenum 2026-11-15: Chat minutes",
+            link: "https://wiki.test/doc/c",
+            as_of: "28 Nov 2026, 10:40",
+            postponed: &postponed,
+        };
+        let text = crate::page::result_box_with(
+            &["Yellow bins".into()],
+            &topics,
+            &["Anna: order them".into()],
+            Some(&chat),
+        );
+        assert!(text.contains("⏭️"), "{text}");
+        assert!(Look::for_text(&text).builtin, "{text}");
+        // the PDF keeps the box (without its fence) and drops only the template's help
+        let page = format!(":::info\nThe template's help\n:::\n\n{text}\n\n## Topics\n");
+        let kept = outline_cleanup(&page);
+        assert!(kept.contains(crate::page::BOX_TITLE), "{kept}");
+        assert!(kept.contains("Yellow bins"), "{kept}");
+        assert!(!kept.contains("help") && !kept.contains(":::"), "{kept}");
+        assert!(Look::for_text("1️⃣ ⌛ ⬆️ x").builtin);
+        // Outline writes a Shift-Enter as `\n` in the line; code keeps it
+        assert_eq!(
+            outline_cleanup("Anna\\nBen\n```\nprintf(\"\\n\")\n```"),
+            "Anna  \nBen\n```\nprintf(\"\\n\")\n```"
+        );
     }
 
     #[test]

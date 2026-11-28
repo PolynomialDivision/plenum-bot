@@ -146,7 +146,8 @@ pub fn open_tasks_block(tasks: &[Carried]) -> String {
     }
     let mut block = format!("{OPEN_TASKS_HEADING}\n\n");
     for t in tasks {
-        let text = t.text.replace('[', "(").replace(']', ")");
+        // a mention stays whole: on the page it is still the person
+        let text = outside_mentions(&t.text, |s| s.replace('[', "(").replace(']', ")"));
         // a task open for a second time keeps its first day
         if text.trim_end().ends_with(')') && text.contains("(since ") {
             block.push_str(&format!("- [ ] {text}\n"));
@@ -460,7 +461,7 @@ pub fn decisions_block(title: &str, link: &str, decisions: &[String]) -> String 
     let mut block = format!("### [{title}]({link})\n\n");
     for d in decisions {
         // Outline reads appended Markdown: a literal "[ ]" would become a checkbox.
-        let d = d.replace('[', "\\[").replace(']', "\\]");
+        let d = plain_mentions(d).replace('[', "\\[").replace(']', "\\]");
         block.push_str(&format!("* {d}\n"));
     }
     block
@@ -613,7 +614,7 @@ pub fn overview_text(
     decisions: &[Carried],
     links: &OverviewLinks<'_>,
 ) -> String {
-    let esc = |s: &str| s.replace('[', "\\[").replace(']', "\\]");
+    let esc = |s: &str| plain_mentions(s).replace('[', "\\[").replace(']', "\\]");
     let mut t = format!(
         "_The plenum bot rewrites this page whenever something changes. What applies is in \
          the [rules]({}); your own texts belong there._\n\n## Next meetings\n\n",
@@ -1013,35 +1014,79 @@ pub fn for_matrix(
 ) -> (String, Vec<OwnedUserId>) {
     let mut out = String::with_capacity(text.len());
     let mut users: Vec<OwnedUserId> = Vec::new();
-    let mut rest = text;
-    while let Some(at) = rest.find("@[") {
-        out.push_str(&rest[..at]);
-        let tail = &rest[at + 2..];
-        let parsed = tail.split_once("](mention://").and_then(|(label, after)| {
-            let end = after.find(')')?;
-            let plain = !label.is_empty() && !label.contains(['[', ']', '\n']);
-            plain.then(|| (label, &after[..end], &after[end + 1..]))
-        });
-        let Some((label, target, after)) = parsed else {
-            out.push_str("@[");
-            rest = tail;
-            continue;
-        };
-        let is_user = target.split('/').nth(1) == Some("user");
-        match is_user.then(|| account(label)).flatten() {
+    let mut at = 0;
+    for m in mentions(text) {
+        out.push_str(&text[at..m.span.start]);
+        let is_user = m.target.split('/').nth(1) == Some("user");
+        match is_user.then(|| account(m.label)).flatten() {
             Some(id) => {
-                out.push_str(&format!("[{label}](https://matrix.to/#/{id})"));
+                out.push_str(&format!("[{}](https://matrix.to/#/{id})", m.label));
                 if !users.contains(&id) {
                     users.push(id);
                 }
             }
-            None if is_user => out.push_str(&format!("@{label}")),
-            None => out.push_str(label),
+            None if is_user => out.push_str(&format!("@{}", m.label)),
+            None => out.push_str(m.label),
         }
-        rest = after;
+        at = m.span.end;
     }
-    out.push_str(rest);
+    out.push_str(&text[at..]);
     (out, users)
+}
+
+/// A wiki mention in a text: `@[label](mention://target)`.
+pub(crate) struct Mention<'a> {
+    pub span: std::ops::Range<usize>,
+    pub label: &'a str,
+    pub target: &'a str,
+}
+
+/// The wiki mentions in `text`, in order.
+pub(crate) fn mentions(text: &str) -> Vec<Mention<'_>> {
+    const LINK: &str = "](mention://";
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(found) = text[from..].find("@[") {
+        let start = from + found;
+        let tail = &text[start + 2..];
+        let parsed = tail.split_once(LINK).and_then(|(label, after)| {
+            let end = after.find(')')?;
+            let plain = !label.is_empty() && !label.contains(['[', ']', '\n']);
+            plain.then_some((label, &after[..end]))
+        });
+        match parsed {
+            Some((label, target)) => {
+                let end = start + 2 + label.len() + LINK.len() + target.len() + 1;
+                out.push(Mention {
+                    span: start..end,
+                    label,
+                    target,
+                });
+                from = end;
+            }
+            None => from = start + 2,
+        }
+    }
+    out
+}
+
+/// `text` with `f` applied to what is outside its wiki mentions (they stay whole).
+pub(crate) fn outside_mentions(text: &str, f: impl Fn(&str) -> String) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for m in mentions(text) {
+        out.push_str(&f(&text[at..m.span.start]));
+        out.push_str(&text[m.span.clone()]);
+        at = m.span.end;
+    }
+    out.push_str(&f(&text[at..]));
+    out
+}
+
+/// A text from the wiki with its mentions as names (`@Ben Berg`): for a list or a message
+/// that is no page people write in.
+pub(crate) fn plain_mentions(text: &str) -> String {
+    for_matrix(text, |_| None).0
 }
 
 /// What the summary says about the PDF.
@@ -1466,6 +1511,37 @@ Decisions were taken quickly.
             "## Open tasks from the last plenum\n\n- [ ] Cara: buy the compost bin\n"
         );
         assert_eq!(without_withheld(md, &[]), md);
+    }
+
+    #[test]
+    fn a_wiki_mention_stays_whole_on_a_page_and_is_a_name_elsewhere() {
+        let ben = "@[Ben Berg](mention://m1/user/u1)";
+        let block = open_tasks_block(&[carried(&format!("{ben}: order [the] bins"))]);
+        assert!(
+            block.contains(&format!(
+                "- [ ] {ben}: order (the) bins (since 18 Oct 2026)"
+            )),
+            "{block}"
+        );
+        let block = decisions_block("T", "L", &[format!("{ben} buys [two]")]);
+        assert!(block.contains("* @Ben Berg buys \\[two\\]\n"), "{block}");
+        let links = OverviewLinks {
+            rules: "r",
+            decisions: "d",
+            protocols: "p",
+            template: "t",
+            example: None,
+            calendar: None,
+        };
+        let t = overview_text(
+            &plenum(),
+            &[],
+            &[carried(&format!("{ben}: order bins"))],
+            &[carried(&format!("{ben} buys two"))],
+            &links,
+        );
+        assert!(!t.contains("mention://"), "{t}");
+        assert!(t.contains("@Ben Berg: order bins") && t.contains("@Ben Berg buys two"));
     }
 
     #[test]

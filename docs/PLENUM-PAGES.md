@@ -63,7 +63,10 @@ in `all` mode, the summary.
 
 "Over" below: the plenum's previous meeting (the latest earlier one neither cancelled nor
 skipped) is closed (`!minutes done`) or past its closing time (`end + close_after_hours`).
-Time-based, so a failing close does not hold the next page back.
+Time-based, so a failing close does not hold the next page back. A room that refuses the
+announcement, the reminder or the template holds up nothing either: each is logged, tried again
+at the next tick, and the close still runs. A meeting step that fails is in the tick's report
+(the ticker's health: the room or a refusing wiki as `failed`, a wiki outage as `unavailable`).
 
 - **`page_after_days` = N** (`[pages]`, per plenum, the room's `page_after`; added 2026-11-07):
   the page opens once the meeting before is over and the local day N days after that
@@ -87,7 +90,9 @@ Calendar edits that the long-open page meets more often now:
 - a series changed "this and all future" in Nextcloud becomes a new event with new IDs: an open
   page of a meeting still to come whose ID left the calendar takes the single occurrence on its
   day that is new to the bot (a move if the time changed), instead of being cancelled while a
-  second page opens. Accepted: a meeting deleted on purpose and another one added that day in
+  second page opens. So does a date without a page yet that has a publication of its own
+  (`!minutes confidential 13.12.`); one that leaves the calendar without such a successor is
+  dropped, and the admins hear once that its setting went with it. Accepted: a meeting deleted on purpose and another one added that day in
   the same 5 minutes keeps the page (moved, not cancelled); read between the two writes of
   such a change, the meeting is cancelled first and back on at the next read;
 - an event entered twice (two IDs, one start) is one meeting; an occurrence the bot keeps
@@ -156,8 +161,10 @@ Proposal: a new one, up to 400 €.
 - The topics: the headings after "Topics"/"Themen" up to a heading titled exactly "Tasks",
   "Aufgaben", "Open tasks" or "Open tasks from the last plenum" (or the end). The first
   heading's level is the topics' level: a heading at that level or above starts a topic, a
-  deeper one belongs to the topic above it. Notices (the help), the result box and the bot's
-  marker lines are skipped.
+  deeper one belongs to the topic above it. The help (`:::info`), the result box and the bot's
+  marker lines are skipped; what people wrote in other notices (`:::success`, `:::tip`,
+  `:::warning`) is read like the page's other lines (`page::without_box`, the same rule as for
+  decisions and tasks).
 - A topic's result: the text after its line "Result:"/"Ergebnis:" (bold, a list item, the
   result on the same line: all fine). **Decided**: a decision line in the topic ("Decision:" /
   "Beschluss:", also "Result: Decision: …"). Otherwise: empty after "Result:" **not reached**,
